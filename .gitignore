@@ -4,3 +4,6 @@ dist/*.map
 *.toolpkg
 .DS_Store
 *.log
+
+# 本地构建脚本（不推送）
+build-local.sh

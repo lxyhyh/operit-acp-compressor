@@ -30,6 +30,7 @@ function Screen(ctx) {
     const [saved, setSaved] = ctx.useState("acp_saved", false);
     const [error, setError] = ctx.useState("acp_error", "");
     const [hasInitialized, setHasInitialized] = ctx.useState("acp_has_init", false);
+    const [stats, setStats] = ctx.useState("acp_stats", null);
 
     // 读配置：渲染期不发起异步；onLoad 内首次加载
     async function load() {
@@ -39,6 +40,11 @@ function Screen(ctx) {
             if (res && typeof res === "object") {
                 setCfg(Object.assign({}, DEFAULT, res));
             }
+            // V0.5：读运行状态（blocks/stats/metrics）
+            try {
+                const s = await ToolPkg.ipc.call("acp.get_stats");
+                if (s && s.ok && s.stats) setStats(s);
+            } catch (e2) { /* 统计读取失败不阻塞配置 */ }
             setError("");
         } catch (e) {
             setError(String(e && e.message ? e.message : e));
@@ -117,6 +123,27 @@ function Screen(ctx) {
             }),
         ])
     );
+
+    // V0.5 运行状态卡（blocks/压缩量/主动率/最近事件）
+    if (stats && stats.stats) {
+        const st = stats.stats || {};
+        const totalFolds = (st.compressSucceeded || 0) + (st.emergencyTriggered || 0);
+        const proactivePct = totalFolds > 0 ? Math.round(((st.compressSucceeded || 0) / totalFolds) * 100) : 0;
+        const convPct = (st.nudgeIssued || 0) > 0 ? Math.round(((st.compressCalled || 0) / (st.nudgeIssued || 0)) * 100) : 0;
+        const epoch = stats.acpNudge && stats.acpNudge.acpEpoch ? stats.acpNudge.acpEpoch : null;
+        const updated = stats.updatedAt ? new Date(stats.updatedAt).toLocaleTimeString() : "";
+        children.push(
+            UI.Card({ fillMaxWidth: true, containerColor: "surfaceVariant" }, [
+                UI.Column({ padding: 12, spacing: 4 }, [
+                    UI.Text({ text: "运行状态" + (updated ? " · " + updated : ""), style: "bodySmall", color: "onSurfaceVariant", fontSize: 11 }),
+                    UI.Text({ text: "压缩块: " + (stats.blocks ?? 0) + " 个 · 累计压缩 " + Number(stats.tokensCompressed || 0).toLocaleString() + " tokens", style: "bodySmall", fontSize: 12 }),
+                    UI.Text({ text: "模型主动压缩: " + (st.compressSucceeded || 0) + " 次 (" + proactivePct + "%) · 紧急兜底: " + (st.emergencyTriggered || 0) + " 次", style: "bodySmall", fontSize: 12 }),
+                    UI.Text({ text: "nudge 已发: " + (st.nudgeIssued || 0) + " (gentle " + (st.gentleNudges || 0) + "/strong " + (st.strongNudges || 0) + "/emergency " + (st.emergencyNudges || 0) + ") · 转化率 " + convPct + "%", style: "bodySmall", fontSize: 12 }),
+                    epoch ? UI.Text({ text: "pressure epoch #" + (epoch.epoch || 0) + " · 注入 " + (epoch.injections || 0) + " 次 · 档位 " + (epoch.maxLevel || "none") + (epoch.closed ? " (closed)" : ""), style: "bodySmall", fontSize: 12 }) : null,
+                ]),
+            ])
+        );
+    }
 
     // 启用开关
     children.push(

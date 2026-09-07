@@ -60,6 +60,47 @@ export function registerIpc(): void {
             const ok = await saveConfig({ ...DEFAULT_CONFIG });
             return { ok, config: DEFAULT_CONFIG };
         });
+        ToolPkg.ipc.on("acp.get_stats", async () => {
+            // V0.5：读最近会话状态文件的 runtimeStats/metrics（UI 状态卡）。
+            try {
+                const dir = "/sdcard/Download/Operit/plugins/com.operit.acp_compressor/acp-state";
+                const res = await Tools.Files.list(dir);
+                const files = (Array.isArray(res) ? res : []).map((f) => typeof f === "string" ? f : String((f as { name?: string }).name ?? "")).filter((f) => f.includes("_b") && f.endsWith(".json") && !f.includes("raw"));
+                // 逐个读 hostMetadata.lastUpdatedAt，取最新（不依赖 stat API）
+                let latest = "";
+                let latestTs = 0;
+                for (const f of files) {
+                    try {
+                        const contentRes = await Tools.Files.read(`${dir}/${f}`);
+                        const content = (contentRes && contentRes.content) as string | undefined;
+                        if (!content) continue;
+                        const parsed = JSON.parse(content);
+                        const ts = typeof parsed?.hostMetadata?.lastUpdatedAt === "number" ? parsed.hostMetadata.lastUpdatedAt : 0;
+                        if (ts > latestTs) { latestTs = ts; latest = f; }
+                    } catch { /* 单个失败跳过 */ }
+                }
+                if (!latest) return { ok: true, stats: null };
+                const contentRes = await Tools.Files.read(`${dir}/${latest}`);
+                const content = (contentRes && contentRes.content) as string | undefined;
+                if (!content) return { ok: true, stats: null };
+                const parsed = JSON.parse(content);
+                const hm = parsed?.hostMetadata ?? {};
+                const stats = hm.runtimeStats ?? null;
+                const acpNudge = hm.acpNudge ?? null;
+                const k = parsed?.kernelState ?? {};
+                return {
+                    ok: true,
+                    stats,
+                    acpNudge,
+                    blocks: Array.isArray(k.blocks) ? k.blocks.length : 0,
+                    tokensCompressed: k.stats?.tokensCompressed ?? 0,
+                    chatFile: latest.replace(/^state_/, "").replace(/\.json$/, ""),
+                    updatedAt: hm.lastUpdatedAt ?? 0,
+                };
+            } catch (e) {
+                return { ok: false, error: String(e && (e as Error).message ? (e as Error).message : e) };
+            }
+        });
     } catch (e) {
         try { console.log(`[acp] registerIpc error: ${String(e)}`); } catch { /* noop */ }
     }

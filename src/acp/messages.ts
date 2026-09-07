@@ -198,7 +198,9 @@ export function capProjectionSize(
   const truncate = (t: PromptTurnLike, chars: number): PromptTurnLike => {
     const content = typeof t.content === "string" ? t.content : "";
     if (content.length <= chars) return t;
-    if (t.kind === "SUMMARY") return t;
+    // SUMMARY 与 SYSTEM 不裁：SUMMARY 保压缩内容完整；SYSTEM 是模型指令核心
+    //（含 ACP 上下文管理指南），裁剪会丢失"主动压缩"指引——本插件存在的意义。
+    if (t.kind === "SUMMARY" || t.kind === "SYSTEM") return t;
     const prefix = content.slice(0, chars);
     const suffix = content.slice(-chars);
     return {
@@ -216,6 +218,7 @@ export function capProjectionSize(
       let reduced = false;
       for (let i = 0; i < out.length && total > totalBudgetChars; i++) {
         if (i >= protectFrom) continue;
+        if (out[i].kind === "SYSTEM" || out[i].kind === "SUMMARY") continue; // 保护指令与摘要
         const before = typeof out[i].content === "string" ? (out[i].content as string).length : 0;
         if (before > Math.floor(keepChars / 4)) {
           out[i] = truncate(out[i], Math.floor(keepChars / 4));

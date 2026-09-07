@@ -3285,7 +3285,7 @@ function capProjectionSize(turns, opts) {
   const truncate = (t, chars) => {
     const content = typeof t.content === "string" ? t.content : "";
     if (content.length <= chars) return t;
-    if (t.kind === "SUMMARY") return t;
+    if (t.kind === "SUMMARY" || t.kind === "SYSTEM") return t;
     const prefix = content.slice(0, chars);
     const suffix = content.slice(-chars);
     return {
@@ -3304,6 +3304,7 @@ ${suffix}`
       let reduced = false;
       for (let i = 0; i < out.length && total > totalBudgetChars; i++) {
         if (i >= protectFrom) continue;
+        if (out[i].kind === "SYSTEM" || out[i].kind === "SUMMARY") continue;
         const before = typeof out[i].content === "string" ? out[i].content.length : 0;
         if (before > Math.floor(keepChars / 4)) {
           out[i] = truncate(out[i], Math.floor(keepChars / 4));
@@ -3664,7 +3665,21 @@ function createEngine(dataDir) {
       try {
         if (hookStage === "before_send_to_model") {
           const cached2 = await persistence.load(sessionKey);
-          return { preparedHistory: turns, fingerprint: computeFingerprint(sessionKey, turns, resolveKernelConfig(settings)), state: cached2.kernelState };
+          const config2 = resolveKernelConfig(settings);
+          const fp = computeFingerprint(sessionKey, turns, config2);
+          const memCached = projectionCache.get(sessionKey);
+          const projected = memCached && memCached.projection && Array.isArray(memCached.projection) && memCached.projection.length > 0 ? memCached.projection : void 0;
+          try {
+            const p0 = projected && projected[0];
+            const pLen = p0 && typeof p0.content === "string" ? String(p0.content).length : 0;
+            const pHasAcp = p0 && typeof p0.content === "string" ? String(p0.content).includes("[ACP \u4E0A\u4E0B\u6587\u7BA1\u7406]") : false;
+            console.log(`[acp] project stage2 fp=${fp.slice(0, 12)} cached=${projected ? 1 : 0} sysLen=${pLen} sysHasAcp=${pHasAcp}`);
+          } catch {
+          }
+          if (projected) {
+            return { preparedHistory: projected, fingerprint: fp, state: cached2.kernelState };
+          }
+          return { preparedHistory: turns, fingerprint: fp, state: cached2.kernelState };
         }
         const config = resolveKernelConfig(settings);
         const fingerprint = computeFingerprint(sessionKey, turns, config);
@@ -3825,6 +3840,13 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           const gateInfo = `allow=${nudgeGate.allowInject ? 1 : 0} kShould=${turn.nudge?.shouldInject ? 1 : 0}`;
           const st = nextStats;
           console.log(`[acp] project stage=${hookStage} chat=${chatId ? String(chatId).slice(0, 8) : "-"} sub=${isSubTask ? 1 : 0} fp=${fingerprint.slice(0, 12)} raw=${turns.length} proj=${cappedTurns.length} blocks=${active}/${turn.state.blocks.length} tok=${tokenEstimate} saved=${(cached.kernelState.stats?.tokensCompressed ?? 0) - (turn.state.stats?.tokensCompressed ?? 0)} nudge=${gateInfo} stats={n:${st.nudgeIssued},m:${st.compressSucceeded},e:${st.emergencyTriggered}} ${nudgeReason}`);
+        } catch {
+        }
+        try {
+          const p0 = cappedTurns[0];
+          const pLen = p0 && typeof p0.content === "string" ? String(p0.content).length : 0;
+          const pHasAcp = p0 && typeof p0.content === "string" ? String(p0.content).includes("[ACP \u4E0A\u4E0B\u6587\u7BA1\u7406]") : false;
+          console.log(`[acp] project-return stage=${hookStage} firstKind=${p0?.kind ?? "-"} sysLen=${pLen} sysHasAcp=${pHasAcp} projLen=${cappedTurns.length}`);
         } catch {
         }
         return { preparedHistory: cappedTurns, fingerprint, nudgeText, state: turn.state };

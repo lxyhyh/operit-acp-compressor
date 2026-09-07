@@ -248,11 +248,29 @@ export function createEngine(dataDir?: string): AcpEngine {
         // —— 阶段守卫：宿主同一发送周期会调两次 finalize hook。
         //   第一阶段 before_finalize_prompt：输入为消息库原始历史 → 执行投影压缩。
         //   第二阶段 before_send_to_model：输入是宿主基于第一阶段投影输出整理的
-        //   内容（或原始历史）→ 直接透传，绝不重复 processTurn——否则 kernel
-        //   syncBlocks 会因输入不含 block 覆盖的原始消息而 deactivate 已形成块。
+        //   内容（SYSTEM 可能已被宿主替换为精简版，丢失 ACP 指南）→ 返回
+        //   第一阶段缓存的投影（含完整 SYSTEM/ACP guide），绝不透传宿主精简
+        //   turns——否则 ACP 上下文管理指南（模型主动压缩的唯一指引）会丢失，
+        //   模型只看到裸工具、不知何时用，压缩永远不主动发生。
+        //   同时不重复 processTurn（防 kernel syncBlocks 误 deactivate）。
         if (hookStage === "before_send_to_model") {
           const cached = await persistence.load(sessionKey);
-          return { preparedHistory: turns, fingerprint: computeFingerprint(sessionKey, turns, resolveKernelConfig(settings)), state: cached.kernelState };
+          const config = resolveKernelConfig(settings);
+          const fp = computeFingerprint(sessionKey, turns, config);
+          const memCached = projectionCache.get(sessionKey);
+          const projected = memCached && memCached.projection && Array.isArray(memCached.projection) && memCached.projection.length > 0
+            ? memCached.projection
+            : undefined;
+          try {
+            const p0 = projected && projected[0];
+            const pLen = p0 && typeof (p0 as PromptTurnLike).content === "string" ? String((p0 as PromptTurnLike).content).length : 0;
+            const pHasAcp = p0 && typeof (p0 as PromptTurnLike).content === "string" ? String((p0 as PromptTurnLike).content).includes("[ACP 上下文管理]") : false;
+            console.log(`[acp] project stage2 fp=${fp.slice(0, 12)} cached=${projected ? 1 : 0} sysLen=${pLen} sysHasAcp=${pHasAcp}`);
+          } catch { /* noop */ }
+          if (projected) {
+            return { preparedHistory: projected as PromptTurnLike[], fingerprint: fp, state: cached.kernelState };
+          }
+          return { preparedHistory: turns, fingerprint: fp, state: cached.kernelState };
         }
         const config = resolveKernelConfig(settings);
         const fingerprint = computeFingerprint(sessionKey, turns, config);
@@ -457,6 +475,13 @@ export function createEngine(dataDir?: string): AcpEngine {
           console.log(`[acp] project stage=${hookStage} chat=${chatId ? String(chatId).slice(0, 8) : "-"} sub=${isSubTask ? 1 : 0} fp=${fingerprint.slice(0, 12)} raw=${turns.length} proj=${cappedTurns.length} blocks=${active}/${turn.state.blocks.length} tok=${tokenEstimate} saved=${(cached.kernelState.stats?.tokensCompressed ?? 0) - (turn.state.stats?.tokensCompressed ?? 0)} nudge=${gateInfo} stats={n:${st.nudgeIssued},m:${st.compressSucceeded},e:${st.emergencyTriggered}} ${nudgeReason}`);
         } catch { /* noop */ }
 
+        // [诊断] 返回前记录 preparedHistory[0] SYSTEM 长度（判定模型实际收到什么）
+        try {
+          const p0 = cappedTurns[0];
+          const pLen = p0 && typeof (p0 as PromptTurnLike).content === "string" ? String((p0 as PromptTurnLike).content).length : 0;
+          const pHasAcp = p0 && typeof (p0 as PromptTurnLike).content === "string" ? String((p0 as PromptTurnLike).content).includes("[ACP 上下文管理]") : false;
+          console.log(`[acp] project-return stage=${hookStage} firstKind=${p0?.kind ?? "-"} sysLen=${pLen} sysHasAcp=${pHasAcp} projLen=${cappedTurns.length}`);
+        } catch { /* noop */ }
         return { preparedHistory: cappedTurns, fingerprint, nudgeText, state: turn.state };
       } finally {
         release();

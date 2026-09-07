@@ -79,12 +79,21 @@ export async function onFinalize(event: FinalizeHookEvent): Promise<PromptHookOb
   const turns = turnsFromPayload(payload);
   const stage = String(payload.stage ?? event?.eventName ?? "before_finalize_prompt");
 
+  // [诊断] finalize 收到的 history 是否含 SYSTEM turn + ACP guide（外部 AI 判定根因用）
+  try {
+    const kinds = turns.slice(0, 20).map((t) => t.kind).join(",");
+    const sysTurn = turns.find((t) => t.kind === "SYSTEM");
+    const sysLen = sysTurn && typeof sysTurn.content === "string" ? sysTurn.content.length : 0;
+    const sysHasAcp = sysTurn && typeof sysTurn.content === "string" ? sysTurn.content.includes("[ACP 上下文管理]") : false;
+    diagLog(LOG_TOOLS_VISIBILITY_FILE, `[finalize-history] stage=${stage} count=${turns.length} firstKinds=${kinds} sysLen=${sysLen} sysHasAcp=${sysHasAcp}`);
+  } catch { /* ignore */ }
+
   // [探针] 工具可见性诊断：ACP 工具是否真的在 availableTools（模型工具列表）。
   try {
     const tools = payload.availableTools as Array<{ name?: string }> | undefined;
     const toolNames = (tools ?? []).map((t) => t.name ?? "").filter(Boolean);
     const acpVisible = toolNames.filter((n) => /compress|decompress|search_context|acp_status/.test(n));
-    diagLog(LOG_TOOLS_VISIBILITY_FILE, `[tools] stage=${stage} tools=${toolNames.length} acp=${acpVisible.join(",") || "NONE"} hasSysprompt=${typeof payload.systemPrompt === "string" && payload.systemPrompt.length > 0}`);
+    diagLog(LOG_TOOLS_VISIBILITY_FILE, `[tools] stage=${stage} tools=${toolNames.length} acp=${acpVisible.join(",") || "NONE"} hasSysprompt=${typeof payload.systemPrompt === "string" && payload.systemPrompt.length > 0} sysPromptLen=${typeof payload.systemPrompt === "string" ? payload.systemPrompt.length : 0} sysPromptHasAcp=${typeof payload.systemPrompt === "string" ? payload.systemPrompt.includes("[ACP 上下文管理]") : false}`);
   } catch { /* ignore */ }
 
   if (!engine.settings.enabled) return;
@@ -92,7 +101,21 @@ export async function onFinalize(event: FinalizeHookEvent): Promise<PromptHookOb
 
   const projected = await safeProject(engine, sessionKey, ctx.chatId, ctx.isSubTask, stage, turns);
   if (projected === undefined) return;
-  return { preparedHistory: projected as PromptTurn[] };
+  // finalize 返回：preparedHistory 投影 + systemPrompt 追加 ACP 指南。
+  // （SystemPromptComposeHook 返回值宿主不采纳——19:49 实测 after 阶段 len 未变，
+  //  而 PromptFinalizeHookReturn 支持 systemPrompt 字段，改由此通道注入。）
+  const result: PromptHookObjectResult = { preparedHistory: projected as PromptTurn[] };
+  const sp = typeof payload.systemPrompt === "string" ? payload.systemPrompt : undefined;
+  if (sp && sp.length > 0) {
+    const next = appendAcpSystemPrompt(sp);
+    if (next !== sp) {
+      result.systemPrompt = next;
+      diagLog(LOG_TOOLS_VISIBILITY_FILE, `[finalize] INJECT sysprompt via finalize: len ${sp.length} -> ${next.length}`);
+    }
+  } else {
+    diagLog(LOG_TOOLS_VISIBILITY_FILE, `[finalize] payload.systemPrompt empty (len=0), cannot inject via finalize`);
+  }
+  return result;
 }
 
 /** 注入用的 ACP 工具（模块级单例）。 */
@@ -122,17 +145,21 @@ export async function onToolPromptCompose(event: ToolPromptComposeHookEvent): Pr
  * 只在 after_compose_system_prompt 阶段追加 ACP 提示（该阶段 systemPrompt
  * 已完整；before 阶段注入会让原生角色/准则/工具清单丢失）。
  */
-export async function onSystemPromptCompose(event: SystemPromptComposeHookEvent): Promise<PromptHookObjectResult | void> {
+export async function onSystemPromptCompose(event: SystemPromptComposeHookEvent): Promise<string | PromptHookObjectResult | void> {
   const payload = (event?.eventPayload && typeof event.eventPayload === "object" ? event.eventPayload : {}) as Record<string, unknown>;
   const stage = String(payload.stage ?? "");
   const systemPrompt = typeof payload.systemPrompt === "string" ? payload.systemPrompt : undefined;
-  // [探针] 记录 system prompt hook 被调用情况（确认宿主是否在 after 阶段调用）。
-  diagLog(LOG_TOOLS_VISIBILITY_FILE, `[sysprompt] stage=${stage || "(none)"} len=${systemPrompt?.length ?? 0}`);
+  const p = payload as { systemPrompt?: string };
+  const len = p.systemPrompt?.length ?? 0;
+  diagLog(LOG_TOOLS_VISIBILITY_FILE, `[sysprompt] stage=${stage || "(none)"} len=${len} hasAcp=${p.systemPrompt?.includes("[ACP 上下文管理]") ?? false}`);
   if (stage !== "after_compose_system_prompt") return;
   if (!systemPrompt || systemPrompt.length === 0) return;
   const next = appendAcpSystemPrompt(systemPrompt);
   if (next === systemPrompt) return;
-  return { systemPrompt: next };
+  // 方式 3：返回完整 payload 对象（含修改后的 systemPrompt），宿主若做
+  // mutation merge 即可生效。string 与 {systemPrompt} 已实测不被采纳。
+  diagLog(LOG_TOOLS_VISIBILITY_FILE, `[sysprompt] INJECT full-payload: len ${systemPrompt.length} -> ${next.length} (${next.length - systemPrompt.length} chars added)`);
+  return { ...payload, systemPrompt: next };
 }
 
 /** 从估算事件 payload 提取 session 上下文（与 finalize 同构）。 */

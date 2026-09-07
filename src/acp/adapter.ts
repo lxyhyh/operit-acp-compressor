@@ -375,6 +375,9 @@ export function createEngine(dataDir?: string): AcpEngine {
           nextStats.emergencySavedTokens += emergencyFreedTokens;
           nextStats.lastCompressSource = "emergency";
           nextStats.lastCompressAt = Date.now();
+          // V0.4.1 usage credit：压缩完成当轮 usage 为基准，credit 内免打扰。
+          nextStats.creditBaseToken = tokenEstimate;
+          nextStats.creditRemaining = settings.usageCreditTokens;
         }
         // nudge 状态机（Adapter 层门控）：达到阈值最多注入一次；压缩/下降后 reset。
         const prevNudgeState = cached.hostMetadata.acpNudge ?? {};
@@ -391,6 +394,8 @@ export function createEngine(dataDir?: string): AcpEngine {
           tokenEstimate,
           nudgeCooldownTurns: settings.nudgeCooldownTurns,
           nudgeCooldownTokens: settings.nudgeCooldownTokens,
+          usageCreditTokens: settings.usageCreditTokens,
+          creditBaseToken: typeof prevStats.creditBaseToken === "number" ? prevStats.creditBaseToken : undefined,
         });
         const nextNudgeState = nudgeGate.nextNudgeState;
 
@@ -500,6 +505,12 @@ export function createEngine(dataDir?: string): AcpEngine {
           nextStats.modelSavedTokens += applied.result.tokensCompressed;
           nextStats.lastCompressSource = "model";
           nextStats.lastCompressAt = Date.now();
+          // V0.4.1 usage credit：模型主动压缩后同样获得免打扰窗口。
+          const est = loaded.hostMetadata.lastTokenEstimate;
+          if (typeof est === "number") {
+            nextStats.creditBaseToken = est;
+            nextStats.creditRemaining = settings.usageCreditTokens;
+          }
         } else if (applied.result.blocksCreated === 0) {
           nextStats.compressFailed += 1;
         }
@@ -607,13 +618,20 @@ export function createEngine(dataDir?: string): AcpEngine {
       const mapping = promptTurnsToCoreMessages(messages);
       const tokenCount = estimateProjectionTokens(mapping.messages, collectCoveredMessageIds(loaded.kernelState));
       const report = core.status(loaded.kernelState, tokenCount, config);
-      // V0.4：附运行时统计（nudge/compress/emergency 链路），供诊断主动压缩率。
+      // V0.4.1：指标修正——proactive 指"模型主动建块占全部建块的比例"（原实现
+      //  compressSucceeded/nudgeIssued 语义不清），并拆出 conversion rate
+      //  （nudge 发出后模型是否跟进 compress）。
       const stats = loaded.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS;
-      const proactiveRate = stats.nudgeIssued > 0
-        ? Math.round((stats.compressSucceeded / stats.nudgeIssued) * 100)
+      const totalFolds = (stats.compressSucceeded ?? 0) + (stats.emergencyTriggered ?? 0);
+      const proactiveRate = totalFolds > 0
+        ? Math.round(((stats.compressSucceeded ?? 0) / totalFolds) * 100)
         : 0;
-      const emergencyRate = (stats.emergencyTriggered + stats.compressSucceeded) > 0
-        ? Math.round((stats.emergencyTriggered / (stats.emergencyTriggered + stats.compressSucceeded)) * 100)
+      const emergencyRate = totalFolds > 0
+        ? Math.round(((stats.emergencyTriggered ?? 0) / totalFolds) * 100)
+        : 0;
+      // conversion：nudge 后模型真的调了 compress（无论成败）的比例。
+      const conversionRate = stats.nudgeIssued > 0
+        ? Math.round(((stats.compressCalled ?? 0) / stats.nudgeIssued) * 100)
         : 0;
       const enriched = {
         ...(typeof report === "object" && report !== null ? report : { raw: report }),
@@ -621,6 +639,7 @@ export function createEngine(dataDir?: string): AcpEngine {
         metrics: {
           proactiveCompressRatePct: proactiveRate,
           emergencySharePct: emergencyRate,
+          conversionRatePct: conversionRate,
           nudgeIssued: stats.nudgeIssued,
           compressSucceeded: stats.compressSucceeded,
           emergencyTriggered: stats.emergencyTriggered,
@@ -667,6 +686,10 @@ interface NudgeGateInput {
   tokenEstimate: number;
   nudgeCooldownTurns: number;
   nudgeCooldownTokens: number;
+  /** V0.4.1 usage credit：最近一次压缩后此 token 内免除 nudge。0=不启用。 */
+  usageCreditTokens: number;
+  /** 最近一次压缩后的基准 token（压缩完成当轮 usage）。 */
+  creditBaseToken?: number;
 }
 interface NudgeGateResult {
   allowInject: boolean;
@@ -687,6 +710,12 @@ function evaluateNudgeGate(input: NudgeGateInput): NudgeGateResult {
   // EMERGENCY（usage 超过硬顶/emergency 阈值）：每轮提醒直到压缩成功或上下文回落。
   // 模型不 compress 时继续提醒（不回退冷却），避免"提醒一次被无视后死锁"。
   const emergency = /EMERGENCY/i.test(input.kernelReason);
+  // V0.4.1 usage credit：压缩后增长未超 credit 前不提醒（EMERGENCY 仍提醒——已
+  //  逼近硬顶，不能因 credit 豁免）。creditBaseToken 记于 stats，跨轮持久化。
+  const creditLeft = input.usageCreditTokens > 0 && typeof input.creditBaseToken === "number"
+    ? input.creditBaseToken + input.usageCreditTokens - input.tokenEstimate
+    : 0;
+  const inCreditWindow = !emergency && creditLeft > 0;
 
   if (input.curBlocks > input.prevBlocks) {
     return { allowInject: false, nextNudgeState: { lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0 } };
@@ -695,6 +724,10 @@ function evaluateNudgeGate(input: NudgeGateInput): NudgeGateResult {
     return { allowInject: false, nextNudgeState: { lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0 } };
   }
   if (!input.kernelShouldInject) {
+    return { allowInject: false, nextNudgeState: prev };
+  }
+  if (inCreditWindow) {
+    // credit 窗口内：kernel 建议也抑制（刚压缩过，给增长留空间）。
     return { allowInject: false, nextNudgeState: prev };
   }
   if (!emergency && (lastInjectedAt > 0 || nudgeCount >= input.nudgeCooldownTurns)) {

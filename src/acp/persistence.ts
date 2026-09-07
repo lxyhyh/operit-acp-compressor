@@ -35,6 +35,12 @@ export interface AcpRuntimeStats {
   /** 最近一次 compress 来源（model/emergency）。 */
   lastCompressSource?: "model" | "emergency";
   lastCompressAt?: number;
+  /** V0.4.1 usage credit：compress 后 N token 内免除 nudge（防刚压缩又提醒）。 */
+  creditUntilToken?: number;
+  /** 上次 credit 发放时的 context token 数（用于判断 credit 是否已消费完）。 */
+  creditBaseToken?: number;
+  /** credit 剩余 token（估算：creditBaseToken + 增长 - 当前）。 */
+  creditRemaining?: number;
 }
 
 export const EMPTY_RUNTIME_STATS: AcpRuntimeStats = {

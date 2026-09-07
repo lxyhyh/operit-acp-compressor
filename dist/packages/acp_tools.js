@@ -3103,9 +3103,10 @@ function readList(key, dflt) {
   return raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
 }
 function loadAdapterSettings() {
+  const modelContextLimit = readNum(KEYS.modelContextLimit, 2e5);
   return {
     enabled: readBool(KEYS.enabled, true),
-    modelContextLimit: readNum(KEYS.modelContextLimit, 2e5),
+    modelContextLimit,
     preserveRecentMessages: readNum(KEYS.preserveRecentMessages, 5),
     preserveRecentTokens: 5e3,
     protectedTools: readList("protectedTools", []),
@@ -3122,6 +3123,8 @@ function loadAdapterSettings() {
     // V0.4 三档：温和提示沿用旧键 nudgeThresholdPct（兼容已存设置），强制/硬限新增键。
     gentleThresholdPct: readPct("nudgeThresholdPct", 0.72),
     strongThresholdPct: readPct("strongThresholdPct", 0.82),
+    // V0.4.1 usage credit：压缩后 contextLimit*15% token 内免除 nudge。
+    usageCreditTokens: Math.round(modelContextLimit * 0.15),
     dataDir: DATA_DIR
   };
 }
@@ -3760,6 +3763,8 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           nextStats.emergencySavedTokens += emergencyFreedTokens;
           nextStats.lastCompressSource = "emergency";
           nextStats.lastCompressAt = Date.now();
+          nextStats.creditBaseToken = tokenEstimate;
+          nextStats.creditRemaining = settings.usageCreditTokens;
         }
         const prevNudgeState = cached.hostMetadata.acpNudge ?? {};
         const prevBlocks = cached.kernelState.blocks.length;
@@ -3774,7 +3779,9 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           prevTokenCount,
           tokenEstimate,
           nudgeCooldownTurns: settings.nudgeCooldownTurns,
-          nudgeCooldownTokens: settings.nudgeCooldownTokens
+          nudgeCooldownTokens: settings.nudgeCooldownTokens,
+          usageCreditTokens: settings.usageCreditTokens,
+          creditBaseToken: typeof prevStats.creditBaseToken === "number" ? prevStats.creditBaseToken : void 0
         });
         const nextNudgeState = nudgeGate.nextNudgeState;
         const usage = config.modelContextLimit > 0 ? tokenEstimate / config.modelContextLimit : 0;
@@ -3862,6 +3869,11 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           nextStats.modelSavedTokens += applied.result.tokensCompressed;
           nextStats.lastCompressSource = "model";
           nextStats.lastCompressAt = Date.now();
+          const est = loaded.hostMetadata.lastTokenEstimate;
+          if (typeof est === "number") {
+            nextStats.creditBaseToken = est;
+            nextStats.creditRemaining = settings.usageCreditTokens;
+          }
         } else if (applied.result.blocksCreated === 0) {
           nextStats.compressFailed += 1;
         }
@@ -3966,14 +3978,17 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
       const tokenCount = estimateProjectionTokens(mapping.messages, collectCoveredMessageIds(loaded.kernelState));
       const report = core.status(loaded.kernelState, tokenCount, config);
       const stats = loaded.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS;
-      const proactiveRate = stats.nudgeIssued > 0 ? Math.round(stats.compressSucceeded / stats.nudgeIssued * 100) : 0;
-      const emergencyRate = stats.emergencyTriggered + stats.compressSucceeded > 0 ? Math.round(stats.emergencyTriggered / (stats.emergencyTriggered + stats.compressSucceeded) * 100) : 0;
+      const totalFolds = (stats.compressSucceeded ?? 0) + (stats.emergencyTriggered ?? 0);
+      const proactiveRate = totalFolds > 0 ? Math.round((stats.compressSucceeded ?? 0) / totalFolds * 100) : 0;
+      const emergencyRate = totalFolds > 0 ? Math.round((stats.emergencyTriggered ?? 0) / totalFolds * 100) : 0;
+      const conversionRate = stats.nudgeIssued > 0 ? Math.round((stats.compressCalled ?? 0) / stats.nudgeIssued * 100) : 0;
       const enriched = {
         ...typeof report === "object" && report !== null ? report : { raw: report },
         runtimeStats: stats,
         metrics: {
           proactiveCompressRatePct: proactiveRate,
           emergencySharePct: emergencyRate,
+          conversionRatePct: conversionRate,
           nudgeIssued: stats.nudgeIssued,
           compressSucceeded: stats.compressSucceeded,
           emergencyTriggered: stats.emergencyTriggered
@@ -4008,6 +4023,8 @@ function evaluateNudgeGate(input) {
   const nudgeCount = typeof prev.nudgeCount === "number" ? prev.nudgeCount : 0;
   const lastTokensAtInject = typeof prev.lastTokensAtInject === "number" ? prev.lastTokensAtInject : 0;
   const emergency = /EMERGENCY/i.test(input.kernelReason);
+  const creditLeft = input.usageCreditTokens > 0 && typeof input.creditBaseToken === "number" ? input.creditBaseToken + input.usageCreditTokens - input.tokenEstimate : 0;
+  const inCreditWindow = !emergency && creditLeft > 0;
   if (input.curBlocks > input.prevBlocks) {
     return { allowInject: false, nextNudgeState: { lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0 } };
   }
@@ -4015,6 +4032,9 @@ function evaluateNudgeGate(input) {
     return { allowInject: false, nextNudgeState: { lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0 } };
   }
   if (!input.kernelShouldInject) {
+    return { allowInject: false, nextNudgeState: prev };
+  }
+  if (inCreditWindow) {
     return { allowInject: false, nextNudgeState: prev };
   }
   if (!emergency && (lastInjectedAt > 0 || nudgeCount >= input.nudgeCooldownTurns)) {

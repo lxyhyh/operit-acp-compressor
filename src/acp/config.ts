@@ -46,6 +46,8 @@ export interface AdapterSettings {
   gentleThresholdPct: number;
   /** 强制建议阈值（0~1，usage ≥ 此值发 strong nudge）。默认 0.82。 */
   strongThresholdPct: number;
+  /** V0.4.1 usage credit：压缩后此 token 数内免除 nudge。默认 contextLimit*0.15。 */
+  usageCreditTokens: number;
   /** 数据目录。 */
   dataDir: string;
 }
@@ -119,9 +121,10 @@ function readList(key: string, dflt: string[]): string[] {
 }
 
 export function loadAdapterSettings(): AdapterSettings {
+  const modelContextLimit = readNum(KEYS.modelContextLimit, 200_000);
   return {
     enabled: readBool(KEYS.enabled, true),
-    modelContextLimit: readNum(KEYS.modelContextLimit, 200_000),
+    modelContextLimit,
     preserveRecentMessages: readNum(KEYS.preserveRecentMessages, 5),
     preserveRecentTokens: 5_000,
     protectedTools: readList("protectedTools", []),
@@ -138,6 +141,8 @@ export function loadAdapterSettings(): AdapterSettings {
     // V0.4 三档：温和提示沿用旧键 nudgeThresholdPct（兼容已存设置），强制/硬限新增键。
     gentleThresholdPct: readPct("nudgeThresholdPct", 0.72),
     strongThresholdPct: readPct("strongThresholdPct", 0.82),
+    // V0.4.1 usage credit：压缩后 contextLimit*15% token 内免除 nudge。
+    usageCreditTokens: Math.round(modelContextLimit * 0.15),
     dataDir: DATA_DIR,
   };
 }

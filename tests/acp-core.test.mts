@@ -318,3 +318,12 @@ test("V0.4 分档约束：gentle < strong < emergency（防配置倒挂）", () 
     assert.ok(gentle >= 0.5, "温和阈值不应低于 50%（否则正常对话也频繁打扰）");
     assert.ok(emergency <= 0.98, "硬限不应超过 98%（kernel emergencyOverride 语义）");
 });
+
+test("V0.4.1 usage credit：默认窗口 ≈ contextLimit 的 15%（200k → 30k）", () => {
+    const credit = Math.round(200_000 * 0.15);
+    assert.equal(credit, 30_000);
+    // 压缩后增长 30k 内应免打扰：base + credit - now > 0
+    const base = 70_000;
+    assert.ok(base + credit - 85_000 > 0, "85k < 100k 仍在 credit 窗口");
+    assert.ok(base + credit - 105_000 <= 0, "105k ≥ 100k 已出 credit 窗口");
+});

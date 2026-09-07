@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "toolpkg_id": "com.operit.acp_compressor",
+  "version": "0.3.0",
+  "author": ["Operit ACP Team"],
+  "main": "dist/main.js",
+  "display_name": {
+    "zh": "ACP 上下文压缩",
+    "en": "ACP Context Compressor"
+  },
+  "description": {
+    "zh": "渐进式上下文压缩：发送前自动投影折叠历史，模型可调用 compress 主动压缩；不中断对话、可逆恢复。",
+    "en": "Incremental context compression: projects/folds history before send; model calls compress proactively; non-interrupting and reversible."
+  },
+  "enabled_by_default": true,
+  "resources": [],
+  "subpackages": [
+    {
+      "id": "acp_tools",
+      "entry": "dist/packages/acp_tools.js",
+      "enabled_by_default": true,
+      "display_name": {
+        "zh": "ACP 压缩工具",
+        "en": "ACP Compression Tools"
+      },
+      "description": {
+        "zh": "ACP 上下文压缩引擎的模型侧工具：compress / decompress / search_context / acp_status",
+        "en": "ACP context compression engine model-side tools: compress / decompress / search_context / acp_status"
+      }
+    }
+  ]
+}

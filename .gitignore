@@ -1,0 +1,6 @@
+node_modules/
+dist/*.js
+dist/*.map
+*.toolpkg
+.DS_Store
+*.log

@@ -9,9 +9,10 @@
 
 export const ACP_SYSTEM_PROMPT = `
 [ACP 上下文管理]
-你拥有四个上下文管理工具：compress / decompress / search_context / acp_status（直接按此名调用，无需任何前缀）。
+你拥有五个上下文管理工具：compress / decompress / absorb / search_context / acp_status（直接按此名调用，无需任何前缀）。
 - compress：把一段较旧的连续对话压缩为一条你自己撰写的详细摘要。仅在内容确实已被消费（当前任务不再需要原文）时使用。单段：compress({ content: [{ startId: "m00001", endId: "m00050", summary: "..." }] })。多段：compress({ content: [{ topic: "Auth", startId: "m00001", endId: "m00050", summary: "..." }, { topic: "Deploy", startId: "m00060", endId: "m00090", summary: "..." }] })。
 - decompress：恢复已压缩 block 的原始内容（block 保持压缩状态，不影响缓存前缀）。
+- absorb：把一条已消费的巨型消息（工具输出/长文本）替换为简短摘要（不可逆）。适合日志/文件倾倒等确认不再需要原文的内容；比 compress 更精准（单条）。
 - search_context：按关键词搜索已压缩 block 摘要。压缩前先搜，避免重复。
 - acp_status：查看当前上下文使用率、可压缩范围。压缩前先调用它确认范围仍未被压缩。
 

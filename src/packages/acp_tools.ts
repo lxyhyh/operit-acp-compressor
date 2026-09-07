@@ -26,6 +26,19 @@
       ]
     }
     {
+      name: "absorb"
+      description: {
+        zh: "吸收指定 ref 所指的已消费工具结果/大段文本为简短摘要（不可逆，谨慎用）。absorb 适合把巨大的工具输出（日志/文件内容）在确认不再需要原文后换成摘要，释放 token。需要给要吸收的消息 ref id（acp_status 可查）与一段简短说明。"
+        en: "Absorb a consumed message (by ref id) into a short summary (irreversible, use with care). Good for huge tool outputs (logs/file dumps) you no longer need verbatim."
+      }
+      parameters: [
+        { name: "chatId", description: { zh: "会话 ID（可选）", en: "Chat ID (optional)" }, type: "string", required: false }
+        { name: "session", description: { zh: "session key（可选）", en: "Session key (optional)" }, type: "string", required: false }
+        { name: "ref", description: { zh: "要吸收的消息 ref id（如 m00042；acp_status 可查）", en: "Ref id of the message to absorb (e.g. m00042; see acp_status)" }, type: "string", required: true }
+        { name: "summary", description: { zh: "吸收后替换的简短摘要", en: "Short summary that replaces the absorbed message" }, type: "string", required: true }
+      ]
+    }
+    {
       name: "decompress"
       description: {
         zh: "恢复一个已压缩 block（deactivate），下次投影将包含其原始消息。"
@@ -190,6 +203,38 @@ export async function decompress(params: {
       return { success: false, message: result.error || "decompress 失败" };
     }
     return { success: true, message: `block ${blockId} 已恢复（deactivated），下次投影将包含其原始消息。` };
+  } catch (error) {
+    return { success: false, message: String(error && (error as Error).message ? (error as Error).message : error) };
+  }
+}
+
+export async function absorb(params: {
+  chatId?: string;
+  session?: string;
+  ref?: string;
+  summary?: string;
+}): Promise<unknown> {
+  try {
+    probeParams("absorb", params as Record<string, unknown>);
+    const e = getEngine();
+    const sessionKey = sessionKeyFromParams(params);
+    const ref = (params.ref || "").trim();
+    const summary = (params.summary || "").trim();
+    if (!ref) {
+      return { success: false, message: "ref 必填（要吸收的消息 ref id，acp_status 可查）。" };
+    }
+    if (!summary) {
+      return { success: false, message: "summary 必填（吸收后替换的简短摘要）。" };
+    }
+    const result = await e.absorb(sessionKey, ref, summary);
+    if (!result.ok) {
+      return { success: false, message: result.resultText || "absorb 失败" };
+    }
+    return {
+      success: true,
+      message: result.resultText || "absorb 完成",
+      data: { absorbedTokens: result.absorbedTokens },
+    };
   } catch (error) {
     return { success: false, message: String(error && (error as Error).message ? (error as Error).message : error) };
   }

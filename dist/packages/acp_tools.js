@@ -26,6 +26,19 @@
       ]
     }
     {
+      name: "absorb"
+      description: {
+        zh: "吸收指定 ref 所指的已消费工具结果/大段文本为简短摘要（不可逆，谨慎用）。absorb 适合把巨大的工具输出（日志/文件内容）在确认不再需要原文后换成摘要，释放 token。需要给要吸收的消息 ref id（acp_status 可查）与一段简短说明。"
+        en: "Absorb a consumed message (by ref id) into a short summary (irreversible, use with care). Good for huge tool outputs (logs/file dumps) you no longer need verbatim."
+      }
+      parameters: [
+        { name: "chatId", description: { zh: "会话 ID（可选）", en: "Chat ID (optional)" }, type: "string", required: false }
+        { name: "session", description: { zh: "session key（可选）", en: "Session key (optional)" }, type: "string", required: false }
+        { name: "ref", description: { zh: "要吸收的消息 ref id（如 m00042；acp_status 可查）", en: "Ref id of the message to absorb (e.g. m00042; see acp_status)" }, type: "string", required: true }
+        { name: "summary", description: { zh: "吸收后替换的简短摘要", en: "Short summary that replaces the absorbed message" }, type: "string", required: true }
+      ]
+    }
+    {
       name: "decompress"
       description: {
         zh: "恢复一个已压缩 block（deactivate），下次投影将包含其原始消息。"
@@ -112,6 +125,7 @@ var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "sy
 // src/packages/acp_tools.ts
 var acp_tools_exports = {};
 __export(acp_tools_exports, {
+  absorb: () => absorb,
   acp_status: () => acp_status,
   compress: () => compress,
   decompress: () => decompress,
@@ -4045,7 +4059,7 @@ function buildNudgeText(nudge, level) {
   if (nudge.compressibleRanges.length > 0) {
     const top = [...nudge.compressibleRanges].sort((a, b) => b.tokens - a.tokens)[0];
     lines.push(`\u5EFA\u8BAE\u538B\u7F29\u8303\u56F4\uFF1A${top.startRef}..${top.endRef}\uFF08\u8C03\u7528 compress\uFF09\u3002`);
-    lines.push(`\u53EF\u9009\u5DE5\u5177\uFF1Aacp_status\uFF08\u67E5\u72B6\u6001/\u8303\u56F4\uFF09\u3001decompress\uFF08\u6062\u590D\uFF09\u3001search_context\uFF08\u641C\u7D22\uFF09\u3002`);
+    lines.push(`\u53EF\u9009\u5DE5\u5177\uFF1Aacp_status\uFF08\u67E5\u72B6\u6001/\u8303\u56F4\uFF09\u3001absorb\uFF08\u5438\u6536\u5355\u6761\u5DE8\u578B\u8F93\u51FA\uFF09\u3001decompress\uFF08\u6062\u590D\uFF09\u3001search_context\uFF08\u641C\u7D22\uFF09\u3002`);
   }
   return lines.join("\n");
 }
@@ -4226,6 +4240,32 @@ async function decompress(params) {
       return { success: false, message: result.error || "decompress \u5931\u8D25" };
     }
     return { success: true, message: `block ${blockId} \u5DF2\u6062\u590D\uFF08deactivated\uFF09\uFF0C\u4E0B\u6B21\u6295\u5F71\u5C06\u5305\u542B\u5176\u539F\u59CB\u6D88\u606F\u3002` };
+  } catch (error) {
+    return { success: false, message: String(error && error.message ? error.message : error) };
+  }
+}
+async function absorb(params) {
+  try {
+    probeParams("absorb", params);
+    const e = getEngine();
+    const sessionKey = sessionKeyFromParams(params);
+    const ref = (params.ref || "").trim();
+    const summary = (params.summary || "").trim();
+    if (!ref) {
+      return { success: false, message: "ref \u5FC5\u586B\uFF08\u8981\u5438\u6536\u7684\u6D88\u606F ref id\uFF0Cacp_status \u53EF\u67E5\uFF09\u3002" };
+    }
+    if (!summary) {
+      return { success: false, message: "summary \u5FC5\u586B\uFF08\u5438\u6536\u540E\u66FF\u6362\u7684\u7B80\u77ED\u6458\u8981\uFF09\u3002" };
+    }
+    const result = await e.absorb(sessionKey, ref, summary);
+    if (!result.ok) {
+      return { success: false, message: result.resultText || "absorb \u5931\u8D25" };
+    }
+    return {
+      success: true,
+      message: result.resultText || "absorb \u5B8C\u6210",
+      data: { absorbedTokens: result.absorbedTokens }
+    };
   } catch (error) {
     return { success: false, message: String(error && error.message ? error.message : error) };
   }

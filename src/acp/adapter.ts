@@ -722,7 +722,7 @@ function buildNudgeText(nudge: { reason: string; compressibleRanges: { startRef:
   if (nudge.compressibleRanges.length > 0) {
     const top = [...nudge.compressibleRanges].sort((a, b) => b.tokens - a.tokens)[0];
     lines.push(`建议压缩范围：${top.startRef}..${top.endRef}（调用 compress）。`);
-    lines.push(`可选工具：acp_status（查状态/范围）、decompress（恢复）、search_context（搜索）。`);
+    lines.push(`可选工具：acp_status（查状态/范围）、absorb（吸收单条巨型输出）、decompress（恢复）、search_context（搜索）。`);
   }
   return lines.join("\n");
 }

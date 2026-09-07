@@ -119,11 +119,11 @@ test("appendAcpSystemPrompt 幂等", () => {
 
 // ---- 5. tools-meta ----
 
-test("tools-meta：4 个核心工具契约", () => {
+test("tools-meta：5 个核心工具契约（V0.5 含 absorb）", () => {
     const names = acpCoreToolNames();
-    assert.deepEqual(names, ["compress", "decompress", "search_context", "acp_status"]);
+    assert.deepEqual(names, ["compress", "absorb", "decompress", "search_context", "acp_status"]);
     const items = buildAcpToolPromptItems();
-    assert.equal(items.length, 4);
+    assert.equal(items.length, 5);
     for (const it of items) {
         assert.equal(typeof it.name, "string");
         assert.equal(typeof it.description, "string");

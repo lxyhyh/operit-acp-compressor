@@ -35,6 +35,7 @@ import {
 } from "./messages";
 import { collectCoveredMessageIds, estimateProjectionTokens } from "./token";
 import { createPersistence, stripOldAnchorMessages, EMPTY_RUNTIME_STATS, type Persistence, type OperitAcpSessionState } from "./persistence";
+import { chatTrace } from "./trace";
 
 /** 投影缓存（globalThis 共享；compress 等 state mutation 后失效）。
  *  V0.4：send（project）与 estimate 分离——两者投影内容可能不同
@@ -393,6 +394,11 @@ export function createEngine(dataDir?: string): AcpEngine {
           nextStats.emergencySavedTokens += emergencyFreedTokens;
           nextStats.lastCompressSource = "emergency";
           nextStats.lastCompressAt = Date.now();
+          // ACP Trace：紧急兜底折叠
+          chatTrace(chatId, {
+            type: "emergency",
+            detail: { blocks: newBlockIds.length, tokens: emergencyFreedTokens },
+          });
           // V0.4.1 usage credit：压缩完成当轮 usage 为基准，credit 内免打扰。
           nextStats.creditBaseToken = tokenEstimate;
           nextStats.creditRemaining = settings.usageCreditTokens;
@@ -483,6 +489,11 @@ export function createEngine(dataDir?: string): AcpEngine {
           const gateInfo = `allow=${nudgeGate.allowInject ? 1 : 0} kShould=${turn.nudge?.shouldInject ? 1 : 0}`;
           const st = nextStats;
           console.log(`[acp] project stage=${hookStage} chat=${chatId ? String(chatId).slice(0, 8) : "-"} sub=${isSubTask ? 1 : 0} fp=${fingerprint.slice(0, 12)} raw=${turns.length} proj=${cappedTurns.length} blocks=${active}/${turn.state.blocks.length} tok=${tokenEstimate} saved=${(cached.kernelState.stats?.tokensCompressed ?? 0) - (turn.state.stats?.tokensCompressed ?? 0)} nudge=${gateInfo} stats={n:${st.nudgeIssued},m:${st.compressSucceeded},e:${st.emergencyTriggered}} ${nudgeReason}`);
+          // ACP Trace：投影事件
+          chatTrace(chatId, {
+            type: "project", stage: hookStage,
+            detail: { raw: turns.length, proj: cappedTurns.length, blocks: turn.state.blocks.length, tok: tokenEstimate, nudgeAllow: nudgeGate.allowInject, emergency: autoFolded },
+          });
         } catch { /* noop */ }
 
         // [诊断] 返回前记录 preparedHistory[0] SYSTEM 长度（判定模型实际收到什么）
@@ -540,6 +551,12 @@ export function createEngine(dataDir?: string): AcpEngine {
           nextStats.modelSavedTokens += applied.result.tokensCompressed;
           nextStats.lastCompressSource = "model";
           nextStats.lastCompressAt = Date.now();
+          // ACP Trace：模型主动压缩成功
+          chatTrace(undefined, {
+            type: "compress",
+            level: "model",
+            detail: { blocks: applied.result.blocksCreated, tokens: applied.result.tokensCompressed, ranges: ranges.length },
+          });
           // V0.4.1 usage credit：模型主动压缩后同样获得免打扰窗口。
           const est = loaded.hostMetadata.lastTokenEstimate;
           if (typeof est === "number") {
@@ -599,6 +616,8 @@ export function createEngine(dataDir?: string): AcpEngine {
           },
         });
         projectionCache.delete(sessionKey); estimateCache.delete(sessionKey);
+        // ACP Trace：decompress 恢复
+        chatTrace(undefined, { type: "decompress", detail: { blockId } });
         return { ok: true };
       } finally {
         release();
@@ -635,6 +654,11 @@ export function createEngine(dataDir?: string): AcpEngine {
         });
         projectionCache.delete(sessionKey); estimateCache.delete(sessionKey);
         const record = result.state.absorbed?.slice(-1)[0] as { tokensReclaimed?: number } | undefined;
+        // ACP Trace：absorb 吸收成功
+        chatTrace(undefined, {
+          type: "absorb",
+          detail: { ref, absorbedTokens: record?.tokensReclaimed ?? 0 },
+        });
         return { ok: true, resultText: result.resultText, absorbedTokens: record?.tokensReclaimed };
       } finally {
         release();

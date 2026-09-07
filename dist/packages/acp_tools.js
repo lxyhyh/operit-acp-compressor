@@ -449,13 +449,13 @@ function collectSummaryAnchors(state, indexById, summaryIndexById) {
 }
 function rebuildMessages(messages, covered, firstUserIndex, anchors) {
   const result = [];
-  const pending = [...anchors];
+  const pending2 = [...anchors];
   const anchoredSummaryIds = new Set(
     anchors.map((anchor) => summaryMessageId(anchor.blockId))
   );
   for (let index = 0; index < messages.length; index++) {
-    while (pending.length > 0 && pending[0].insertAt === index) {
-      result.push(renderSummary(pending.shift()));
+    while (pending2.length > 0 && pending2[0].insertAt === index) {
+      result.push(renderSummary(pending2.shift()));
     }
     if (index === firstUserIndex && firstUserIndex >= 0) {
       result.push(messages[index]);
@@ -466,8 +466,8 @@ function rebuildMessages(messages, covered, firstUserIndex, anchors) {
       continue;
     result.push(messages[index]);
   }
-  while (pending.length > 0) {
-    result.push(renderSummary(pending.shift()));
+  while (pending2.length > 0) {
+    result.push(renderSummary(pending2.shift()));
   }
   return result;
 }
@@ -3541,6 +3541,40 @@ function createPersistence(dataDir) {
   };
 }
 
+// src/acp/trace.ts
+var MAX_PENDING = 200;
+var pending = [];
+var flushTimer = void 0;
+function trace(ev) {
+  try {
+    pending.push(ev);
+    if (pending.length >= MAX_PENDING) flushSync();
+    else if (flushTimer === void 0) {
+      flushTimer = setTimeout(() => {
+        flushTimer = void 0;
+        flushSync();
+      }, 1e3);
+    }
+  } catch {
+  }
+}
+function flushSync() {
+  try {
+    if (pending.length === 0) return;
+    const batch = pending.splice(0, pending.length);
+    const lines = batch.map((e) => JSON.stringify(e)).join("\n");
+    Tools.Files.mkdir(LOG_DIR, true, "android").catch(() => {
+    });
+    Tools.Files.write(`${LOG_DIR}/acp_trace.jsonl`, `${lines}
+`, true, "android").catch(() => {
+    });
+  } catch {
+  }
+}
+function chatTrace(chatId, ev) {
+  trace({ ...ev, t: Date.now(), chat: chatId ? String(chatId).slice(0, 8) : void 0 });
+}
+
 // src/acp/adapter.ts
 var projectionCache = globalThis.__acpProjectionCacheV2 ?? /* @__PURE__ */ new Map();
 if (!globalThis.__acpProjectionCacheV2) {
@@ -3792,6 +3826,10 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           nextStats.emergencySavedTokens += emergencyFreedTokens;
           nextStats.lastCompressSource = "emergency";
           nextStats.lastCompressAt = Date.now();
+          chatTrace(chatId, {
+            type: "emergency",
+            detail: { blocks: newBlockIds.length, tokens: emergencyFreedTokens }
+          });
           nextStats.creditBaseToken = tokenEstimate;
           nextStats.creditRemaining = settings.usageCreditTokens;
         }
@@ -3864,6 +3902,11 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           const gateInfo = `allow=${nudgeGate.allowInject ? 1 : 0} kShould=${turn.nudge?.shouldInject ? 1 : 0}`;
           const st = nextStats;
           console.log(`[acp] project stage=${hookStage} chat=${chatId ? String(chatId).slice(0, 8) : "-"} sub=${isSubTask ? 1 : 0} fp=${fingerprint.slice(0, 12)} raw=${turns.length} proj=${cappedTurns.length} blocks=${active}/${turn.state.blocks.length} tok=${tokenEstimate} saved=${(cached.kernelState.stats?.tokensCompressed ?? 0) - (turn.state.stats?.tokensCompressed ?? 0)} nudge=${gateInfo} stats={n:${st.nudgeIssued},m:${st.compressSucceeded},e:${st.emergencyTriggered}} ${nudgeReason}`);
+          chatTrace(chatId, {
+            type: "project",
+            stage: hookStage,
+            detail: { raw: turns.length, proj: cappedTurns.length, blocks: turn.state.blocks.length, tok: tokenEstimate, nudgeAllow: nudgeGate.allowInject, emergency: autoFolded }
+          });
         } catch {
         }
         try {
@@ -3915,6 +3958,11 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           nextStats.modelSavedTokens += applied.result.tokensCompressed;
           nextStats.lastCompressSource = "model";
           nextStats.lastCompressAt = Date.now();
+          chatTrace(void 0, {
+            type: "compress",
+            level: "model",
+            detail: { blocks: applied.result.blocksCreated, tokens: applied.result.tokensCompressed, ranges: ranges.length }
+          });
           const est = loaded.hostMetadata.lastTokenEstimate;
           if (typeof est === "number") {
             nextStats.creditBaseToken = est;
@@ -3971,6 +4019,7 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
         });
         projectionCache.delete(sessionKey);
         estimateCache.delete(sessionKey);
+        chatTrace(void 0, { type: "decompress", detail: { blockId } });
         return { ok: true };
       } finally {
         release();
@@ -4007,6 +4056,10 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
         projectionCache.delete(sessionKey);
         estimateCache.delete(sessionKey);
         const record = result.state.absorbed?.slice(-1)[0];
+        chatTrace(void 0, {
+          type: "absorb",
+          detail: { ref, absorbedTokens: record?.tokensReclaimed ?? 0 }
+        });
         return { ok: true, resultText: result.resultText, absorbedTokens: record?.tokensReclaimed };
       } finally {
         release();

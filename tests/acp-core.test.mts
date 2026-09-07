@@ -339,6 +339,79 @@ test("V0.4.2 pressure epoch 契约：档位只升不降、压缩关闭后重置�
     assert.equal(levelFor("emergency", 0.75), "emergency"); // closed 前 maxLevel 保留延续
 });
 
+// —— 文档 Phase3.1 absorb candidate 契约测试
+import {
+  detectAbsorbCandidates,
+  upsertAbsorbCandidates,
+  getActiveAbsorbCandidates,
+  markAbsorbed,
+  type AbsorbCandidate,
+} from "../src/acp/absorb-candidates.ts";
+import { stableKeyForTurn } from "../src/acp/messages.ts";
+
+function mkTurn(kind: string, content: string, toolName?: string) {
+  return { kind, content, toolName, metadata: {} };
+}
+/** 生成真实 stableKey（detectAbsorbCandidates 内部用 stableKeyForTurn 匹配 byRaw）。 */
+function stableKeyForTurnForTest(t: any): string {
+  return stableKeyForTurn(t);
+}
+function mkCand(ref: string, stableKey: string, chars: number, status: "candidate" | "absorbed" = "candidate"): AbsorbCandidate {
+  return { ref, stableKey, chars, turnIndex: 0, status, createdAt: 1 };
+}
+
+test("Test1: 无 nudge 也能发现 candidate（usage 低、TOOL_RESULT=10k）", () => {
+  const turns = [mkTurn("USER", "hi"), mkTurn("TOOL_RESULT", "x".repeat(10000), "read_file")];
+  const mapping = { messages: [], byKey: new Map() };
+  const state = { messageRefs: { byRaw: { [stableKeyForTurnForTest(turns[1])]: "m00042" } } } as any;
+  const cands = detectAbsorbCandidates(turns as any, mapping as any, state, new Set());
+  assert.equal(cands.length, 1);
+  assert.equal(cands[0].ref, "m00042");
+});
+
+test("Test2: 多 Hop 不重复（同一 TOOL_RESULT 幂等去重）", () => {
+  const turn = mkTurn("TOOL_RESULT", "y".repeat(9000), "terminal");
+  const key = stableKeyForTurnForTest(turn);
+  const state = { messageRefs: { byRaw: { [key]: "m00007" } } } as any;
+  const detected = detectAbsorbCandidates([turn] as any, { messages: [], byKey: new Map() } as any, state, new Set());
+  const merged = upsertAbsorbCandidates(detected, detected); // 模拟 Hop2 再次 detect
+  const merged3 = upsertAbsorbCandidates(merged, detected); // Hop3
+  assert.equal(getActiveAbsorbCandidates(merged3).length, 1, "同一 TOOL_RESULT 应只有 1 个 candidate");
+});
+
+test("Test3: 多 candidate（3 个不同巨型 TOOL_RESULT → 3 个 ref）", () => {
+  const turns = [
+    mkTurn("TOOL_RESULT", "a".repeat(10000), "toolA"),
+    mkTurn("TOOL_RESULT", "b".repeat(20000), "toolB"),
+    mkTurn("TOOL_RESULT", "c".repeat(30000), "toolC"),
+  ];
+  const byRaw: Record<string, string> = {};
+  const mapping = { messages: [], byKey: new Map() } as any;
+  for (let i = 0; i < turns.length; i++) byRaw[stableKeyForTurnForTest(turns[i])] = `m0000${i + 1}`;
+  const state = { messageRefs: { byRaw } } as any;
+  const cands = detectAbsorbCandidates(turns as any, mapping, state, new Set());
+  assert.equal(cands.length, 3);
+  const refs = new Set(cands.map((c) => c.ref));
+  assert.equal(refs.size, 3, "3 个不同候选应有 3 个不同 ref");
+});
+
+test("Test4: absorb 后消失（markAbsorbed 后不再作为 active）", () => {
+  const cands = [mkCand("m00001", "k1", 10000), mkCand("m00002", "k2", 8000)];
+  const after = markAbsorbed(cands, "m00001");
+  const active = getActiveAbsorbCandidates(after);
+  assert.equal(active.length, 1);
+  assert.equal(active[0].ref, "m00002");
+});
+
+test("Test5: 已被 compression block 覆盖的 TOOL_RESULT 不产生 candidate", () => {
+  const turn = mkTurn("TOOL_RESULT", "z".repeat(8000), "terminal");
+  const key = stableKeyForTurnForTest(turn);
+  const state = { messageRefs: { byRaw: { [key]: "m00009" } } } as any;
+  const covered = new Set([key]); // 已被 block 覆盖
+  const cands = detectAbsorbCandidates([turn] as any, { messages: [], byKey: new Map() } as any, state, covered);
+  assert.equal(cands.length, 0, "covered 消息不应产生 candidate");
+});
+
 test("V0.4.1 usage credit：默认窗口 ≈ contextLimit 的 15%（200k → 30k）", () => {
     const credit = Math.round(200_000 * 0.15);
     assert.equal(credit, 30_000);

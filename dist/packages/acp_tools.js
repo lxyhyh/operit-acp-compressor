@@ -3577,6 +3577,62 @@ function chatTrace(chatId, ev) {
   trace({ ...ev, t: Date.now(), chat: chatId ? String(chatId).slice(0, 8) : void 0 });
 }
 
+// src/acp/absorb-candidates.ts
+var HUGE_TOOL_RESULT_CHARS = 6e3;
+function detectAbsorbCandidates(turns, mapping, state, coveredKeys, minChars = HUGE_TOOL_RESULT_CHARS) {
+  const candidates = [];
+  const byRaw = state.messageRefs?.byRaw ?? {};
+  const now = Date.now();
+  for (let i = 0; i < turns.length; i++) {
+    const t = turns[i];
+    if (!t || typeof t !== "object") continue;
+    const kind = t.kind;
+    if (kind !== "TOOL_RESULT" && kind !== "tool") continue;
+    const content = typeof t.content === "string" ? t.content : "";
+    if (content.length < minChars) continue;
+    const key = stableKeyForTurn(t);
+    if (coveredKeys.has(key)) continue;
+    const ref = byRaw[key];
+    if (!ref) continue;
+    candidates.push({
+      ref,
+      stableKey: key,
+      tool: t.toolName || "tool",
+      chars: content.length,
+      turnIndex: i,
+      status: "candidate",
+      createdAt: now
+    });
+  }
+  return candidates;
+}
+function upsertAbsorbCandidates(existing, detected) {
+  const map = /* @__PURE__ */ new Map();
+  for (const c of existing ?? []) map.set(c.stableKey, c);
+  for (const c of detected) {
+    const prev = map.get(c.stableKey);
+    if (prev) {
+      map.set(c.stableKey, {
+        ...prev,
+        chars: c.chars,
+        turnIndex: c.turnIndex,
+        tool: c.tool ?? prev.tool
+      });
+    } else {
+      map.set(c.stableKey, c);
+    }
+  }
+  return [...map.values()].sort((a, b) => b.chars - a.chars);
+}
+function getActiveAbsorbCandidates(candidates) {
+  return (candidates ?? []).filter((c) => c.status !== "absorbed");
+}
+function markAbsorbed(candidates, ref) {
+  return (candidates ?? []).map(
+    (c) => c.ref === ref && c.status !== "absorbed" ? { ...c, status: "absorbed" } : c
+  );
+}
+
 // src/acp/adapter.ts
 var projectionCache = globalThis.__acpProjectionCacheV2 ?? /* @__PURE__ */ new Map();
 if (!globalThis.__acpProjectionCacheV2) {
@@ -3790,6 +3846,23 @@ function createEngine(dataDir) {
           }
         }
         const projectedTurns = coreMessagesToPromptTurns(projectedMessages, mapping.byKey);
+        let nextAbsorbCandidates = cached.hostMetadata.absorbCandidates;
+        try {
+          const detected = detectAbsorbCandidates(turns, mapping, turn.state, coveredIds);
+          nextAbsorbCandidates = upsertAbsorbCandidates(cached.hostMetadata.absorbCandidates, detected);
+          if (nextAbsorbCandidates.length > 0) {
+            try {
+              const active = getActiveAbsorbCandidates(nextAbsorbCandidates);
+              console.log(`[acp] absorb-candidates active=${active.length} total=${nextAbsorbCandidates.length} big=${active.slice(0, 3).map((c) => `${c.tool}:${c.chars}`).join(" ")}`);
+            } catch {
+            }
+          }
+        } catch (e) {
+          try {
+            console.log(`[acp] absorb-candidate detect failed: ${String(e)}`);
+          } catch {
+          }
+        }
         let autoFolded = false;
         let emergencyFreedTokens = 0;
         let preflightRounds = 0;
@@ -3919,11 +3992,14 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
         let nudgeText;
         if (nudgeGate.allowInject && settings.nudgeEnabled) {
           nudgeText = buildNudgeText(turn.nudge, level);
-          const huge = findHugeToolResults(turns, 6e3);
-          if (huge.length > 0) {
+          const active = getActiveAbsorbCandidates(nextAbsorbCandidates);
+          if (active.length > 0) {
+            const lines = active.slice(0, 3).map((c) => `- ref=${c.ref} tool=${c.tool} size=${c.chars}`);
             nudgeText += `
-\uFF08\u68C0\u6D4B\u5230 ${huge.length} \u6761\u5DE8\u578B\u5DE5\u5177\u8F93\u51FA\u53EF absorb\uFF1A${huge.slice(0, 3).map((h) => h.tool || "tool").join("\u3001")}${huge.length > 3 ? " \u7B49" : ""}\u2014\u2014\u82E5\u5185\u5BB9\u5DF2\u88AB\u6D88\u8D39\uFF0C\u53EF\u8C03\u7528 absorb \u91CA\u653E token\u3002\uFF09`;
-            nextStats.nudgeIssued += 0;
+\u68C0\u6D4B\u5230\u53EF\u91CA\u653E\u7684\u5927\u578B\u5DE5\u5177\u8F93\u51FA\u3002\u53EF\u5438\u6536\u5019\u9009\uFF1A
+${lines.join("\n")}${active.length > 3 ? `
+- \u53CA\u53E6\u5916 ${active.length - 3} \u6761` : ""}
+\u5982\u679C\u8FD9\u4E9B\u5185\u5BB9\u5DF2\u88AB\u6D88\u8D39\u4E14\u540E\u7EED\u4E0D\u9700\u8981\u539F\u6587\uFF0C\u8BF7\u8C03\u7528 absorb(ref="...", summary="...") \u91CA\u653E\u4E0A\u4E0B\u6587\u7A7A\u95F4\u3002`;
           }
           projectedTurns.push({ kind: "SYSTEM", content: nudgeText, metadata: { acpNudge: true, acpNudgeLevel: level } });
           nextStats.nudgeIssued += 1;
@@ -3943,6 +4019,7 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
             lastTokenEstimate: tokenEstimate,
             acpNudge: nextNudgeState,
             runtimeStats: nextStats,
+            absorbCandidates: nextAbsorbCandidates,
             blockSources: {
               ...cached.hostMetadata.blockSources ?? {},
               // 新 emergency block 标记来源；保留历史标记。
@@ -4109,7 +4186,9 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
             ...loaded.hostMetadata,
             lastUpdatedAt: Date.now(),
             stateVersion: (loaded.hostMetadata.stateVersion ?? 0) + 1,
-            lastProjectionFingerprint: void 0
+            lastProjectionFingerprint: void 0,
+            // V0.6 Phase3.1：absorb 成功后该 ref 标记 absorbed，后续不再作为 active 候选提示。
+            absorbCandidates: markAbsorbed(loaded.hostMetadata.absorbCandidates, ref)
           }
         });
         projectionCache.delete(sessionKey);
@@ -4158,18 +4237,6 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
       return persistence.load(sessionKey);
     }
   };
-}
-function findHugeToolResults(turns, minChars) {
-  const out = [];
-  for (const t of turns) {
-    const kind = t.kind;
-    if (kind !== "TOOL_RESULT" && kind !== "tool") continue;
-    const c = typeof t.content === "string" ? String(t.content) : "";
-    if (c.length >= minChars) {
-      out.push({ tool: t.toolName, chars: c.length });
-    }
-  }
-  return out.slice(0, 5);
 }
 function buildNudgeText(nudge, level) {
   const lines = [];

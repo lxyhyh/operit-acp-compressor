@@ -11,6 +11,7 @@ import type { CompressionState } from "acp-kernel";
 import { createInitialState, isSummaryMessageId } from "acp-kernel";
 import { hashString } from "./messages";
 import { STATE_DIR } from "./paths";
+import type { AbsorbCandidate } from "./absorb-candidates";
 
 export interface AcpRuntimeStats {
   /** 发出 nudge 的次数（分档计数）。 */
@@ -71,6 +72,8 @@ export interface OperitAcpSessionState {
     runtimeStats?: AcpRuntimeStats;
     /** V0.4：block 来源映射 blockId → model | emergency（搜索/统计用）。 */
     blockSources?: Record<string, "model" | "emergency">;
+    /** V0.6 Phase3.1：巨型工具输出 absorb 候选（持久化，跨 Hop 幂等）。 */
+    absorbCandidates?: AbsorbCandidate[];
   };
   /** 仅内存载体（hook 最近一次投影的原始 turns），save 不落盘。 */
   lastRawTurns?: Array<{ kind: string; content: string; toolName?: string; metadata?: Record<string, unknown> | null }>;

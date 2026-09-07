@@ -36,6 +36,13 @@ import {
 import { collectCoveredMessageIds, estimateProjectionTokens } from "./token";
 import { createPersistence, stripOldAnchorMessages, EMPTY_RUNTIME_STATS, type Persistence, type OperitAcpSessionState } from "./persistence";
 import { chatTrace } from "./trace";
+import {
+  detectAbsorbCandidates,
+  upsertAbsorbCandidates,
+  getActiveAbsorbCandidates,
+  markAbsorbed,
+  type AbsorbCandidate,
+} from "./absorb-candidates";
 
 /** 投影缓存（globalThis 共享；compress 等 state mutation 后失效）。
  *  V0.4：send（project）与 estimate 分离——两者投影内容可能不同
@@ -349,6 +356,25 @@ export function createEngine(dataDir?: string): AcpEngine {
         }
 
         const projectedTurns = coreMessagesToPromptTurns(projectedMessages, mapping.byKey);
+
+        // —— V0.6 Phase3.1：巨型 TOOL_RESULT 候选检测（与 nudge 完全解耦——恒执行）。
+        //    processTurn 后 state.messageRefs.byRaw 已就绪，用 stableKey 定位稳定 ref。
+        //    无论 usage 高低，只要 finalize 收到巨型工具输出就发现它；已被压缩 block
+        //    覆盖的消息跳过；absorb 成功的保持 absorbed 不再提示。
+        let nextAbsorbCandidates = cached.hostMetadata.absorbCandidates;
+        try {
+          const detected = detectAbsorbCandidates(turns, mapping, turn.state, coveredIds);
+          nextAbsorbCandidates = upsertAbsorbCandidates(cached.hostMetadata.absorbCandidates, detected);
+          if (nextAbsorbCandidates.length > 0) {
+            try {
+              const active = getActiveAbsorbCandidates(nextAbsorbCandidates);
+              console.log(`[acp] absorb-candidates active=${active.length} total=${nextAbsorbCandidates.length} big=${active.slice(0, 3).map((c) => `${c.tool}:${c.chars}`).join(" ")}`);
+            } catch { /* noop */ }
+          }
+        } catch (e) {
+          try { console.log(`[acp] absorb-candidate detect failed: ${String(e)}`); } catch { /* noop */ }
+        }
+
         // —— Preflight 自动兜底（文档 Phase 5）：request 可能超过模型窗口时，
         //    插件连续压缩多轮，直到 fit 或无可压缩范围，不等模型 compress、不因
         //    一次压缩后仍超限而放弃。摘要带 [ACP 自动折叠] 标记可 decompress 恢复。
@@ -500,12 +526,12 @@ export function createEngine(dataDir?: string): AcpEngine {
         let nudgeText: string | undefined;
         if (nudgeGate.allowInject && settings.nudgeEnabled) {
           nudgeText = buildNudgeText(turn.nudge!, level);
-          // V0.6 Phase3（宿主无 ToolLifecycleHook 的替代）：扫描本轮巨型工具输出，
-          //    追加 absorb 建议——模型可主动吸收已消费的大段工具结果，省 token。
-          const huge = findHugeToolResults(turns, 6000);
-          if (huge.length > 0) {
-            nudgeText += `\n（检测到 ${huge.length} 条巨型工具输出可 absorb：${huge.slice(0, 3).map((h) => h.tool || "tool").join("、")}${huge.length > 3 ? " 等" : ""}——若内容已被消费，可调用 absorb 释放 token。）`;
-            nextStats.nudgeIssued += 0; // 不计 extra 提醒为一次 nudge
+          // V0.6 Phase3.1：从持久化候选读取（检测已在 project 内与 nudge 解耦恒执行）。
+          //    只消费候选，不在此处重新检测。文案提供可操作 ref（与 absorb 工具兼容）。
+          const active = getActiveAbsorbCandidates(nextAbsorbCandidates);
+          if (active.length > 0) {
+            const lines = active.slice(0, 3).map((c) => `- ref=${c.ref} tool=${c.tool} size=${c.chars}`);
+            nudgeText += `\n检测到可释放的大型工具输出。可吸收候选：\n${lines.join("\n")}${active.length > 3 ? `\n- 及另外 ${active.length - 3} 条` : ""}\n如果这些内容已被消费且后续不需要原文，请调用 absorb(ref="...", summary="...") 释放上下文空间。`;
           }
           projectedTurns.push({ kind: "SYSTEM", content: nudgeText, metadata: { acpNudge: true, acpNudgeLevel: level } });
           nextStats.nudgeIssued += 1;
@@ -528,6 +554,7 @@ export function createEngine(dataDir?: string): AcpEngine {
             lastTokenEstimate: tokenEstimate,
             acpNudge: nextNudgeState,
             runtimeStats: nextStats,
+            absorbCandidates: nextAbsorbCandidates,
             blockSources: {
               ...(cached.hostMetadata.blockSources ?? {}),
               // 新 emergency block 标记来源；保留历史标记。
@@ -712,6 +739,8 @@ export function createEngine(dataDir?: string): AcpEngine {
             lastUpdatedAt: Date.now(),
             stateVersion: (loaded.hostMetadata.stateVersion ?? 0) + 1,
             lastProjectionFingerprint: undefined as string | undefined,
+            // V0.6 Phase3.1：absorb 成功后该 ref 标记 absorbed，后续不再作为 active 候选提示。
+            absorbCandidates: markAbsorbed(loaded.hostMetadata.absorbCandidates, ref),
           },
         });
         projectionCache.delete(sessionKey); estimateCache.delete(sessionKey);
@@ -792,20 +821,6 @@ interface PressureEpoch {
   maxLevel: NudgeLevel | "none";
   /** 纪元是否已因压缩成功关闭（关闭后无新越线不再注入）。 */
   closed: boolean;
-}
-
-/** V0.6 Phase3：扫描 turns 里的巨型工具输出（≥minChars），返回候选（供 nudge 建议 absorb）。 */
-function findHugeToolResults(turns: PromptTurnLike[], minChars: number): { tool?: string; chars: number }[] {
-  const out: { tool?: string; chars: number }[] = [];
-  for (const t of turns) {
-    const kind = (t as { kind?: string }).kind;
-    if (kind !== "TOOL_RESULT" && kind !== "tool") continue;
-    const c = typeof (t as { content?: unknown }).content === "string" ? String((t as { content?: unknown }).content) : "";
-    if (c.length >= minChars) {
-      out.push({ tool: (t as { toolName?: string }).toolName, chars: c.length });
-    }
-  }
-  return out.slice(0, 5);
 }
 
 function buildNudgeText(nudge: { reason: string; compressibleRanges: { startRef: string; endRef: string; tokens: number }[] }, level: NudgeLevel): string {

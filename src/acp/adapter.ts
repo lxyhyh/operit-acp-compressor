@@ -500,6 +500,13 @@ export function createEngine(dataDir?: string): AcpEngine {
         let nudgeText: string | undefined;
         if (nudgeGate.allowInject && settings.nudgeEnabled) {
           nudgeText = buildNudgeText(turn.nudge!, level);
+          // V0.6 Phase3（宿主无 ToolLifecycleHook 的替代）：扫描本轮巨型工具输出，
+          //    追加 absorb 建议——模型可主动吸收已消费的大段工具结果，省 token。
+          const huge = findHugeToolResults(turns, 6000);
+          if (huge.length > 0) {
+            nudgeText += `\n（检测到 ${huge.length} 条巨型工具输出可 absorb：${huge.slice(0, 3).map((h) => h.tool || "tool").join("、")}${huge.length > 3 ? " 等" : ""}——若内容已被消费，可调用 absorb 释放 token。）`;
+            nextStats.nudgeIssued += 0; // 不计 extra 提醒为一次 nudge
+          }
           projectedTurns.push({ kind: "SYSTEM", content: nudgeText, metadata: { acpNudge: true, acpNudgeLevel: level } });
           nextStats.nudgeIssued += 1;
           if (level === "gentle") nextStats.gentleNudges += 1;
@@ -785,6 +792,20 @@ interface PressureEpoch {
   maxLevel: NudgeLevel | "none";
   /** 纪元是否已因压缩成功关闭（关闭后无新越线不再注入）。 */
   closed: boolean;
+}
+
+/** V0.6 Phase3：扫描 turns 里的巨型工具输出（≥minChars），返回候选（供 nudge 建议 absorb）。 */
+function findHugeToolResults(turns: PromptTurnLike[], minChars: number): { tool?: string; chars: number }[] {
+  const out: { tool?: string; chars: number }[] = [];
+  for (const t of turns) {
+    const kind = (t as { kind?: string }).kind;
+    if (kind !== "TOOL_RESULT" && kind !== "tool") continue;
+    const c = typeof (t as { content?: unknown }).content === "string" ? String((t as { content?: unknown }).content) : "";
+    if (c.length >= minChars) {
+      out.push({ tool: (t as { toolName?: string }).toolName, chars: c.length });
+    }
+  }
+  return out.slice(0, 5);
 }
 
 function buildNudgeText(nudge: { reason: string; compressibleRanges: { startRef: string; endRef: string; tokens: number }[] }, level: NudgeLevel): string {

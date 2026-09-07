@@ -3919,6 +3919,12 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
         let nudgeText;
         if (nudgeGate.allowInject && settings.nudgeEnabled) {
           nudgeText = buildNudgeText(turn.nudge, level);
+          const huge = findHugeToolResults(turns, 6e3);
+          if (huge.length > 0) {
+            nudgeText += `
+\uFF08\u68C0\u6D4B\u5230 ${huge.length} \u6761\u5DE8\u578B\u5DE5\u5177\u8F93\u51FA\u53EF absorb\uFF1A${huge.slice(0, 3).map((h) => h.tool || "tool").join("\u3001")}${huge.length > 3 ? " \u7B49" : ""}\u2014\u2014\u82E5\u5185\u5BB9\u5DF2\u88AB\u6D88\u8D39\uFF0C\u53EF\u8C03\u7528 absorb \u91CA\u653E token\u3002\uFF09`;
+            nextStats.nudgeIssued += 0;
+          }
           projectedTurns.push({ kind: "SYSTEM", content: nudgeText, metadata: { acpNudge: true, acpNudgeLevel: level } });
           nextStats.nudgeIssued += 1;
           if (level === "gentle") nextStats.gentleNudges += 1;
@@ -4152,6 +4158,18 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
       return persistence.load(sessionKey);
     }
   };
+}
+function findHugeToolResults(turns, minChars) {
+  const out = [];
+  for (const t of turns) {
+    const kind = t.kind;
+    if (kind !== "TOOL_RESULT" && kind !== "tool") continue;
+    const c = typeof t.content === "string" ? String(t.content) : "";
+    if (c.length >= minChars) {
+      out.push({ tool: t.toolName, chars: c.length });
+    }
+  }
+  return out.slice(0, 5);
 }
 function buildNudgeText(nudge, level) {
   const lines = [];

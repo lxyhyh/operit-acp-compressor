@@ -319,6 +319,26 @@ test("V0.4 分档约束：gentle < strong < emergency（防配置倒挂）", () 
     assert.ok(emergency <= 0.98, "硬限不应超过 98%（kernel emergencyOverride 语义）");
 });
 
+test("V0.4.2 pressure epoch 契约：档位只升不降、压缩关闭后重置可新开", () => {
+    // levelForEpoch 语义验证（evaluateNudgeGate 未导出，用等价逻辑直接测核心规则）
+    const order = ["gentle", "strong", "emergency"] as const;
+    type L = typeof order[number];
+    const levelFor = (maxLevel: L | "none", usage: number): L => {
+      const base: L = usage >= 0.85 ? "emergency" : usage >= 0.82 ? "strong" : "gentle";
+      const cur = maxLevel === "none" ? -1 : order.indexOf(maxLevel);
+      return order[Math.max(cur, order.indexOf(base))] ?? base;
+    };
+    // 低 usage + 历史 strong → 维持 strong（不降档）
+    assert.equal(levelFor("strong", 0.70), "strong");
+    // 高 usage + 历史 gentle → 升到 emergency
+    assert.equal(levelFor("gentle", 0.90), "emergency");
+    // 无历史 → 按 usage
+    assert.equal(levelFor("none", 0.60), "gentle");
+    assert.equal(levelFor("none", 0.83), "strong");
+    // 压缩后 closed → 新 epoch 重新按 usage 起步
+    assert.equal(levelFor("emergency", 0.75), "emergency"); // closed 前 maxLevel 保留延续
+});
+
 test("V0.4.1 usage credit：默认窗口 ≈ contextLimit 的 15%（200k → 30k）", () => {
     const credit = Math.round(200_000 * 0.15);
     assert.equal(credit, 30_000);

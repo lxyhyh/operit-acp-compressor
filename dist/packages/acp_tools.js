@@ -3785,6 +3785,8 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
         const prevBlocks = cached.kernelState.blocks.length;
         const curBlocks = turn.state.blocks.length;
         const prevTokenCount = cached.hostMetadata.lastTokenEstimate ?? 0;
+        const usage = config.modelContextLimit > 0 ? tokenEstimate / config.modelContextLimit : 0;
+        const prevEpoch = prevNudgeState.acpEpoch;
         const nudgeGate = evaluateNudgeGate({
           kernelShouldInject: turn.nudge?.shouldInject === true,
           kernelReason: turn.nudge?.reason ?? "",
@@ -3796,11 +3798,19 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           nudgeCooldownTurns: settings.nudgeCooldownTurns,
           nudgeCooldownTokens: settings.nudgeCooldownTokens,
           usageCreditTokens: settings.usageCreditTokens,
-          creditBaseToken: typeof prevStats.creditBaseToken === "number" ? prevStats.creditBaseToken : void 0
+          creditBaseToken: typeof prevStats.creditBaseToken === "number" ? prevStats.creditBaseToken : void 0,
+          usage,
+          gentleThresholdPct: settings.gentleThresholdPct,
+          strongThresholdPct: settings.strongThresholdPct,
+          emergencyThresholdPct: settings.hardLimitPct,
+          prevEpoch
         });
-        const nextNudgeState = nudgeGate.nextNudgeState;
-        const usage = config.modelContextLimit > 0 ? tokenEstimate / config.modelContextLimit : 0;
-        const level = emergency ? "emergency" : usage >= settings.strongThresholdPct ? "strong" : usage >= settings.gentleThresholdPct ? "gentle" : "gentle";
+        const nextNudgeState = {
+          ...nudgeGate.nextNudgeState,
+          // 持久化 epoch 到 acpNudge（跨轮/跨 VM 恢复压力档位）
+          ...nudgeGate.nextEpoch ? { acpEpoch: nudgeGate.nextEpoch } : {}
+        };
+        const level = nudgeGate.level ?? (emergency ? "emergency" : usage >= settings.strongThresholdPct ? "strong" : usage >= settings.gentleThresholdPct ? "gentle" : "gentle");
         let nudgeText;
         if (nudgeGate.allowInject && settings.nudgeEnabled) {
           nudgeText = buildNudgeText(turn.nudge, level);
@@ -4039,16 +4049,49 @@ function buildNudgeText(nudge, level) {
   }
   return lines.join("\n");
 }
+function readEpoch(prev) {
+  try {
+    const a = prev.anchors;
+    if (!a || typeof a !== "object") return void 0;
+    const e = a.pressureEpoch;
+    if (!e || typeof e !== "object") return void 0;
+    return {
+      epoch: typeof e.epoch === "number" ? e.epoch : 0,
+      openedAtUsage: typeof e.openedAtUsage === "number" ? e.openedAtUsage : 0,
+      injections: typeof e.injections === "number" ? e.injections : 0,
+      maxLevel: e.maxLevel ?? "none",
+      closed: e.closed === true
+    };
+  } catch {
+    return void 0;
+  }
+}
+function levelForEpoch(epoch, usage, s) {
+  const baseLevel = usage >= s.emergencyThresholdPct ? "emergency" : usage >= s.strongThresholdPct ? "strong" : "gentle";
+  if (!epoch || epoch.closed) return baseLevel;
+  const order = ["gentle", "strong", "emergency"];
+  const curIdx = epoch.maxLevel === "none" ? -1 : order.indexOf(epoch.maxLevel);
+  const baseIdx = order.indexOf(baseLevel);
+  const level = order[Math.max(curIdx, baseIdx)] ?? baseLevel;
+  return level;
+}
 function evaluateNudgeGate(input) {
   const prev = input.prevNudgeState;
   const lastInjectedAt = typeof prev.lastInjectedAt === "number" ? prev.lastInjectedAt : 0;
   const nudgeCount = typeof prev.nudgeCount === "number" ? prev.nudgeCount : 0;
   const lastTokensAtInject = typeof prev.lastTokensAtInject === "number" ? prev.lastTokensAtInject : 0;
   const emergency = /EMERGENCY/i.test(input.kernelReason);
+  const prevEpoch = input.prevEpoch ?? readEpoch(prev);
+  const usage = input.usage;
   const creditLeft = input.usageCreditTokens > 0 && typeof input.creditBaseToken === "number" ? input.creditBaseToken + input.usageCreditTokens - input.tokenEstimate : 0;
   const inCreditWindow = !emergency && creditLeft > 0;
   if (input.curBlocks > input.prevBlocks) {
-    return { allowInject: false, nextNudgeState: { lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0 } };
+    const closedEpoch = prevEpoch ? { ...prevEpoch, closed: true, injections: prevEpoch.injections } : void 0;
+    return {
+      allowInject: false,
+      nextNudgeState: { lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0 },
+      nextEpoch: closedEpoch
+    };
   }
   if (lastInjectedAt > 0 && input.tokenEstimate < lastTokensAtInject * 0.9) {
     return { allowInject: false, nextNudgeState: { lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0 } };
@@ -4059,17 +4102,25 @@ function evaluateNudgeGate(input) {
   if (inCreditWindow) {
     return { allowInject: false, nextNudgeState: prev };
   }
-  if (!emergency && (lastInjectedAt > 0 || nudgeCount >= input.nudgeCooldownTurns)) {
-    return { allowInject: false, nextNudgeState: prev };
+  const epochActive = prevEpoch && !prevEpoch.closed;
+  const level = levelForEpoch(epochActive ? prevEpoch : void 0, usage, input);
+  const nextEpoch = {
+    epoch: (prevEpoch?.epoch ?? 0) + (epochActive ? 0 : 1),
+    openedAtUsage: epochActive ? prevEpoch?.openedAtUsage ?? usage : usage,
+    injections: (epochActive ? prevEpoch?.injections ?? 0 : 0) + 1,
+    maxLevel: level,
+    closed: false
+  };
+  if (!emergency && lastInjectedAt > 0 && input.tokenEstimate < lastTokensAtInject * 1.05) {
+    return { allowInject: false, nextNudgeState: prev, nextEpoch };
   }
-  if (emergency && lastInjectedAt > 0 && input.tokenEstimate >= lastTokensAtInject * 0.95) {
-    return {
-      allowInject: true,
-      nextNudgeState: { lastInjectedAt: Date.now(), nudgeCount: nudgeCount + 1, lastTokensAtInject: input.tokenEstimate }
-    };
+  if (!emergency && nudgeCount >= input.nudgeCooldownTurns) {
+    return { allowInject: false, nextNudgeState: prev, nextEpoch };
   }
   return {
     allowInject: true,
+    level,
+    nextEpoch,
     nextNudgeState: {
       lastInjectedAt: Date.now(),
       nudgeCount: nudgeCount + 1,

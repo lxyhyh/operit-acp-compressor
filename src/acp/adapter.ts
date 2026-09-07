@@ -397,11 +397,13 @@ export function createEngine(dataDir?: string): AcpEngine {
           nextStats.creditBaseToken = tokenEstimate;
           nextStats.creditRemaining = settings.usageCreditTokens;
         }
-        // nudge 状态机（Adapter 层门控）：达到阈值最多注入一次；压缩/下降后 reset。
+        // nudge 状态机（Adapter 层门控）：V0.4.2 pressure-epoch 驱动。
         const prevNudgeState = cached.hostMetadata.acpNudge ?? {};
         const prevBlocks = cached.kernelState.blocks.length;
         const curBlocks = turn.state.blocks.length;
         const prevTokenCount = (cached.hostMetadata.lastTokenEstimate as number) ?? 0;
+        const usage = config.modelContextLimit > 0 ? tokenEstimate / config.modelContextLimit : 0;
+        const prevEpoch = (prevNudgeState as { acpEpoch?: PressureEpoch }).acpEpoch;
         const nudgeGate = evaluateNudgeGate({
           kernelShouldInject: turn.nudge?.shouldInject === true,
           kernelReason: turn.nudge?.reason ?? "",
@@ -414,16 +416,24 @@ export function createEngine(dataDir?: string): AcpEngine {
           nudgeCooldownTokens: settings.nudgeCooldownTokens,
           usageCreditTokens: settings.usageCreditTokens,
           creditBaseToken: typeof prevStats.creditBaseToken === "number" ? prevStats.creditBaseToken : undefined,
+          usage,
+          gentleThresholdPct: settings.gentleThresholdPct,
+          strongThresholdPct: settings.strongThresholdPct,
+          emergencyThresholdPct: settings.hardLimitPct,
+          prevEpoch,
         });
-        const nextNudgeState = nudgeGate.nextNudgeState;
+        const nextNudgeState: Record<string, unknown> = {
+          ...nudgeGate.nextNudgeState,
+          // 持久化 epoch 到 acpNudge（跨轮/跨 VM 恢复压力档位）
+          ...(nudgeGate.nextEpoch ? { acpEpoch: nudgeGate.nextEpoch } : {}),
+        };
 
-        // 按 usage 分档（V0.4）：gentle（接近）→ strong（超过）→ emergency（硬顶）。
-        const usage = config.modelContextLimit > 0 ? tokenEstimate / config.modelContextLimit : 0;
-        const level: NudgeLevel =
-          emergency ? "emergency"
-          : usage >= settings.strongThresholdPct ? "strong"
-          : usage >= settings.gentleThresholdPct ? "gentle"
-          : "gentle";
+        // nudge 档位：epoch 状态机输出（无注入时按 usage 兜底算档位供 stats）
+        const level: NudgeLevel = nudgeGate.level ??
+          (emergency ? "emergency"
+            : usage >= settings.strongThresholdPct ? "strong"
+            : usage >= settings.gentleThresholdPct ? "gentle"
+            : "gentle");
 
         // nudge 仅当状态机允许时注入（SYSTEM 消息追加；UI 不渲染成新用户消息）。
         let nudgeText: string | undefined;
@@ -681,6 +691,23 @@ export function createEngine(dataDir?: string): AcpEngine {
 
 type NudgeLevel = "gentle" | "strong" | "emergency";
 
+/** V0.4.2 pressure epoch 状态机（存 kernel NudgeState.anchors，随 state 持久化）。
+ *  取代纯 cooldown：纪元 = 从"首次越线"到"压缩成功"的完整压力周期。
+ *  - 纪元内注入档位按次数递增（1次gentle→2次strong→3+emergency），maxLevel 只升不降
+ *  - 压缩成功关闭纪元 + 发放 usage credit
+ *  - 纪元关闭后 usage 仍越线（压缩不足）→ 新纪元直接从 emergency 起步（压力延续） */
+interface PressureEpoch {
+  epoch: number;
+  /** 纪元开启时的 usage（0~1）。 */
+  openedAtUsage: number;
+  /** 纪元内已注入 nudge 次数。 */
+  injections: number;
+  /** 本纪元已用最高档位（只升不降）。 */
+  maxLevel: NudgeLevel | "none";
+  /** 纪元是否已因压缩成功关闭（关闭后无新越线不再注入）。 */
+  closed: boolean;
+}
+
 function buildNudgeText(nudge: { reason: string; compressibleRanges: { startRef: string; endRef: string; tokens: number }[] }, level: NudgeLevel): string {
   // 固定模板（不嵌入动态 token 数/百分比——动态内容破坏 LLM 缓存前缀命中率）。
   // 三档递进文案：gentle = 提醒准备；strong = 要求主动压缩；emergency = 必须压缩。
@@ -715,58 +742,121 @@ interface NudgeGateInput {
   usageCreditTokens: number;
   /** 最近一次压缩后的基准 token（压缩完成当轮 usage）。 */
   creditBaseToken?: number;
+  /** V0.4.2 三档阈值与当前 usage（epoch 状态机判定用）。 */
+  usage: number;
+  gentleThresholdPct: number;
+  strongThresholdPct: number;
+  emergencyThresholdPct: number;
+  /** 上一次 epoch 状态（来自 kernel NudgeState.anchors 或 hostMetadata）。 */
+  prevEpoch?: PressureEpoch;
 }
 interface NudgeGateResult {
   allowInject: boolean;
   nextNudgeState: Record<string, unknown>;
+  /** V0.4.2：本轮回注的档位（allowInject=true 时有意义）。 */
+  level?: NudgeLevel;
+  /** V0.4.2：更新后的 epoch（写入 anchors 持久化）。 */
+  nextEpoch?: PressureEpoch;
+}
+
+/** 从 kernel NudgeState.anchors 读 epoch（结构容错）。 */
+function readEpoch(prev: Record<string, unknown>): PressureEpoch | undefined {
+  try {
+    const a = prev.anchors as Record<string, unknown> | undefined;
+    if (!a || typeof a !== "object") return undefined;
+    const e = a.pressureEpoch as Partial<PressureEpoch> | undefined;
+    if (!e || typeof e !== "object") return undefined;
+    return {
+      epoch: typeof e.epoch === "number" ? e.epoch : 0,
+      openedAtUsage: typeof e.openedAtUsage === "number" ? e.openedAtUsage : 0,
+      injections: typeof e.injections === "number" ? e.injections : 0,
+      maxLevel: (e.maxLevel as NudgeLevel | "none") ?? "none",
+      closed: e.closed === true,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** 计算本轮回注档位：越线档 + epoch 内递增（同档位只升不降）。 */
+function levelForEpoch(epoch: PressureEpoch | undefined, usage: number, s: NudgeGateInput): NudgeLevel {
+  const baseLevel: NudgeLevel = usage >= s.emergencyThresholdPct ? "emergency"
+    : usage >= s.strongThresholdPct ? "strong"
+    : "gentle";
+  if (!epoch || epoch.closed) return baseLevel;
+  const order: NudgeLevel[] = ["gentle", "strong", "emergency"];
+  const curIdx = epoch.maxLevel === "none" ? -1 : order.indexOf(epoch.maxLevel);
+  const baseIdx = order.indexOf(baseLevel);
+  // 取二者较高档（usage 越线档 与 历史最高档 的 max）——压力延续时不降档。
+  const level = order[Math.max(curIdx, baseIdx)] ?? baseLevel;
+  return level;
 }
 
 /**
- * Adapter 层 nudge 状态机：idle → pressure → nudge-once → waiting →
- * (compress-success | context-drop | new-cycle) → idle。
- * 规则：kernel 建议注入且未注入过才注入一次；compress 成功/context 明显
- * 下降后 reset；连续无视超过 cooldown 则抑制（不再打扰）。
+ * Adapter 层 nudge 状态机（V0.4.2 pressure-epoch 驱动）：
+ * - idle → 越线(gently/strong/emergency) → epoch 开启
+ * - epoch 内每轮 kernel 建议均注入，档位按 levelForEpoch 只升不降
+ * - compress 成功（curBlocks>prevBlocks）或上下文明显回落 → epoch 关闭 + reset
+ * - usage credit 窗口内不注入（刚压缩过给增长留空间）
+ * - EMERGENCY 每轮提醒直到压缩成功或上下文回落
  */
 function evaluateNudgeGate(input: NudgeGateInput): NudgeGateResult {
   const prev = input.prevNudgeState;
   const lastInjectedAt = typeof prev.lastInjectedAt === "number" ? prev.lastInjectedAt : 0;
   const nudgeCount = typeof prev.nudgeCount === "number" ? prev.nudgeCount : 0;
   const lastTokensAtInject = typeof prev.lastTokensAtInject === "number" ? prev.lastTokensAtInject : 0;
-  // EMERGENCY（usage 超过硬顶/emergency 阈值）：每轮提醒直到压缩成功或上下文回落。
-  // 模型不 compress 时继续提醒（不回退冷却），避免"提醒一次被无视后死锁"。
   const emergency = /EMERGENCY/i.test(input.kernelReason);
-  // V0.4.1 usage credit：压缩后增长未超 credit 前不提醒（EMERGENCY 仍提醒——已
-  //  逼近硬顶，不能因 credit 豁免）。creditBaseToken 记于 stats，跨轮持久化。
+  const prevEpoch = input.prevEpoch ?? readEpoch(prev);
+  const usage = input.usage;
+  // credit 窗口（EMERGENCY 不免除——已逼近硬顶必须提醒）
   const creditLeft = input.usageCreditTokens > 0 && typeof input.creditBaseToken === "number"
     ? input.creditBaseToken + input.usageCreditTokens - input.tokenEstimate
     : 0;
   const inCreditWindow = !emergency && creditLeft > 0;
 
+  // 压缩成功：关闭纪元 + 重置状态机
   if (input.curBlocks > input.prevBlocks) {
-    return { allowInject: false, nextNudgeState: { lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0 } };
+    const closedEpoch: PressureEpoch | undefined = prevEpoch
+      ? { ...prevEpoch, closed: true, injections: prevEpoch.injections }
+      : undefined;
+    return {
+      allowInject: false,
+      nextNudgeState: { lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0 },
+      nextEpoch: closedEpoch,
+    };
   }
+  // 上下文明显回落（无压缩也降）：视为压力解除，重置（不关纪元标记，防误判）
   if (lastInjectedAt > 0 && input.tokenEstimate < lastTokensAtInject * 0.9) {
     return { allowInject: false, nextNudgeState: { lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0 } };
   }
   if (!input.kernelShouldInject) {
+    // 未越线：纪元维持但本轮不注入。epoch 仍在（下次越线从上次 maxLevel 继续）。
     return { allowInject: false, nextNudgeState: prev };
   }
   if (inCreditWindow) {
-    // credit 窗口内：kernel 建议也抑制（刚压缩过，给增长留空间）。
     return { allowInject: false, nextNudgeState: prev };
   }
-  if (!emergency && (lastInjectedAt > 0 || nudgeCount >= input.nudgeCooldownTurns)) {
-    return { allowInject: false, nextNudgeState: prev };
+  // 越线且纪元不存在/已关闭 → 开新纪元（closed 后再次越线=压力延续，从上次档位起步）
+  const epochActive = prevEpoch && !prevEpoch.closed;
+  const level = levelForEpoch(epochActive ? prevEpoch : undefined, usage, input);
+  const nextEpoch: PressureEpoch = {
+    epoch: (prevEpoch?.epoch ?? 0) + (epochActive ? 0 : 1),
+    openedAtUsage: epochActive ? (prevEpoch?.openedAtUsage ?? usage) : usage,
+    injections: (epochActive ? prevEpoch?.injections ?? 0 : 0) + 1,
+    maxLevel: level,
+    closed: false,
+  };
+  // 冷却/重复保护：非 emergency 且最近注入过且增长不足 → 抑制
+  if (!emergency && lastInjectedAt > 0 && input.tokenEstimate < lastTokensAtInject * 1.05) {
+    return { allowInject: false, nextNudgeState: prev, nextEpoch };
   }
-  if (emergency && lastInjectedAt > 0 && input.tokenEstimate >= lastTokensAtInject * 0.95) {
-    // 已是 emergency 且上下文没回落：每轮继续提醒（更新 lastInjectedAt，持续增压）。
-    return {
-      allowInject: true,
-      nextNudgeState: { lastInjectedAt: Date.now(), nudgeCount: nudgeCount + 1, lastTokensAtInject: input.tokenEstimate },
-    };
+  if (!emergency && nudgeCount >= input.nudgeCooldownTurns) {
+    return { allowInject: false, nextNudgeState: prev, nextEpoch };
   }
   return {
     allowInject: true,
+    level,
+    nextEpoch,
     nextNudgeState: {
       lastInjectedAt: Date.now(),
       nudgeCount: nudgeCount + 1,

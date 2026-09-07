@@ -314,23 +314,36 @@ export function createEngine(dataDir?: string): AcpEngine {
         }
 
         const projectedTurns = coreMessagesToPromptTurns(projectedMessages, mapping.byKey);
-        // —— Emergency 自动兜底（对齐 preflight 设计）：kernel EMERGENCY 且仍无块时，
-        //    插件直接用本轮推荐范围 + 抽取摘要自动压缩，不等模型 compress。
-        //    保证"发送量封顶"（模型不主动时也有底线），摘要带 [ACP 自动折叠] 标记可 decompress 恢复。
-        //    V0.4：来源标记 emergency + 统计。
+        // —— Preflight 自动兜底（文档 Phase 5）：request 可能超过模型窗口时，
+        //    插件连续压缩多轮，直到 fit 或无可压缩范围，不等模型 compress、不因
+        //    一次压缩后仍超限而放弃。摘要带 [ACP 自动折叠] 标记可 decompress 恢复。
+        //    V0.4+：来源标记 emergency + 统计。
         let autoFolded = false;
         let emergencyFreedTokens = 0;
+        let preflightRounds = 0;
         const prevStats = { ...(cached.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS) };
         const emergency = /EMERGENCY/i.test(turn.nudge?.reason ?? "");
-        if (emergency && turn.state.blocks.length === 0 && turn.nudge?.compressibleRanges && turn.nudge.compressibleRanges.length > 0) {
+        const maxRounds = 5; // 一次 preflight 最多连续压 5 轮，防失控
+        if (emergency) {
           try {
-            const ranges = (turn.nudge.compressibleRanges as { startRef: string; endRef: string; tokens?: number }[])
-              .filter((r) => r.startRef && r.endRef)
-              .slice(0, 2); // 每轮最多压 2 段，防一次压太多丢上下文
-            if (ranges.length > 0) {
+            // 循环压缩：每轮压最多 2 段，重新 processTurn 看 usage，直到 fit 或耗尽
+            for (let round = 0; round < maxRounds; round++) {
+              // 重新评估当前 usage（基于本轮已建块的状态投影）
+              const curTurn = core.processTurn({
+                messages: mapping.messages, state: turn.state, config,
+                tokenCount: tokenEstimate, renderTags: "none",
+              });
+              const curEstimate = curTurn.state.stats?.tokensCompressed ?? 0;
+              void curEstimate;
+              const curNudge = curTurn.nudge;
+              const stillEmergency = curNudge && /EMERGENCY/i.test(curNudge.reason ?? "");
+              if (!stillEmergency) break; // 已脱离 emergency，停止 preflight
+              const ranges = ((curNudge?.compressibleRanges ?? []) as { startRef: string; endRef: string; tokens?: number }[])
+                .filter((r) => r.startRef && r.endRef)
+                .slice(0, 2);
+              if (ranges.length === 0) break; // 无可压缩范围
               const applied = core.applyCompression({
                 ranges: ranges.map((r) => {
-                  // 用范围对应消息做确定性抽取摘要
                   const byRef = (turn.state.messageRefs?.byRef ?? {}) as Record<string, string>;
                   const startMsg = messageForRef(mapping.messages, byRef, mapping.byKey, r.startRef);
                   const endMsg = messageForRef(mapping.messages, byRef, mapping.byKey, r.endRef);
@@ -352,10 +365,17 @@ export function createEngine(dataDir?: string): AcpEngine {
               if (applied.result.blocksCreated > 0) {
                 turn.state = applied.state;
                 autoFolded = true;
-                emergencyFreedTokens = applied.result.tokensCompressed;
+                emergencyFreedTokens += applied.result.tokensCompressed;
+                preflightRounds++;
+              } else {
+                break; // 本段无法再压
               }
             }
           } catch { /* 自动兜底失败不影响主流程（仍走 nudge 提示） */ }
+          // 记录 preflight 轮数（trace 诊断用）
+          if (autoFolded) {
+            try { console.log(`[acp] preflight rounds=${preflightRounds} freed=${emergencyFreedTokens}`); } catch { /* noop */ }
+          }
         }
 
         if (autoFolded) {

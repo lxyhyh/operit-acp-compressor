@@ -3762,12 +3762,26 @@ function createEngine(dataDir) {
         const projectedTurns = coreMessagesToPromptTurns(projectedMessages, mapping.byKey);
         let autoFolded = false;
         let emergencyFreedTokens = 0;
+        let preflightRounds = 0;
         const prevStats = { ...cached.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS };
         const emergency = /EMERGENCY/i.test(turn.nudge?.reason ?? "");
-        if (emergency && turn.state.blocks.length === 0 && turn.nudge?.compressibleRanges && turn.nudge.compressibleRanges.length > 0) {
+        const maxRounds = 5;
+        if (emergency) {
           try {
-            const ranges = turn.nudge.compressibleRanges.filter((r) => r.startRef && r.endRef).slice(0, 2);
-            if (ranges.length > 0) {
+            for (let round = 0; round < maxRounds; round++) {
+              const curTurn = core.processTurn({
+                messages: mapping.messages,
+                state: turn.state,
+                config,
+                tokenCount: tokenEstimate,
+                renderTags: "none"
+              });
+              const curEstimate = curTurn.state.stats?.tokensCompressed ?? 0;
+              const curNudge = curTurn.nudge;
+              const stillEmergency = curNudge && /EMERGENCY/i.test(curNudge.reason ?? "");
+              if (!stillEmergency) break;
+              const ranges = (curNudge?.compressibleRanges ?? []).filter((r) => r.startRef && r.endRef).slice(0, 2);
+              if (ranges.length === 0) break;
               const applied = core.applyCompression({
                 ranges: ranges.map((r) => {
                   const byRef = turn.state.messageRefs?.byRef ?? {};
@@ -3790,10 +3804,19 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
               if (applied.result.blocksCreated > 0) {
                 turn.state = applied.state;
                 autoFolded = true;
-                emergencyFreedTokens = applied.result.tokensCompressed;
+                emergencyFreedTokens += applied.result.tokensCompressed;
+                preflightRounds++;
+              } else {
+                break;
               }
             }
           } catch {
+          }
+          if (autoFolded) {
+            try {
+              console.log(`[acp] preflight rounds=${preflightRounds} freed=${emergencyFreedTokens}`);
+            } catch {
+            }
           }
         }
         if (autoFolded) {

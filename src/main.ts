@@ -20,7 +20,7 @@ import { installIntlSegmenter } from "./shims/segmenter-shim";
 // 模块加载最先安装 Intl shim（acp-kernel 顶层会 new Intl.Segmenter）。
 installIntlSegmenter();
 
-import { onFinalize, onEstimateFinalize, onEstimateHistory, onSystemPromptCompose, onToolPromptCompose } from "./acp/lifecycle";
+import { onFinalize, onEstimateFinalize, onEstimateHistory, onSystemPromptCompose, onToolPromptCompose, onToolLifecycle } from "./acp/lifecycle";
 import { loadConfig, saveConfig, DEFAULT_CONFIG, type AcpConfig } from "./config";
 
 // IPC 通道必须在 main 脚本【模块顶层】注册（guide 3.2.5 示例），
@@ -135,6 +135,8 @@ export function registerAcpHooks(): void {
     } catch (e) {
         try { console.log(`[acp] registerPromptEstimateHistoryHook error: ${String(e)}`); } catch { /* noop */ }
     }
+    // ToolLifecycleHook 已移除：宿主不支持（实测 IllegalStateException 崩溃）。
+    // onToolLifecycle 处理函数保留导出（无害），但不注册。
     try {
         ToolPkg.registerSystemPromptComposeHook({
             id: "acp.system_prompt",
@@ -154,7 +156,7 @@ export function registerAcpHooks(): void {
 }
 
 // 宿主要求注册的 handler 函数本身也是「模块导出」。
-export { onFinalize, onEstimateFinalize, onEstimateHistory, onSystemPromptCompose, onToolPromptCompose };
+export { onFinalize, onEstimateFinalize, onEstimateHistory, onSystemPromptCompose, onToolPromptCompose, onToolLifecycle };
 
 // UI 设置页：独立文件随包分发（dist/ui/settings/index.ui.js）。
 export function registerToolboxUi(): void {

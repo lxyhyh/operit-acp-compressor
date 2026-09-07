@@ -211,3 +211,35 @@ export async function onEstimateFinalize(event: { eventPayload?: Record<string, 
 export async function onEstimateHistory(event: { eventPayload?: Record<string, unknown> }): Promise<PromptHookObjectResult | void> {
   return projectEstimate(event);
 }
+
+/** 巨型工具输出阈值（字符）。超过即视为可 absorb 候选（V0.6 ToolLoop）。 */
+const HUGE_TOOL_OUTPUT_CHARS = 8000;
+
+/**
+ * ToolLifecycleHook 处理函数（V0.6 ToolLoop 集成）。
+ * 监听 tool_execution_result / finished：检测巨型工具输出（≥8k 字符），
+ * 记 trace 事件 + 诊断日志（供后续 absorb 候选提示）。只读，不改上下文。
+ */
+export async function onToolLifecycle(event: { eventPayload?: Record<string, unknown>; eventName?: string }): Promise<unknown> {
+  try {
+    const payload = (event?.eventPayload && typeof event.eventPayload === "object" ? event.eventPayload : {}) as Record<string, unknown>;
+    const stage = String(event?.eventName ?? payload.stage ?? "");
+    if (!/tool_execution_result|tool_execution_finished/.test(stage)) return;
+    const toolName = String(payload.toolName ?? "");
+    if (!toolName) return;
+    const resultText = typeof payload.resultText === "string" ? payload.resultText : "";
+    const resultJson = payload.resultJson;
+    let jsonLen = 0;
+    try { jsonLen = resultJson ? JSON.stringify(resultJson).length : 0; } catch { /* ignore */ }
+    const totalLen = resultText.length + jsonLen;
+    if (totalLen < HUGE_TOOL_OUTPUT_CHARS) return;
+    diagLog(LOG_TOOLS_VISIBILITY_FILE, `[huge-tool] tool=${toolName} len=${totalLen} stage=${stage} candidate=absorb`);
+    try {
+      const { trace } = await import("./trace");
+      trace({ t: Date.now(), type: "huge_tool_output", detail: { tool: toolName, chars: totalLen, stage } });
+    } catch { /* ignore */ }
+  } catch (error) {
+    try { console.log(`[acp] onToolLifecycle failed: ${String(error)}`); } catch { /* noop */ }
+  }
+  return;
+}

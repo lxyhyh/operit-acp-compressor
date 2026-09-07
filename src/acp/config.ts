@@ -48,6 +48,8 @@ export interface AdapterSettings {
   strongThresholdPct: number;
   /** V0.4.1 usage credit：压缩后此 token 数内免除 nudge。默认 contextLimit*0.15。 */
   usageCreditTokens: number;
+  /** V0.6 Phase7 增量投影：本次仅比上次多 ≤ 此条数时走增量快速路径（跳过全量 processTurn）。 */
+  incrementalMaxNewTurns: number;
   /** 数据目录。 */
   dataDir: string;
 }
@@ -143,6 +145,8 @@ export function loadAdapterSettings(): AdapterSettings {
     strongThresholdPct: readPct("strongThresholdPct", 0.82),
     // V0.4.1 usage credit：压缩后 contextLimit*15% token 内免除 nudge。
     usageCreditTokens: Math.round(modelContextLimit * 0.15),
+    // V0.6 Phase7 增量投影阈值（默认允许新增 8 条内走增量）。
+    incrementalMaxNewTurns: readNum("incrementalMaxNewTurns", 8),
     dataDir: DATA_DIR,
   };
 }

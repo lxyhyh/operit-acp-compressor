@@ -3139,6 +3139,8 @@ function loadAdapterSettings() {
     strongThresholdPct: readPct("strongThresholdPct", 0.82),
     // V0.4.1 usage credit：压缩后 contextLimit*15% token 内免除 nudge。
     usageCreditTokens: Math.round(modelContextLimit * 0.15),
+    // V0.6 Phase7 增量投影阈值（默认允许新增 8 条内走增量）。
+    incrementalMaxNewTurns: readNum("incrementalMaxNewTurns", 8),
     dataDir: DATA_DIR
   };
 }
@@ -3740,6 +3742,34 @@ function createEngine(dataDir) {
             return { preparedHistory: projected, fingerprint, state: cached.kernelState };
           }
           return { preparedHistory: turns, fingerprint, state: cached.kernelState };
+        }
+        if (!(cached.hostMetadata.lastProjectionFingerprint === fingerprint)) {
+          const memPrev = projectionCache.get(sessionKey);
+          const rawPrev = rawTurnsCache.get(sessionKey);
+          const stateUnchanged = (cached.hostMetadata.stateVersion ?? 0) === (memPrev?.stateVersion ?? -1);
+          if (memPrev && memPrev.projection && rawPrev && stateUnchanged && turns.length >= rawPrev.length && turns.length - rawPrev.length > 0 && turns.length - rawPrev.length <= settings.incrementalMaxNewTurns) {
+            let prefixOk = true;
+            for (let i = 0; i < rawPrev.length; i++) {
+              if (stableKeyForTurn(turns[i]) !== stableKeyForTurn(rawPrev[i])) {
+                prefixOk = false;
+                break;
+              }
+            }
+            if (prefixOk) {
+              const delta = turns.slice(rawPrev.length);
+              const deltaMap = promptTurnsToCoreMessages(delta);
+              const deltaTurns = coreMessagesToPromptTurns(deltaMap.messages, deltaMap.byKey);
+              const merged = [...memPrev.projection, ...deltaTurns];
+              const capped = capProjectionSize(merged, { keepChars: 2e3, maxRecent: 3, totalBudgetChars: 2e5 });
+              cacheSetLimited(projectionCache, sessionKey, { fingerprint, stateVersion, projection: capped });
+              cacheSetLimited(rawTurnsCache, sessionKey, turns);
+              try {
+                console.log(`[acp] project INCREMENTAL stage=${hookStage} +${delta.length} raw=${turns.length} proj=${capped.length} (skipped full processTurn)`);
+              } catch {
+              }
+              return { preparedHistory: capped, fingerprint, state: cached.kernelState };
+            }
+          }
         }
         const mapping = promptTurnsToCoreMessages(turns);
         mapping.messages = stripOldAnchorMessages(mapping.messages);

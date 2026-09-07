@@ -290,6 +290,41 @@ export function createEngine(dataDir?: string): AcpEngine {
           return { preparedHistory: turns, fingerprint, state: cached.kernelState };
         }
 
+        // —— V0.6 Phase7 增量快速路径：stateVersion 未变 + 本次 turns 是上次的
+        //   尾部超集（新增少量 tool result/assistant 消息，前缀稳定）时，
+        //   复用上次投影 + 只追加新增尾部，跳过全量 processTurn 与 capProjectionSize。
+        //   解决 20-50 Hop 工具循环里每 Hop 全量重投影的 O(n²) 成本。
+        //   前提：state 未变（无新 block）→ 旧投影仍有效，仅尾部新增内容需并入。
+        if (!(cached.hostMetadata.lastProjectionFingerprint === fingerprint)) {
+          const memPrev = projectionCache.get(sessionKey);
+          const rawPrev = rawTurnsCache.get(sessionKey);
+          const stateUnchanged = (cached.hostMetadata.stateVersion ?? 0) === (memPrev?.stateVersion ?? -1);
+          if (memPrev && memPrev.projection && rawPrev && stateUnchanged
+            && turns.length >= rawPrev.length
+            && turns.length - rawPrev.length > 0
+            && turns.length - rawPrev.length <= settings.incrementalMaxNewTurns) {
+            // 校验前缀稳定：前 rawPrev.length 条 stableKey 完全一致。
+            let prefixOk = true;
+            for (let i = 0; i < rawPrev.length; i++) {
+              if (stableKeyForTurn(turns[i]) !== stableKeyForTurn(rawPrev[i])) { prefixOk = false; break; }
+            }
+            if (prefixOk) {
+              const delta = turns.slice(rawPrev.length);
+              // 新增尾部本身再做一次轻量投影（可能含 tool result 需转 core）。
+              const deltaMap = promptTurnsToCoreMessages(delta);
+              const deltaTurns = coreMessagesToPromptTurns(deltaMap.messages, deltaMap.byKey);
+              const merged = [...memPrev.projection, ...deltaTurns];
+              const capped = capProjectionSize(merged, { keepChars: 2000, maxRecent: 3, totalBudgetChars: 200_000 });
+              cacheSetLimited(projectionCache, sessionKey, { fingerprint, stateVersion, projection: capped });
+              cacheSetLimited(rawTurnsCache, sessionKey, turns);
+              try {
+                console.log(`[acp] project INCREMENTAL stage=${hookStage} +${delta.length} raw=${turns.length} proj=${capped.length} (skipped full processTurn)`);
+              } catch { /* noop */ }
+              return { preparedHistory: capped, fingerprint, state: cached.kernelState };
+            }
+          }
+        }
+
         const mapping = promptTurnsToCoreMessages(turns);
         // 清理宿主回传的旧锚点残留（避免旧摘要继续出现在 UI/上下文）。
         mapping.messages = stripOldAnchorMessages(mapping.messages) as CoreMessage[];

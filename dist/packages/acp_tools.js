@@ -3137,6 +3137,8 @@ function loadAdapterSettings() {
     // V0.4 三档：温和提示沿用旧键 nudgeThresholdPct（兼容已存设置），强制/硬限新增键。
     gentleThresholdPct: readPct("nudgeThresholdPct", 0.72),
     strongThresholdPct: readPct("strongThresholdPct", 0.82),
+    // V0.7 host 自接管下限：约 0.70（低于 gentle 0.72，允许 Adapter 在 kernel 沉默区先接管）。
+    hostEscalationFloor: readPct("hostEscalationFloor", 0.7),
     // V0.4.1 usage credit：压缩后 contextLimit*15% token 内免除 nudge。
     usageCreditTokens: Math.round(modelContextLimit * 0.15),
     // V0.6 Phase7 增量投影阈值（默认允许新增 8 条内走增量）。
@@ -3633,6 +3635,123 @@ function markAbsorbed(candidates, ref) {
   );
 }
 
+// src/acp/pressure.ts
+function computeEffectivePressure(input) {
+  const { tokenEstimate, modelContextLimit } = input;
+  const measured = typeof input.actualUsage === "number" && Number.isFinite(input.actualUsage) && input.actualUsage > 0 ? input.actualUsage : 0;
+  const estimated = modelContextLimit > 0 ? tokenEstimate / modelContextLimit : 0;
+  const usagePct = Math.max(measured, estimated);
+  const source = measured <= 0 ? "estimated" : estimated > 0 ? "hybrid" : "measured";
+  return { effectiveTokens: Math.max(tokenEstimate, measured * modelContextLimit), usagePct, source };
+}
+function computePressureLevel(input) {
+  const base = input.usagePct >= input.emergencyThresholdPct ? "emergency" : input.usagePct >= input.strongThresholdPct ? "strong" : input.usagePct >= input.gentleThresholdPct ? "gentle" : "none";
+  if (base === "none") return "none";
+  if (!input.epoch || input.epoch.closed) return base;
+  const order = ["gentle", "strong", "emergency"];
+  const curIdx = order.indexOf(input.epoch.maxLevel);
+  const baseIdx = order.indexOf(base);
+  return order[Math.max(curIdx, baseIdx)] ?? base;
+}
+function shouldEscalate(usagePct, strongThresholdPct) {
+  return usagePct >= strongThresholdPct;
+}
+function evaluatePressure(input) {
+  const prev = {
+    lastInjectedAt: input.lastInjectedAt,
+    nudgeCount: input.nudgeCount,
+    lastTokensAtInject: input.lastTokensAtInject
+  };
+  const emergency = /EMERGENCY/i.test(input.kernelReason);
+  const prevEpoch = input.prevEpoch;
+  const usage = input.usagePct;
+  if (input.curBlocks > input.prevBlocks) {
+    const closedEpoch = prevEpoch ? { ...prevEpoch, closed: true, injections: prevEpoch.injections } : void 0;
+    return {
+      allowInject: false,
+      nextNudgeState: { lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0 },
+      nextEpoch: closedEpoch,
+      decisionReason: "compressed-close-epoch"
+    };
+  }
+  if (prev.lastInjectedAt > 0 && input.tokenEstimate < prev.lastTokensAtInject * 0.9) {
+    return {
+      allowInject: false,
+      nextNudgeState: { lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0 },
+      nextEpoch: prevEpoch,
+      decisionReason: "context-dropped-reset"
+    };
+  }
+  const levelRaw = computePressureLevel({
+    usagePct: usage,
+    gentleThresholdPct: input.gentleThresholdPct,
+    strongThresholdPct: input.strongThresholdPct,
+    emergencyThresholdPct: input.emergencyThresholdPct,
+    epoch: prevEpoch && !prevEpoch.closed ? prevEpoch : void 0
+  });
+  const epochActive = prevEpoch && !prevEpoch.closed;
+  const nextEpoch = {
+    epoch: (prevEpoch?.epoch ?? 0) + (epochActive ? 0 : 1),
+    openedAtUsage: epochActive ? prevEpoch?.openedAtUsage ?? usage : usage,
+    injections: (epochActive ? prevEpoch?.injections ?? 0 : 0) + 1,
+    maxLevel: levelRaw === "none" ? "gentle" : levelRaw,
+    closed: false
+  };
+  const escalate = shouldEscalate(usage, input.strongThresholdPct);
+  if (emergency || usage >= input.emergencyThresholdPct) {
+    return {
+      allowInject: true,
+      level: "emergency",
+      nextEpoch,
+      nextNudgeState: { lastInjectedAt: Date.now(), nudgeCount: prev.nudgeCount + 1, lastTokensAtInject: input.tokenEstimate },
+      decisionReason: "emergency-unconditional"
+    };
+  }
+  if (escalate) {
+    return {
+      allowInject: true,
+      level: levelRaw === "none" ? "strong" : levelRaw,
+      nextEpoch,
+      nextNudgeState: { lastInjectedAt: Date.now(), nudgeCount: prev.nudgeCount + 1, lastTokensAtInject: input.tokenEstimate },
+      decisionReason: "strong-bypassed-cooldown-and-credit"
+    };
+  }
+  const level = levelRaw === "none" ? "gentle" : levelRaw;
+  const creditLeft = input.usageCreditTokens > 0 && typeof input.creditBaseToken === "number" ? input.creditBaseToken + input.usageCreditTokens - input.tokenEstimate : 0;
+  if (creditLeft > 0) {
+    return { allowInject: false, nextEpoch, nextNudgeState: prev, decisionReason: "gentle-suppressed-by-credit" };
+  }
+  const deltaSinceNudge = input.lastTokensAtInject > 0 ? input.tokenEstimate - input.lastTokensAtInject : 0;
+  const deltaSinceCompression = typeof input.lastCompressToken === "number" ? input.tokenEstimate - input.lastCompressToken : 0;
+  const grewSinceNudge = prev.lastInjectedAt === 0 || deltaSinceNudge >= input.nudgeGrowthFloor;
+  const grewSinceCompression = typeof input.lastCompressToken !== "number" || deltaSinceCompression >= input.nudgeGrowthFloor;
+  if (!input.kernelShouldInject) {
+    if (usage >= input.hostEscalationFloor && grewSinceCompression && grewSinceNudge) {
+      return {
+        allowInject: true,
+        level,
+        nextEpoch,
+        nextNudgeState: { lastInjectedAt: Date.now(), nudgeCount: prev.nudgeCount + 1, lastTokensAtInject: input.tokenEstimate },
+        decisionReason: "host-escalation-floor-crossed-with-growth"
+      };
+    }
+    return { allowInject: false, nextEpoch, nextNudgeState: prev, decisionReason: "kernel-silent-host-below-growth-floor" };
+  }
+  if (prev.lastInjectedAt > 0 && !grewSinceNudge) {
+    return { allowInject: false, nextEpoch, nextNudgeState: prev, decisionReason: "gentle-no-growth-since-last-inject" };
+  }
+  if (prev.nudgeCount >= input.nudgeCooldownTurns) {
+    return { allowInject: false, nextEpoch, nextNudgeState: prev, decisionReason: "gentle-cooldown" };
+  }
+  return {
+    allowInject: true,
+    level,
+    nextEpoch,
+    nextNudgeState: { lastInjectedAt: Date.now(), nudgeCount: prev.nudgeCount + 1, lastTokensAtInject: input.tokenEstimate },
+    decisionReason: "gentle-inject"
+  };
+}
+
 // src/acp/adapter.ts
 var projectionCache = globalThis.__acpProjectionCacheV2 ?? /* @__PURE__ */ new Map();
 if (!globalThis.__acpProjectionCacheV2) {
@@ -3963,34 +4082,43 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
         const prevBlocks = cached.kernelState.blocks.length;
         const curBlocks = turn.state.blocks.length;
         const prevTokenCount = cached.hostMetadata.lastTokenEstimate ?? 0;
-        const usage = config.modelContextLimit > 0 ? tokenEstimate / config.modelContextLimit : 0;
+        const eff = computeEffectivePressure({
+          actualUsage: config.modelContextLimit > 0 ? tokenEstimate / config.modelContextLimit : 0,
+          tokenEstimate,
+          modelContextLimit: config.modelContextLimit
+        });
         const prevEpoch = prevNudgeState.acpEpoch;
-        const nudgeGate = evaluateNudgeGate({
+        const lastCompressToken = typeof prevStats.creditBaseToken === "number" ? prevStats.creditBaseToken : void 0;
+        const pressure = evaluatePressure({
+          usagePct: eff.usagePct,
+          effectiveTokens: eff.effectiveTokens,
+          tokenEstimate,
           kernelShouldInject: turn.nudge?.shouldInject === true,
           kernelReason: turn.nudge?.reason ?? "",
-          prevNudgeState,
+          prevEpoch,
           prevBlocks,
           curBlocks,
-          prevTokenCount,
-          tokenEstimate,
-          nudgeCooldownTurns: settings.nudgeCooldownTurns,
-          nudgeCooldownTokens: settings.nudgeCooldownTokens,
-          usageCreditTokens: settings.usageCreditTokens,
-          creditBaseToken: typeof prevStats.creditBaseToken === "number" ? prevStats.creditBaseToken : void 0,
-          usage,
           gentleThresholdPct: settings.gentleThresholdPct,
           strongThresholdPct: settings.strongThresholdPct,
           emergencyThresholdPct: settings.hardLimitPct,
-          prevEpoch
+          hostEscalationFloor: settings.hostEscalationFloor,
+          nudgeCooldownTurns: settings.nudgeCooldownTurns,
+          nudgeGrowthFloor: settings.nudgeGrowthFloor,
+          usageCreditTokens: settings.usageCreditTokens,
+          creditBaseToken: lastCompressToken,
+          lastInjectedAt: typeof prevNudgeState.lastInjectedAt === "number" ? prevNudgeState.lastInjectedAt : 0,
+          nudgeCount: typeof prevNudgeState.nudgeCount === "number" ? prevNudgeState.nudgeCount : 0,
+          lastTokensAtInject: typeof prevNudgeState.lastTokensAtInject === "number" ? prevNudgeState.lastTokensAtInject : 0,
+          lastCompressToken
         });
         const nextNudgeState = {
-          ...nudgeGate.nextNudgeState,
+          ...pressure.nextNudgeState,
           // 持久化 epoch 到 acpNudge（跨轮/跨 VM 恢复压力档位）
-          ...nudgeGate.nextEpoch ? { acpEpoch: nudgeGate.nextEpoch } : {}
+          ...pressure.nextEpoch ? { acpEpoch: pressure.nextEpoch } : {}
         };
-        const level = nudgeGate.level ?? (emergency ? "emergency" : usage >= settings.strongThresholdPct ? "strong" : usage >= settings.gentleThresholdPct ? "gentle" : "gentle");
+        const level = pressure.level ?? (emergency ? "emergency" : eff.usagePct >= settings.strongThresholdPct ? "strong" : eff.usagePct >= settings.gentleThresholdPct ? "gentle" : "gentle");
         let nudgeText;
-        if (nudgeGate.allowInject && settings.nudgeEnabled) {
+        if (pressure.allowInject && settings.nudgeEnabled) {
           nudgeText = buildNudgeText(turn.nudge, level);
           const active = getActiveAbsorbCandidates(nextAbsorbCandidates);
           if (active.length > 0) {
@@ -4035,13 +4163,13 @@ ${lines.join("\n")}${active.length > 3 ? `
         try {
           const active = turn.state.blocks.filter((b) => b.active).length;
           const nudgeReason = turn.nudge?.reason ? turn.nudge.reason.slice(0, 120) : "(kernel:no-nudge)";
-          const gateInfo = `allow=${nudgeGate.allowInject ? 1 : 0} kShould=${turn.nudge?.shouldInject ? 1 : 0}`;
+          const gateInfo = `allow=${pressure.allowInject ? 1 : 0} kShould=${turn.nudge?.shouldInject ? 1 : 0} reason=${pressure.decisionReason} eff=${Math.round(eff.usagePct * 100)}%`;
           const st = nextStats;
           console.log(`[acp] project stage=${hookStage} chat=${chatId ? String(chatId).slice(0, 8) : "-"} sub=${isSubTask ? 1 : 0} fp=${fingerprint.slice(0, 12)} raw=${turns.length} proj=${cappedTurns.length} blocks=${active}/${turn.state.blocks.length} tok=${tokenEstimate} saved=${(cached.kernelState.stats?.tokensCompressed ?? 0) - (turn.state.stats?.tokensCompressed ?? 0)} nudge=${gateInfo} stats={n:${st.nudgeIssued},m:${st.compressSucceeded},e:${st.emergencyTriggered}} ${nudgeReason}`);
           chatTrace(chatId, {
             type: "project",
             stage: hookStage,
-            detail: { raw: turns.length, proj: cappedTurns.length, blocks: turn.state.blocks.length, tok: tokenEstimate, nudgeAllow: nudgeGate.allowInject, emergency: autoFolded }
+            detail: { raw: turns.length, proj: cappedTurns.length, blocks: turn.state.blocks.length, tok: tokenEstimate, effPct: Math.round(eff.usagePct * 100), level, nudgeAllow: pressure.allowInject, reason: pressure.decisionReason, emergency: autoFolded }
           });
         } catch {
         }
@@ -4253,85 +4381,6 @@ function buildNudgeText(nudge, level) {
     lines.push(`\u53EF\u9009\u5DE5\u5177\uFF1Aacp_status\uFF08\u67E5\u72B6\u6001/\u8303\u56F4\uFF09\u3001absorb\uFF08\u5438\u6536\u5355\u6761\u5DE8\u578B\u8F93\u51FA\uFF09\u3001decompress\uFF08\u6062\u590D\uFF09\u3001search_context\uFF08\u641C\u7D22\uFF09\u3002`);
   }
   return lines.join("\n");
-}
-function readEpoch(prev) {
-  try {
-    const a = prev.anchors;
-    if (!a || typeof a !== "object") return void 0;
-    const e = a.pressureEpoch;
-    if (!e || typeof e !== "object") return void 0;
-    return {
-      epoch: typeof e.epoch === "number" ? e.epoch : 0,
-      openedAtUsage: typeof e.openedAtUsage === "number" ? e.openedAtUsage : 0,
-      injections: typeof e.injections === "number" ? e.injections : 0,
-      maxLevel: e.maxLevel ?? "none",
-      closed: e.closed === true
-    };
-  } catch {
-    return void 0;
-  }
-}
-function levelForEpoch(epoch, usage, s) {
-  const baseLevel = usage >= s.emergencyThresholdPct ? "emergency" : usage >= s.strongThresholdPct ? "strong" : "gentle";
-  if (!epoch || epoch.closed) return baseLevel;
-  const order = ["gentle", "strong", "emergency"];
-  const curIdx = epoch.maxLevel === "none" ? -1 : order.indexOf(epoch.maxLevel);
-  const baseIdx = order.indexOf(baseLevel);
-  const level = order[Math.max(curIdx, baseIdx)] ?? baseLevel;
-  return level;
-}
-function evaluateNudgeGate(input) {
-  const prev = input.prevNudgeState;
-  const lastInjectedAt = typeof prev.lastInjectedAt === "number" ? prev.lastInjectedAt : 0;
-  const nudgeCount = typeof prev.nudgeCount === "number" ? prev.nudgeCount : 0;
-  const lastTokensAtInject = typeof prev.lastTokensAtInject === "number" ? prev.lastTokensAtInject : 0;
-  const emergency = /EMERGENCY/i.test(input.kernelReason);
-  const prevEpoch = input.prevEpoch ?? readEpoch(prev);
-  const usage = input.usage;
-  const creditLeft = input.usageCreditTokens > 0 && typeof input.creditBaseToken === "number" ? input.creditBaseToken + input.usageCreditTokens - input.tokenEstimate : 0;
-  const inCreditWindow = !emergency && creditLeft > 0;
-  if (input.curBlocks > input.prevBlocks) {
-    const closedEpoch = prevEpoch ? { ...prevEpoch, closed: true, injections: prevEpoch.injections } : void 0;
-    return {
-      allowInject: false,
-      nextNudgeState: { lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0 },
-      nextEpoch: closedEpoch
-    };
-  }
-  if (lastInjectedAt > 0 && input.tokenEstimate < lastTokensAtInject * 0.9) {
-    return { allowInject: false, nextNudgeState: { lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0 } };
-  }
-  if (!input.kernelShouldInject) {
-    return { allowInject: false, nextNudgeState: prev };
-  }
-  if (inCreditWindow) {
-    return { allowInject: false, nextNudgeState: prev };
-  }
-  const epochActive = prevEpoch && !prevEpoch.closed;
-  const level = levelForEpoch(epochActive ? prevEpoch : void 0, usage, input);
-  const nextEpoch = {
-    epoch: (prevEpoch?.epoch ?? 0) + (epochActive ? 0 : 1),
-    openedAtUsage: epochActive ? prevEpoch?.openedAtUsage ?? usage : usage,
-    injections: (epochActive ? prevEpoch?.injections ?? 0 : 0) + 1,
-    maxLevel: level,
-    closed: false
-  };
-  if (!emergency && lastInjectedAt > 0 && input.tokenEstimate < lastTokensAtInject * 1.05) {
-    return { allowInject: false, nextNudgeState: prev, nextEpoch };
-  }
-  if (!emergency && nudgeCount >= input.nudgeCooldownTurns) {
-    return { allowInject: false, nextNudgeState: prev, nextEpoch };
-  }
-  return {
-    allowInject: true,
-    level,
-    nextEpoch,
-    nextNudgeState: {
-      lastInjectedAt: Date.now(),
-      nudgeCount: nudgeCount + 1,
-      lastTokensAtInject: input.tokenEstimate
-    }
-  };
 }
 
 // src/acp/session.ts

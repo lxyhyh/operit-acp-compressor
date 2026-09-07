@@ -46,6 +46,9 @@ export interface AdapterSettings {
   gentleThresholdPct: number;
   /** 强制建议阈值（0~1，usage ≥ 此值发 strong nudge）。默认 0.82。 */
   strongThresholdPct: number;
+  /** V0.7 host 自接管下限（0~1，约 0.70）：kernel 沉默但 usage ≥ 此值且增长明显时，
+   *  Adapter 自行发 gentle/strong，防 kernel 阈值未触发而 context 危险增长。 */
+  hostEscalationFloor: number;
   /** V0.4.1 usage credit：压缩后此 token 数内免除 nudge。默认 contextLimit*0.15。 */
   usageCreditTokens: number;
   /** V0.6 Phase7 增量投影：本次仅比上次多 ≤ 此条数时走增量快速路径（跳过全量 processTurn）。 */
@@ -143,6 +146,8 @@ export function loadAdapterSettings(): AdapterSettings {
     // V0.4 三档：温和提示沿用旧键 nudgeThresholdPct（兼容已存设置），强制/硬限新增键。
     gentleThresholdPct: readPct("nudgeThresholdPct", 0.72),
     strongThresholdPct: readPct("strongThresholdPct", 0.82),
+    // V0.7 host 自接管下限：约 0.70（低于 gentle 0.72，允许 Adapter 在 kernel 沉默区先接管）。
+    hostEscalationFloor: readPct("hostEscalationFloor", 0.70),
     // V0.4.1 usage credit：压缩后 contextLimit*15% token 内免除 nudge。
     usageCreditTokens: Math.round(modelContextLimit * 0.15),
     // V0.6 Phase7 增量投影阈值（默认允许新增 8 条内走增量）。

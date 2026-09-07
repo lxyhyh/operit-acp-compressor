@@ -7,7 +7,8 @@ import { resolveConfigDir } from "./acp/paths";
 
 export interface AcpConfig {
     enabled: boolean;
-    nudgeThresholdPct: number;      // 0~1，窗口占比达到则提示模型压缩
+    nudgeThresholdPct: number;      // 0~1，温和提示阈值（gentle）
+    strongThresholdPct: number;     // 0~1，强制建议阈值（strong）
     hardLimitPct: number;           // 0~1，超过则插件主动折叠
     contextLimit: number;           // 与 Operit contextLength 对齐
     preserveRecentMessages: number; // 保护最近 N 条消息
@@ -16,7 +17,8 @@ export interface AcpConfig {
 
 export const DEFAULT_CONFIG: AcpConfig = {
     enabled: true,
-    nudgeThresholdPct: 0.5,
+    nudgeThresholdPct: 0.72,
+    strongThresholdPct: 0.82,
     hardLimitPct: 0.85,
     contextLimit: 200_000,
     preserveRecentMessages: 5,

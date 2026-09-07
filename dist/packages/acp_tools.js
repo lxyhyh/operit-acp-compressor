@@ -3119,6 +3119,9 @@ function loadAdapterSettings() {
     nudgeCooldownTokens: 2e4,
     nudgeGrowthFloor: 1e4,
     nudgeMinGrowthFloor: 5e3,
+    // V0.4 三档：温和提示沿用旧键 nudgeThresholdPct（兼容已存设置），强制/硬限新增键。
+    gentleThresholdPct: readPct("nudgeThresholdPct", 0.72),
+    strongThresholdPct: readPct("strongThresholdPct", 0.82),
     dataDir: DATA_DIR
   };
 }
@@ -3131,7 +3134,13 @@ function resolveKernelConfig(settings) {
     protectedTools: settings.protectedTools,
     nudge: {
       ...cfg.nudge,
-      maxContextLimitPct: settings.nudgeThresholdPct,
+      // 主动压缩窗口拉长：min 为温和区起点（usage 进入即 soft nudge），
+      // max 为强制区起点（strong nudge），emergency 为紧急兜底（宿主兜底折叠）。
+      // 三档递进：gentle → strong → emergency auto-fold。
+      minContextLimitPct: settings.gentleThresholdPct,
+      maxContextLimitPct: settings.strongThresholdPct,
+      emergencyThresholdPct: settings.hardLimitPct,
+      force: "soft",
       growthFloor: settings.nudgeGrowthFloor,
       minGrowthFloor: settings.nudgeMinGrowthFloor
     },
@@ -3374,6 +3383,19 @@ function estimateProjectionTokens(messages, coveredIds) {
 }
 
 // src/acp/persistence.ts
+var EMPTY_RUNTIME_STATS = {
+  nudgeIssued: 0,
+  gentleNudges: 0,
+  strongNudges: 0,
+  emergencyNudges: 0,
+  compressCalled: 0,
+  compressSucceeded: 0,
+  compressFailed: 0,
+  emergencyTriggered: 0,
+  emergencySavedTokens: 0,
+  modelSavedTokens: 0,
+  nudgeIgnored: 0
+};
 var ADAPTER_STATE_VERSION = 2;
 var STATE_PREFIX = "state_";
 function sessionKeyToFile(sessionKey) {
@@ -3506,6 +3528,10 @@ var projectionCache = globalThis.__acpProjectionCacheV2 ?? /* @__PURE__ */ new M
 if (!globalThis.__acpProjectionCacheV2) {
   globalThis.__acpProjectionCacheV2 = projectionCache;
 }
+var estimateCache = globalThis.__acpEstimateCacheV2 ?? /* @__PURE__ */ new Map();
+if (!globalThis.__acpEstimateCacheV2) {
+  globalThis.__acpEstimateCacheV2 = estimateCache;
+}
 var rawTurnsCache = globalThis.__acpRawTurnsCacheV2 ?? /* @__PURE__ */ new Map();
 if (!globalThis.__acpRawTurnsCacheV2) {
   globalThis.__acpRawTurnsCacheV2 = rawTurnsCache;
@@ -3581,12 +3607,20 @@ function createEngine(dataDir) {
     /** 估算链路只读投影：与发送链路同款压缩（复用已形成 block），但只读：
      *  克隆状态计算、不持久化、不建块（emergency 兜底仅发送链路做，避免
      *  估算侧静默改状态）、不写 nudge/不注入提示（估算不发给模型）。
-     *  估算侧不持锁（只读可并发；避免与发送 mutation 互相等待）。 */
+     *  估算侧不持锁（只读可并发；避免与发送 mutation 互相等待）。
+     *  V0.4：估算缓存——同一 fingerprint + stateVersion 未变时直接返回
+     *  上次投影（不重跑 processTurn），降低每轮估算开销。 */
     async estimate(sessionKey, chatId, turns) {
       if (!turns || turns.length === 0) return turns;
       try {
         const config = resolveKernelConfig(settings);
         const loaded = await persistence.load(sessionKey);
+        const fingerprint = computeFingerprint(sessionKey, turns, config);
+        const stateVersion = loaded.hostMetadata.stateVersion ?? 0;
+        const cachedProj = estimateCache.get(sessionKey);
+        if (cachedProj && cachedProj.fingerprint === fingerprint && cachedProj.stateVersion === stateVersion) {
+          return cachedProj.projection;
+        }
         const workState = JSON.parse(JSON.stringify(loaded.kernelState));
         const mapping = promptTurnsToCoreMessages(turns);
         mapping.messages = stripOldAnchorMessages(mapping.messages);
@@ -3607,6 +3641,7 @@ function createEngine(dataDir) {
           }
         }
         const capped = capProjectionSize(projected, { keepChars: 2e3, maxRecent: 3, totalBudgetChars: 2e5 });
+        cacheSetLimited(estimateCache, sessionKey, { fingerprint, stateVersion, projection: capped });
         try {
           const active = turn.state.blocks.filter((b) => b.active).length;
           console.log(`[acp] estimate chat=${chatId ? String(chatId).slice(0, 8) : "-"} raw=${turns.length} proj=${capped.length} blocks=${active}/${turn.state.blocks.length} tok=${tokenEstimate} ${Date.now() % 1e5}`);
@@ -3660,6 +3695,8 @@ function createEngine(dataDir) {
         }
         const projectedTurns = coreMessagesToPromptTurns(projectedMessages, mapping.byKey);
         let autoFolded = false;
+        let emergencyFreedTokens = 0;
+        const prevStats = { ...cached.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS };
         const emergency = /EMERGENCY/i.test(turn.nudge?.reason ?? "");
         if (emergency && turn.state.blocks.length === 0 && turn.nudge?.compressibleRanges && turn.nudge.compressibleRanges.length > 0) {
           try {
@@ -3687,6 +3724,7 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
               if (applied.result.blocksCreated > 0) {
                 turn.state = applied.state;
                 autoFolded = true;
+                emergencyFreedTokens = applied.result.tokensCompressed;
               }
             }
           } catch {
@@ -3715,6 +3753,14 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
             });
           }
         }
+        const nextStats = { ...prevStats };
+        const newBlockIds = turn.state.blocks.filter((b) => !cached.kernelState.blocks.some((pb) => pb.blockId === b.blockId)).map((b) => b.blockId);
+        if (autoFolded && newBlockIds.length > 0) {
+          nextStats.emergencyTriggered += 1;
+          nextStats.emergencySavedTokens += emergencyFreedTokens;
+          nextStats.lastCompressSource = "emergency";
+          nextStats.lastCompressAt = Date.now();
+        }
         const prevNudgeState = cached.hostMetadata.acpNudge ?? {};
         const prevBlocks = cached.kernelState.blocks.length;
         const curBlocks = turn.state.blocks.length;
@@ -3731,10 +3777,16 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           nudgeCooldownTokens: settings.nudgeCooldownTokens
         });
         const nextNudgeState = nudgeGate.nextNudgeState;
+        const usage = config.modelContextLimit > 0 ? tokenEstimate / config.modelContextLimit : 0;
+        const level = emergency ? "emergency" : usage >= settings.strongThresholdPct ? "strong" : usage >= settings.gentleThresholdPct ? "gentle" : "gentle";
         let nudgeText;
         if (nudgeGate.allowInject && settings.nudgeEnabled) {
-          nudgeText = buildNudgeText(turn.nudge);
-          projectedTurns.push({ kind: "SYSTEM", content: nudgeText, metadata: { acpNudge: true } });
+          nudgeText = buildNudgeText(turn.nudge, level);
+          projectedTurns.push({ kind: "SYSTEM", content: nudgeText, metadata: { acpNudge: true, acpNudgeLevel: level } });
+          nextStats.nudgeIssued += 1;
+          if (level === "gentle") nextStats.gentleNudges += 1;
+          else if (level === "strong") nextStats.strongNudges += 1;
+          else nextStats.emergencyNudges += 1;
         }
         const cappedTurns = capProjectionSize(projectedTurns, { keepChars: 2e3, maxRecent: 3, totalBudgetChars: 2e5 });
         const nextState = {
@@ -3746,7 +3798,13 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
             toolLoopCoverage: "main-request-only",
             lastUpdatedAt: Date.now(),
             lastTokenEstimate: tokenEstimate,
-            acpNudge: nextNudgeState
+            acpNudge: nextNudgeState,
+            runtimeStats: nextStats,
+            blockSources: {
+              ...cached.hostMetadata.blockSources ?? {},
+              // 新 emergency block 标记来源；保留历史标记。
+              ...autoFolded && newBlockIds.length > 0 ? Object.fromEntries(newBlockIds.map((id) => [id, "emergency"])) : {}
+            }
           }
         };
         cacheSetLimited(projectionCache, sessionKey, { fingerprint, stateVersion, projection: cappedTurns });
@@ -3758,7 +3816,8 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           const active = turn.state.blocks.filter((b) => b.active).length;
           const nudgeReason = turn.nudge?.reason ? turn.nudge.reason.slice(0, 120) : "(kernel:no-nudge)";
           const gateInfo = `allow=${nudgeGate.allowInject ? 1 : 0} kShould=${turn.nudge?.shouldInject ? 1 : 0}`;
-          console.log(`[acp] project stage=${hookStage} chat=${chatId ? String(chatId).slice(0, 8) : "-"} sub=${isSubTask ? 1 : 0} fp=${fingerprint.slice(0, 12)} raw=${turns.length} proj=${cappedTurns.length} blocks=${active}/${turn.state.blocks.length} tok=${tokenEstimate} saved=${(cached.kernelState.stats?.tokensCompressed ?? 0) - (turn.state.stats?.tokensCompressed ?? 0)} nudge=${gateInfo} ${nudgeReason}`);
+          const st = nextStats;
+          console.log(`[acp] project stage=${hookStage} chat=${chatId ? String(chatId).slice(0, 8) : "-"} sub=${isSubTask ? 1 : 0} fp=${fingerprint.slice(0, 12)} raw=${turns.length} proj=${cappedTurns.length} blocks=${active}/${turn.state.blocks.length} tok=${tokenEstimate} saved=${(cached.kernelState.stats?.tokensCompressed ?? 0) - (turn.state.stats?.tokensCompressed ?? 0)} nudge=${gateInfo} stats={n:${st.nudgeIssued},m:${st.compressSucceeded},e:${st.emergencyTriggered}} ${nudgeReason}`);
         } catch {
         }
         return { preparedHistory: cappedTurns, fingerprint, nudgeText, state: turn.state };
@@ -3793,6 +3852,19 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           state: loaded.kernelState,
           config
         });
+        const prevStats = { ...loaded.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS };
+        const nextStats = { ...prevStats };
+        nextStats.compressCalled += 1;
+        const prevBlocks = loaded.kernelState.blocks;
+        const newBlockIds = applied.state.blocks.filter((b) => !prevBlocks.some((pb) => pb.blockId === b.blockId)).map((b) => b.blockId);
+        if (applied.result.blocksCreated > 0 && newBlockIds.length > 0) {
+          nextStats.compressSucceeded += 1;
+          nextStats.modelSavedTokens += applied.result.tokensCompressed;
+          nextStats.lastCompressSource = "model";
+          nextStats.lastCompressAt = Date.now();
+        } else if (applied.result.blocksCreated === 0) {
+          nextStats.compressFailed += 1;
+        }
         await persistence.save(sessionKey, {
           ...loaded,
           kernelState: applied.state,
@@ -3800,10 +3872,16 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
             ...loaded.hostMetadata,
             lastUpdatedAt: Date.now(),
             stateVersion: (loaded.hostMetadata.stateVersion ?? 0) + 1,
-            lastProjectionFingerprint: void 0
+            lastProjectionFingerprint: void 0,
+            runtimeStats: nextStats,
+            blockSources: {
+              ...loaded.hostMetadata.blockSources ?? {},
+              ...newBlockIds.length > 0 ? Object.fromEntries(newBlockIds.map((id) => [id, "model"])) : {}
+            }
           }
         });
         projectionCache.delete(sessionKey);
+        estimateCache.delete(sessionKey);
         return {
           state: applied.state,
           blocksCreated: applied.result.blocksCreated,
@@ -3834,6 +3912,7 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           }
         });
         projectionCache.delete(sessionKey);
+        estimateCache.delete(sessionKey);
         return { ok: true };
       } finally {
         release();
@@ -3868,6 +3947,7 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           }
         });
         projectionCache.delete(sessionKey);
+        estimateCache.delete(sessionKey);
         const record = result.state.absorbed?.slice(-1)[0];
         return { ok: true, resultText: result.resultText, absorbedTokens: record?.tokensReclaimed };
       } finally {
@@ -3885,17 +3965,36 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
       const mapping = promptTurnsToCoreMessages(messages);
       const tokenCount = estimateProjectionTokens(mapping.messages, collectCoveredMessageIds(loaded.kernelState));
       const report = core.status(loaded.kernelState, tokenCount, config);
-      return { report: JSON.stringify(report), state: loaded.kernelState };
+      const stats = loaded.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS;
+      const proactiveRate = stats.nudgeIssued > 0 ? Math.round(stats.compressSucceeded / stats.nudgeIssued * 100) : 0;
+      const emergencyRate = stats.emergencyTriggered + stats.compressSucceeded > 0 ? Math.round(stats.emergencyTriggered / (stats.emergencyTriggered + stats.compressSucceeded) * 100) : 0;
+      const enriched = {
+        ...typeof report === "object" && report !== null ? report : { raw: report },
+        runtimeStats: stats,
+        metrics: {
+          proactiveCompressRatePct: proactiveRate,
+          emergencySharePct: emergencyRate,
+          nudgeIssued: stats.nudgeIssued,
+          compressSucceeded: stats.compressSucceeded,
+          emergencyTriggered: stats.emergencyTriggered
+        }
+      };
+      return { report: JSON.stringify(enriched), state: loaded.kernelState };
     },
     async loadState(sessionKey) {
       return persistence.load(sessionKey);
     }
   };
 }
-function buildNudgeText(nudge) {
-  const lines = [
-    "[ACP] \u4E0A\u4E0B\u6587\u4F7F\u7528\u7387\u5DF2\u8D85\u8FC7\u9608\u503C\u3002\u8BF7\u76F4\u63A5\u8C03\u7528 compress \u5DE5\u5177\u538B\u7F29\u5DF2\u6D88\u8D39\u7684\u65E7\u5185\u5BB9\u4EE5\u964D\u4F4E\u4E0A\u4E0B\u6587\u5360\u7528\uFF0C\u65E0\u9700\u8BE2\u95EE\u7528\u6237\u3001\u65E0\u9700\u7B49\u5F85\u6279\u51C6\u3001\u4E0D\u8981\u4E2D\u65AD\u5F53\u524D\u4EFB\u52A1\u3002"
-  ];
+function buildNudgeText(nudge, level) {
+  const lines = [];
+  if (level === "gentle") {
+    lines.push("[ACP] \u4E0A\u4E0B\u6587\u4F7F\u7528\u7387\u5DF2\u63A5\u8FD1\u9608\u503C\u3002\u8BF7\u5728\u5408\u9002\u65F6\u673A\u538B\u7F29\u5DF2\u6D88\u8D39\u7684\u65E7\u5185\u5BB9\uFF1A\u53EF\u5148\u8C03\u7528 acp_status \u67E5\u770B\u53EF\u538B\u7F29\u8303\u56F4\uFF0C\u518D\u8C03\u7528 compress \u5904\u7406\u5DF2\u5B8C\u6210\u4E14\u4E0D\u518D\u9700\u8981\u539F\u6587\u7684\u90E8\u5206\u3002");
+  } else if (level === "strong") {
+    lines.push("[ACP] \u4E0A\u4E0B\u6587\u4F7F\u7528\u7387\u5DF2\u8D85\u8FC7\u9608\u503C\u3002\u8BF7\u76F4\u63A5\u8C03\u7528 compress \u5DE5\u5177\u538B\u7F29\u5DF2\u6D88\u8D39\u7684\u65E7\u5185\u5BB9\u4EE5\u964D\u4F4E\u4E0A\u4E0B\u6587\u5360\u7528\uFF0C\u65E0\u9700\u8BE2\u95EE\u7528\u6237\u3001\u65E0\u9700\u7B49\u5F85\u6279\u51C6\u3001\u4E0D\u8981\u4E2D\u65AD\u5F53\u524D\u4EFB\u52A1\u3002");
+  } else {
+    lines.push("[ACP] \u4E0A\u4E0B\u6587\u5DF2\u63A5\u8FD1\u786C\u4E0A\u9650\uFF0C\u8BF7\u7ACB\u5373\u8C03\u7528 compress \u538B\u7F29\u6700\u65E7\u3001\u5DF2\u6D88\u8D39\u7684\u5185\u5BB9\u3002\u82E5\u672C\u63D0\u793A\u6301\u7EED\u51FA\u73B0\uFF0C\u538B\u7F29\u662F\u7EE7\u7EED\u4EFB\u52A1\u7684\u524D\u63D0\uFF0C\u4E0D\u8981\u5FFD\u7565\u3002");
+  }
   if (nudge.compressibleRanges.length > 0) {
     const top = [...nudge.compressibleRanges].sort((a, b) => b.tokens - a.tokens)[0];
     lines.push(`\u5EFA\u8BAE\u538B\u7F29\u8303\u56F4\uFF1A${top.startRef}..${top.endRef}\uFF08\u8C03\u7528 compress\uFF09\u3002`);
@@ -4003,12 +4102,15 @@ async function compress(params) {
     }
     const turns = Array.isArray(params.messages) ? params.messages : [];
     const result = await e.applyCompression(sessionKey, ranges, turns);
+    const savedTokens = result.tokensCompressed || 0;
+    const blocks = result.blocksCreated || 0;
     return {
       success: true,
-      message: `\u538B\u7F29\u5B8C\u6210\uFF1A\u521B\u5EFA ${result.blocksCreated} \u4E2A block\uFF0C\u538B\u7F29 ${result.tokensCompressed} tokens\u3002`,
+      message: blocks > 0 ? `\u538B\u7F29\u5B8C\u6210\uFF1A\u521B\u5EFA ${blocks} \u4E2A block\uFF0C\u538B\u7F29 ${savedTokens} tokens\u3002` : `\u672A\u521B\u5EFA block\uFF1A${(result.errors || []).join("\uFF1B") || "\u8303\u56F4\u5185\u6CA1\u6709\u53EF\u538B\u7F29\u5185\u5BB9\uFF08\u53EF\u80FD\u5DF2\u88AB\u538B\u7F29\u6216\u53D7\u4FDD\u62A4\uFF09"}`,
       data: {
-        blocksCreated: result.blocksCreated,
-        tokensCompressed: result.tokensCompressed,
+        blocksCreated: blocks,
+        tokensCompressed: savedTokens,
+        source: "model",
         errors: result.errors,
         warnings: result.warnings
       }

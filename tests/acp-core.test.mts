@@ -21,7 +21,7 @@ import { countTokensCjk, collectCoveredMessageIds } from "../src/acp/token.ts";
 import { buildSessionKey } from "../src/acp/session.ts";
 import { appendAcpSystemPrompt, ACP_SYSTEM_PROMPT } from "../src/acp/system-prompt.ts";
 import { ACP_CORE_TOOLS, acpCoreToolNames, buildAcpToolPromptItems } from "../src/acp/tools-meta.ts";
-import { sessionKeyToFile, mergeInitialState } from "../src/acp/persistence.ts";
+import { sessionKeyToFile, mergeInitialState, EMPTY_RUNTIME_STATS, type AcpRuntimeStats } from "../src/acp/persistence.ts";
 import { computeFingerprint } from "../src/acp/adapter.ts";
 
 import { createCore, createInitialState, defaultConfig } from "acp-kernel";
@@ -291,4 +291,30 @@ test("kernel 循环压缩后 token 明显下降", () => {
     const t2 = core.processTurn({ messages, state: applied.state, config, tokenCount: 30_000, renderTags: "none" });
     // 压缩后投影的消息数应显著小于原始（大部分被 SUMMARY 覆盖）
     assert.ok(t2.messages.length < messages.length, `压缩后消息数应下降：${t2.messages.length} < ${messages.length}`);
+});
+
+// ---- 9. V0.4 runtime stats 契约 ----
+
+test("V0.4 EMPTY_RUNTIME_STATS 字段齐全且初值为 0", () => {
+    const s = EMPTY_RUNTIME_STATS;
+    const required: (keyof AcpRuntimeStats)[] = [
+        "nudgeIssued", "gentleNudges", "strongNudges", "emergencyNudges",
+        "compressCalled", "compressSucceeded", "compressFailed",
+        "emergencyTriggered", "emergencySavedTokens", "modelSavedTokens",
+        "nudgeIgnored",
+    ];
+    for (const k of required) {
+        assert.equal(s[k], 0, `字段 ${k} 应为 0`);
+    }
+    assert.equal(s.lastCompressSource, undefined, "初始无 lastCompressSource");
+});
+
+test("V0.4 分档约束：gentle < strong < emergency（防配置倒挂）", () => {
+    // 与 src/config.ts DEFAULT_CONFIG / acp/config.ts 默认保持一致。
+    const gentle = 0.72;
+    const strong = 0.82;
+    const emergency = 0.85;
+    assert.ok(gentle < strong && strong < emergency, "三档应递增：0.72 < 0.82 < 0.85");
+    assert.ok(gentle >= 0.5, "温和阈值不应低于 50%（否则正常对话也频繁打扰）");
+    assert.ok(emergency <= 0.98, "硬限不应超过 98%（kernel emergencyOverride 语义）");
 });

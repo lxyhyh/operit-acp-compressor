@@ -12,6 +12,45 @@ import { createInitialState, isSummaryMessageId } from "acp-kernel";
 import { hashString } from "./messages";
 import { STATE_DIR } from "./paths";
 
+export interface AcpRuntimeStats {
+  /** 发出 nudge 的次数（分档计数）。 */
+  nudgeIssued: number;
+  gentleNudges: number;
+  strongNudges: number;
+  emergencyNudges: number;
+  /** 模型实际调用 compress 的次数（无论成败）。 */
+  compressCalled: number;
+  /** compress 成功（建块 >0）次数。 */
+  compressSucceeded: number;
+  /** 模型 compress 失败次数。 */
+  compressFailed: number;
+  /** 自动兜底折叠次数。 */
+  emergencyTriggered: number;
+  /** 自动兜底释放 token。 */
+  emergencySavedTokens: number;
+  /** 模型主动压缩释放 token。 */
+  modelSavedTokens: number;
+  /** nudge 后经历轮数（用于算 ignore 率）。 */
+  nudgeIgnored: number;
+  /** 最近一次 compress 来源（model/emergency）。 */
+  lastCompressSource?: "model" | "emergency";
+  lastCompressAt?: number;
+}
+
+export const EMPTY_RUNTIME_STATS: AcpRuntimeStats = {
+  nudgeIssued: 0,
+  gentleNudges: 0,
+  strongNudges: 0,
+  emergencyNudges: 0,
+  compressCalled: 0,
+  compressSucceeded: 0,
+  compressFailed: 0,
+  emergencyTriggered: 0,
+  emergencySavedTokens: 0,
+  modelSavedTokens: 0,
+  nudgeIgnored: 0,
+};
+
 export interface OperitAcpSessionState {
   adapterStateVersion: number;
   kernelState: CompressionState;
@@ -22,6 +61,10 @@ export interface OperitAcpSessionState {
     lastTokenEstimate?: number;
     stateVersion?: number;
     acpNudge?: Record<string, unknown>;
+    /** V0.4：运行时统计（nudge/compress/emergency 全链路）。 */
+    runtimeStats?: AcpRuntimeStats;
+    /** V0.4：block 来源映射 blockId → model | emergency（搜索/统计用）。 */
+    blockSources?: Record<string, "model" | "emergency">;
   };
   /** 仅内存载体（hook 最近一次投影的原始 turns），save 不落盘。 */
   lastRawTurns?: Array<{ kind: string; content: string; toolName?: string; metadata?: Record<string, unknown> | null }>;

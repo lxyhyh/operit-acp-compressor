@@ -34,14 +34,24 @@ import {
   type PromptTurnLike,
 } from "./messages";
 import { collectCoveredMessageIds, estimateProjectionTokens } from "./token";
-import { createPersistence, stripOldAnchorMessages, type Persistence, type OperitAcpSessionState } from "./persistence";
+import { createPersistence, stripOldAnchorMessages, EMPTY_RUNTIME_STATS, type Persistence, type OperitAcpSessionState } from "./persistence";
 
-/** 投影缓存（globalThis 共享；compress 等 state mutation 后失效）。 */
+/** 投影缓存（globalThis 共享；compress 等 state mutation 后失效）。
+ *  V0.4：send（project）与 estimate 分离——两者投影内容可能不同
+ *  （send 可能带 nudge/autoFold 追加系统消息，estimate 恒只读纯投影），
+ *  共用会互相污染命中（send 漏 nudge / estimate 拿到含 nudge 的发送视图）。 */
 const projectionCache = (globalThis as Record<string, unknown>).__acpProjectionCacheV2 as
   | Map<string, { fingerprint: string; stateVersion: number; projection: PromptTurnLike[] }>
   | undefined ?? new Map<string, { fingerprint: string; stateVersion: number; projection: PromptTurnLike[] }>();
 if (!(globalThis as Record<string, unknown>).__acpProjectionCacheV2) {
   (globalThis as Record<string, unknown>).__acpProjectionCacheV2 = projectionCache;
+}
+
+const estimateCache = (globalThis as Record<string, unknown>).__acpEstimateCacheV2 as
+  | Map<string, { fingerprint: string; stateVersion: number; projection: PromptTurnLike[] }>
+  | undefined ?? new Map<string, { fingerprint: string; stateVersion: number; projection: PromptTurnLike[] }>();
+if (!(globalThis as Record<string, unknown>).__acpEstimateCacheV2) {
+  (globalThis as Record<string, unknown>).__acpEstimateCacheV2 = estimateCache;
 }
 
 /** raw turns 内存缓存（compress/absorb 解析 refs 用；save 不落盘）。 */
@@ -184,12 +194,21 @@ export function createEngine(dataDir?: string): AcpEngine {
     /** 估算链路只读投影：与发送链路同款压缩（复用已形成 block），但只读：
      *  克隆状态计算、不持久化、不建块（emergency 兜底仅发送链路做，避免
      *  估算侧静默改状态）、不写 nudge/不注入提示（估算不发给模型）。
-     *  估算侧不持锁（只读可并发；避免与发送 mutation 互相等待）。 */
+     *  估算侧不持锁（只读可并发；避免与发送 mutation 互相等待）。
+     *  V0.4：估算缓存——同一 fingerprint + stateVersion 未变时直接返回
+     *  上次投影（不重跑 processTurn），降低每轮估算开销。 */
     async estimate(sessionKey, chatId, turns) {
       if (!turns || turns.length === 0) return turns;
       try {
         const config = resolveKernelConfig(settings);
         const loaded = await persistence.load(sessionKey);
+        const fingerprint = computeFingerprint(sessionKey, turns, config);
+        const stateVersion = loaded.hostMetadata.stateVersion ?? 0;
+        // 命中缓存：同 fingerprint + 同 stateVersion → 直接返回缓存投影。
+        const cachedProj = estimateCache.get(sessionKey);
+        if (cachedProj && cachedProj.fingerprint === fingerprint && cachedProj.stateVersion === stateVersion) {
+          return cachedProj.projection;
+        }
         // 克隆状态：绝不动持久化状态（估算侧只读）。kernelState 为纯 JSON，JSON 深拷贝安全。
         const workState = JSON.parse(JSON.stringify(loaded.kernelState)) as CompressionState;
         const mapping = promptTurnsToCoreMessages(turns);
@@ -209,6 +228,8 @@ export function createEngine(dataDir?: string): AcpEngine {
           try { projected = coreMessagesToPromptTurns(kernelHideConsumedCompressCalls(turn.state, turn.messages).messages, mapping.byKey); } catch { /* noop */ }
         }
         const capped = capProjectionSize(projected, { keepChars: 2000, maxRecent: 3, totalBudgetChars: 200_000 });
+        // 写估算缓存（与发送缓存分离，见 estimateCache 定义注释）。
+        cacheSetLimited(estimateCache, sessionKey, { fingerprint, stateVersion, projection: capped });
         try {
           const active = turn.state.blocks.filter((b) => b.active).length;
           console.log(`[acp] estimate chat=${chatId ? String(chatId).slice(0, 8) : "-"} raw=${turns.length} proj=${capped.length} blocks=${active}/${turn.state.blocks.length} tok=${tokenEstimate} ${Date.now() % 100000}`);
@@ -277,7 +298,10 @@ export function createEngine(dataDir?: string): AcpEngine {
         // —— Emergency 自动兜底（对齐 preflight 设计）：kernel EMERGENCY 且仍无块时，
         //    插件直接用本轮推荐范围 + 抽取摘要自动压缩，不等模型 compress。
         //    保证"发送量封顶"（模型不主动时也有底线），摘要带 [ACP 自动折叠] 标记可 decompress 恢复。
+        //    V0.4：来源标记 emergency + 统计。
         let autoFolded = false;
+        let emergencyFreedTokens = 0;
+        const prevStats = { ...(cached.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS) };
         const emergency = /EMERGENCY/i.test(turn.nudge?.reason ?? "");
         if (emergency && turn.state.blocks.length === 0 && turn.nudge?.compressibleRanges && turn.nudge.compressibleRanges.length > 0) {
           try {
@@ -309,6 +333,7 @@ export function createEngine(dataDir?: string): AcpEngine {
               if (applied.result.blocksCreated > 0) {
                 turn.state = applied.state;
                 autoFolded = true;
+                emergencyFreedTokens = applied.result.tokensCompressed;
               }
             }
           } catch { /* 自动兜底失败不影响主流程（仍走 nudge 提示） */ }
@@ -339,6 +364,18 @@ export function createEngine(dataDir?: string): AcpEngine {
             });
           }
         }
+
+        // —— V0.4：运行时统计累计（nudge/compress/emergency 全链路）。
+        //    autoFolded = emergency 兜底折叠（来源 emergency）；模型 compress 走
+        //    applyCompression 单独计数（source=model）。
+        const nextStats = { ...prevStats };
+        const newBlockIds = turn.state.blocks.filter((b) => !cached.kernelState.blocks.some((pb) => pb.blockId === b.blockId)).map((b) => b.blockId);
+        if (autoFolded && newBlockIds.length > 0) {
+          nextStats.emergencyTriggered += 1;
+          nextStats.emergencySavedTokens += emergencyFreedTokens;
+          nextStats.lastCompressSource = "emergency";
+          nextStats.lastCompressAt = Date.now();
+        }
         // nudge 状态机（Adapter 层门控）：达到阈值最多注入一次；压缩/下降后 reset。
         const prevNudgeState = cached.hostMetadata.acpNudge ?? {};
         const prevBlocks = cached.kernelState.blocks.length;
@@ -357,11 +394,23 @@ export function createEngine(dataDir?: string): AcpEngine {
         });
         const nextNudgeState = nudgeGate.nextNudgeState;
 
+        // 按 usage 分档（V0.4）：gentle（接近）→ strong（超过）→ emergency（硬顶）。
+        const usage = config.modelContextLimit > 0 ? tokenEstimate / config.modelContextLimit : 0;
+        const level: NudgeLevel =
+          emergency ? "emergency"
+          : usage >= settings.strongThresholdPct ? "strong"
+          : usage >= settings.gentleThresholdPct ? "gentle"
+          : "gentle";
+
         // nudge 仅当状态机允许时注入（SYSTEM 消息追加；UI 不渲染成新用户消息）。
         let nudgeText: string | undefined;
         if (nudgeGate.allowInject && settings.nudgeEnabled) {
-          nudgeText = buildNudgeText(turn.nudge!);
-          projectedTurns.push({ kind: "SYSTEM", content: nudgeText, metadata: { acpNudge: true } });
+          nudgeText = buildNudgeText(turn.nudge!, level);
+          projectedTurns.push({ kind: "SYSTEM", content: nudgeText, metadata: { acpNudge: true, acpNudgeLevel: level } });
+          nextStats.nudgeIssued += 1;
+          if (level === "gentle") nextStats.gentleNudges += 1;
+          else if (level === "strong") nextStats.strongNudges += 1;
+          else nextStats.emergencyNudges += 1;
         }
 
         // 裁剪投影输出体量（防宿主主线程解析超大 JSON 卡死——总预算 200K）。
@@ -377,6 +426,14 @@ export function createEngine(dataDir?: string): AcpEngine {
             lastUpdatedAt: Date.now(),
             lastTokenEstimate: tokenEstimate,
             acpNudge: nextNudgeState,
+            runtimeStats: nextStats,
+            blockSources: {
+              ...(cached.hostMetadata.blockSources ?? {}),
+              // 新 emergency block 标记来源；保留历史标记。
+              ...(autoFolded && newBlockIds.length > 0
+                ? Object.fromEntries(newBlockIds.map((id) => [id, "emergency" as const]))
+                : {}),
+            },
           },
         };
         // 写内存投影缓存 + raw turns 缓存（save 剥离不落盘）。
@@ -391,7 +448,8 @@ export function createEngine(dataDir?: string): AcpEngine {
           const active = turn.state.blocks.filter((b) => b.active).length;
           const nudgeReason = turn.nudge?.reason ? turn.nudge.reason.slice(0, 120) : "(kernel:no-nudge)";
           const gateInfo = `allow=${nudgeGate.allowInject ? 1 : 0} kShould=${turn.nudge?.shouldInject ? 1 : 0}`;
-          console.log(`[acp] project stage=${hookStage} chat=${chatId ? String(chatId).slice(0, 8) : "-"} sub=${isSubTask ? 1 : 0} fp=${fingerprint.slice(0, 12)} raw=${turns.length} proj=${cappedTurns.length} blocks=${active}/${turn.state.blocks.length} tok=${tokenEstimate} saved=${(cached.kernelState.stats?.tokensCompressed ?? 0) - (turn.state.stats?.tokensCompressed ?? 0)} nudge=${gateInfo} ${nudgeReason}`);
+          const st = nextStats;
+          console.log(`[acp] project stage=${hookStage} chat=${chatId ? String(chatId).slice(0, 8) : "-"} sub=${isSubTask ? 1 : 0} fp=${fingerprint.slice(0, 12)} raw=${turns.length} proj=${cappedTurns.length} blocks=${active}/${turn.state.blocks.length} tok=${tokenEstimate} saved=${(cached.kernelState.stats?.tokensCompressed ?? 0) - (turn.state.stats?.tokensCompressed ?? 0)} nudge=${gateInfo} stats={n:${st.nudgeIssued},m:${st.compressSucceeded},e:${st.emergencyTriggered}} ${nudgeReason}`);
         } catch { /* noop */ }
 
         return { preparedHistory: cappedTurns, fingerprint, nudgeText, state: turn.state };
@@ -429,6 +487,22 @@ export function createEngine(dataDir?: string): AcpEngine {
           state: loaded.kernelState,
           config,
         });
+        // —— V0.4：模型 compress 统计 + 来源标记 model。
+        const prevStats = { ...(loaded.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS) };
+        const nextStats = { ...prevStats };
+        nextStats.compressCalled += 1;
+        const prevBlocks = loaded.kernelState.blocks;
+        const newBlockIds = applied.state.blocks
+          .filter((b) => !prevBlocks.some((pb) => pb.blockId === b.blockId))
+          .map((b) => b.blockId);
+        if (applied.result.blocksCreated > 0 && newBlockIds.length > 0) {
+          nextStats.compressSucceeded += 1;
+          nextStats.modelSavedTokens += applied.result.tokensCompressed;
+          nextStats.lastCompressSource = "model";
+          nextStats.lastCompressAt = Date.now();
+        } else if (applied.result.blocksCreated === 0) {
+          nextStats.compressFailed += 1;
+        }
         // state mutation 后 stateVersion++ 并让旧投影失效。
         await persistence.save(sessionKey, {
           ...loaded,
@@ -438,9 +512,16 @@ export function createEngine(dataDir?: string): AcpEngine {
             lastUpdatedAt: Date.now(),
             stateVersion: (loaded.hostMetadata.stateVersion ?? 0) + 1,
             lastProjectionFingerprint: undefined as string | undefined,
+            runtimeStats: nextStats,
+            blockSources: {
+              ...(loaded.hostMetadata.blockSources ?? {}),
+              ...(newBlockIds.length > 0
+                ? Object.fromEntries(newBlockIds.map((id) => [id, "model" as const]))
+                : {}),
+            },
           },
         });
-        projectionCache.delete(sessionKey);
+        projectionCache.delete(sessionKey); estimateCache.delete(sessionKey);
         return {
           state: applied.state,
           blocksCreated: applied.result.blocksCreated,
@@ -471,7 +552,7 @@ export function createEngine(dataDir?: string): AcpEngine {
             lastProjectionFingerprint: undefined as string | undefined,
           },
         });
-        projectionCache.delete(sessionKey);
+        projectionCache.delete(sessionKey); estimateCache.delete(sessionKey);
         return { ok: true };
       } finally {
         release();
@@ -506,7 +587,7 @@ export function createEngine(dataDir?: string): AcpEngine {
             lastProjectionFingerprint: undefined as string | undefined,
           },
         });
-        projectionCache.delete(sessionKey);
+        projectionCache.delete(sessionKey); estimateCache.delete(sessionKey);
         const record = result.state.absorbed?.slice(-1)[0] as { tokensReclaimed?: number } | undefined;
         return { ok: true, resultText: result.resultText, absorbedTokens: record?.tokensReclaimed };
       } finally {
@@ -526,7 +607,26 @@ export function createEngine(dataDir?: string): AcpEngine {
       const mapping = promptTurnsToCoreMessages(messages);
       const tokenCount = estimateProjectionTokens(mapping.messages, collectCoveredMessageIds(loaded.kernelState));
       const report = core.status(loaded.kernelState, tokenCount, config);
-      return { report: JSON.stringify(report), state: loaded.kernelState };
+      // V0.4：附运行时统计（nudge/compress/emergency 链路），供诊断主动压缩率。
+      const stats = loaded.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS;
+      const proactiveRate = stats.nudgeIssued > 0
+        ? Math.round((stats.compressSucceeded / stats.nudgeIssued) * 100)
+        : 0;
+      const emergencyRate = (stats.emergencyTriggered + stats.compressSucceeded) > 0
+        ? Math.round((stats.emergencyTriggered / (stats.emergencyTriggered + stats.compressSucceeded)) * 100)
+        : 0;
+      const enriched = {
+        ...(typeof report === "object" && report !== null ? report : { raw: report }),
+        runtimeStats: stats,
+        metrics: {
+          proactiveCompressRatePct: proactiveRate,
+          emergencySharePct: emergencyRate,
+          nudgeIssued: stats.nudgeIssued,
+          compressSucceeded: stats.compressSucceeded,
+          emergencyTriggered: stats.emergencyTriggered,
+        },
+      };
+      return { report: JSON.stringify(enriched), state: loaded.kernelState };
     },
 
     async loadState(sessionKey) {
@@ -535,11 +635,19 @@ export function createEngine(dataDir?: string): AcpEngine {
   };
 }
 
-function buildNudgeText(nudge: { reason: string; compressibleRanges: { startRef: string; endRef: string; tokens: number }[] }): string {
+type NudgeLevel = "gentle" | "strong" | "emergency";
+
+function buildNudgeText(nudge: { reason: string; compressibleRanges: { startRef: string; endRef: string; tokens: number }[] }, level: NudgeLevel): string {
   // 固定模板（不嵌入动态 token 数/百分比——动态内容破坏 LLM 缓存前缀命中率）。
-  const lines = [
-    "[ACP] 上下文使用率已超过阈值。请直接调用 compress 工具压缩已消费的旧内容以降低上下文占用，无需询问用户、无需等待批准、不要中断当前任务。",
-  ];
+  // 三档递进文案：gentle = 提醒准备；strong = 要求主动压缩；emergency = 必须压缩。
+  const lines: string[] = [];
+  if (level === "gentle") {
+    lines.push("[ACP] 上下文使用率已接近阈值。请在合适时机压缩已消费的旧内容：可先调用 acp_status 查看可压缩范围，再调用 compress 处理已完成且不再需要原文的部分。");
+  } else if (level === "strong") {
+    lines.push("[ACP] 上下文使用率已超过阈值。请直接调用 compress 工具压缩已消费的旧内容以降低上下文占用，无需询问用户、无需等待批准、不要中断当前任务。");
+  } else {
+    lines.push("[ACP] 上下文已接近硬上限，请立即调用 compress 压缩最旧、已消费的内容。若本提示持续出现，压缩是继续任务的前提，不要忽略。");
+  }
   if (nudge.compressibleRanges.length > 0) {
     const top = [...nudge.compressibleRanges].sort((a, b) => b.tokens - a.tokens)[0];
     lines.push(`建议压缩范围：${top.startRef}..${top.endRef}（调用 compress）。`);

@@ -151,12 +151,17 @@ export async function compress(params: {
     }
     const turns = Array.isArray(params.messages) ? params.messages : [];
     const result = await e.applyCompression(sessionKey, ranges, turns as never);
+    const savedTokens = result.tokensCompressed || 0;
+    const blocks = result.blocksCreated || 0;
     return {
       success: true,
-      message: `压缩完成：创建 ${result.blocksCreated} 个 block，压缩 ${result.tokensCompressed} tokens。`,
+      message: blocks > 0
+        ? `压缩完成：创建 ${blocks} 个 block，压缩 ${savedTokens} tokens。`
+        : `未创建 block：${(result.errors || []).join("；") || "范围内没有可压缩内容（可能已被压缩或受保护）"}`,
       data: {
-        blocksCreated: result.blocksCreated,
-        tokensCompressed: result.tokensCompressed,
+        blocksCreated: blocks,
+        tokensCompressed: savedTokens,
+        source: "model",
         errors: result.errors,
         warnings: result.warnings,
       },

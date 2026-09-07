@@ -14,7 +14,8 @@ Object.defineProperty(_exports, "__esModule", { value: true });
 
 const DEFAULT = {
     enabled: true,
-    nudgeThresholdPct: 0.5,
+    nudgeThresholdPct: 0.72,
+    strongThresholdPct: 0.82,
     hardLimitPct: 0.85,
     contextLimit: 200000,
     preserveRecentMessages: 5,
@@ -147,16 +148,16 @@ function Screen(ctx) {
         ])
     );
 
-    // nudge / 硬限
+    // nudge 三档阈值（温和/强制/硬限）
     children.push(
         UI.Card({ fillMaxWidth: true }, [
             UI.Column({ padding: 12, spacing: 6 }, [
-                UI.Text({ text: "窗口占比达 nudge 阈值时提示模型压缩", style: "bodySmall", color: "onSurfaceVariant", fontSize: 11 }),
+                UI.Text({ text: "上下文窗口占比阈值（渐进式提醒，V0.4）", style: "bodySmall", color: "onSurfaceVariant", fontSize: 11 }),
                 UI.Row({ verticalAlignment: "center" }, [
-                    UI.Text({ text: "nudge 阈值 (%)", style: "bodySmall", fontSize: 12 }),
+                    UI.Text({ text: "温和提示 (%)", style: "bodySmall", fontSize: 12 }),
                     UI.Spacer({ width: 8 }),
                     UI.TextField({
-                        value: String(Math.round((cfg.nudgeThresholdPct || 0) * 100)),
+                        value: String(Math.round((cfg.nudgeThresholdPct || 0.72) * 100)),
                         onValueChange: (v) => {
                             const n = Number(String(v).replace(/[^0-9]/g, ""));
                             if (Number.isFinite(n) && n >= 1 && n <= 100) set("nudgeThresholdPct", n / 100);
@@ -166,13 +167,27 @@ function Screen(ctx) {
                         style: { fontSize: 13 },
                     }),
                 ]),
-                UI.Spacer({ height: 4 }),
-                UI.Text({ text: "窗口占比超硬限时插件自动折叠最早段", style: "bodySmall", color: "onSurfaceVariant", fontSize: 11 }),
+                UI.Text({ text: "温和区：提示准备压缩（gentle）", style: "bodySmall", color: "onSurfaceVariant", fontSize: 11 }),
+                UI.Row({ verticalAlignment: "center" }, [
+                    UI.Text({ text: "强制建议 (%)", style: "bodySmall", fontSize: 12 }),
+                    UI.Spacer({ width: 8 }),
+                    UI.TextField({
+                        value: String(Math.round((cfg.strongThresholdPct || 0.82) * 100)),
+                        onValueChange: (v) => {
+                            const n = Number(String(v).replace(/[^0-9]/g, ""));
+                            if (Number.isFinite(n) && n >= 1 && n <= 100) set("strongThresholdPct", n / 100);
+                        },
+                        label: "%",
+                        singleLine: true,
+                        style: { fontSize: 13 },
+                    }),
+                ]),
+                UI.Text({ text: "强制区：要求主动 compress（strong）", style: "bodySmall", color: "onSurfaceVariant", fontSize: 11 }),
                 UI.Row({ verticalAlignment: "center" }, [
                     UI.Text({ text: "硬限阈值 (%)", style: "bodySmall", fontSize: 12 }),
                     UI.Spacer({ width: 8 }),
                     UI.TextField({
-                        value: String(Math.round((cfg.hardLimitPct || 0) * 100)),
+                        value: String(Math.round((cfg.hardLimitPct || 0.85) * 100)),
                         onValueChange: (v) => {
                             const n = Number(String(v).replace(/[^0-9]/g, ""));
                             if (Number.isFinite(n) && n >= 1 && n <= 100) set("hardLimitPct", n / 100);
@@ -182,6 +197,7 @@ function Screen(ctx) {
                         style: { fontSize: 13 },
                     }),
                 ]),
+                UI.Text({ text: "硬限：超限插件自动兜底折叠（emergency）", style: "bodySmall", color: "onSurfaceVariant", fontSize: 11 }),
             ]),
         ])
     );

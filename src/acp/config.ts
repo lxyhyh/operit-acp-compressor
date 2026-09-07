@@ -42,6 +42,10 @@ export interface AdapterSettings {
   nudgeGrowthFloor: number;
   /** nudge 触发的最小增长下限（token）。默认 5000。 */
   nudgeMinGrowthFloor: number;
+  /** 温和提示阈值（0~1，usage ≥ 此值发 gentle nudge）。默认 0.72。 */
+  gentleThresholdPct: number;
+  /** 强制建议阈值（0~1，usage ≥ 此值发 strong nudge）。默认 0.82。 */
+  strongThresholdPct: number;
   /** 数据目录。 */
   dataDir: string;
 }
@@ -131,6 +135,9 @@ export function loadAdapterSettings(): AdapterSettings {
     nudgeCooldownTokens: 20_000,
     nudgeGrowthFloor: 10_000,
     nudgeMinGrowthFloor: 5_000,
+    // V0.4 三档：温和提示沿用旧键 nudgeThresholdPct（兼容已存设置），强制/硬限新增键。
+    gentleThresholdPct: readPct("nudgeThresholdPct", 0.72),
+    strongThresholdPct: readPct("strongThresholdPct", 0.82),
     dataDir: DATA_DIR,
   };
 }
@@ -147,7 +154,13 @@ export function resolveKernelConfig(settings: AdapterSettings): Config {
     protectedTools: settings.protectedTools,
     nudge: {
       ...cfg.nudge,
-      maxContextLimitPct: settings.nudgeThresholdPct,
+      // 主动压缩窗口拉长：min 为温和区起点（usage 进入即 soft nudge），
+      // max 为强制区起点（strong nudge），emergency 为紧急兜底（宿主兜底折叠）。
+      // 三档递进：gentle → strong → emergency auto-fold。
+      minContextLimitPct: settings.gentleThresholdPct,
+      maxContextLimitPct: settings.strongThresholdPct,
+      emergencyThresholdPct: settings.hardLimitPct,
+      force: "soft",
       growthFloor: settings.nudgeGrowthFloor,
       minGrowthFloor: settings.nudgeMinGrowthFloor,
     },

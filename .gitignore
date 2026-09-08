@@ -7,3 +7,4 @@ dist/*.map
 
 # 本地构建脚本（不推送）
 build-local.sh
+commit-v0710.sh

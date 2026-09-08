@@ -34,7 +34,7 @@ import {
   type PromptTurnLike,
 } from "./messages";
 import { collectCoveredMessageIds, estimateProjectionTokens } from "./token";
-import { createPersistence, stripOldAnchorMessages, EMPTY_RUNTIME_STATS, type Persistence, type OperitAcpSessionState } from "./persistence";
+import { createPersistence, stripOldAnchorMessages, EMPTY_RUNTIME_STATS, type Persistence, type OperitAcpSessionState, type AcpRuntimeStats } from "./persistence";
 import { chatTrace } from "./trace";
 import {
   detectAbsorbCandidates,
@@ -47,8 +47,10 @@ import {
   evaluatePressure,
   type NudgeLevel as PressureNudgeLevel,
   type PressureEpoch,
+  type PressureDecision,
 } from "./pressure";
 import { createUsageManager, type UsageManager, type UsageManagerState } from "./usage";
+import type { TokenSnapshot } from "./token-source";
 import { createOperitHostUsageAdapter, type HostUsageAdapter } from "./host-usage-adapter";
 import { detectProtocol, normalizeUsage, type ProviderUsage } from "./token-source";
 
@@ -217,6 +219,94 @@ export function createEngine(dataDir?: string): AcpEngine {
     return release;
   }
 
+  /**
+   * V0.7.3：collectAndEvaluatePressure —— 每个真实 Model Hop 的 pressure 阶段。
+   * 与 projection path 解耦：full / incremental / cache 三个路径都必须先经过它。
+   * 职责（严格按文档第四/十/十一/十二节）：
+   *  - Usage sampling：host DB 采样 + estimate 记录（actual 保持 undefined 诚实语义）
+   *  - evaluatePressure：连续压力控制（usage / credit / epoch / growth 全状态）
+   *  - per-hop ledger：一条 ledger = 一次真实 Model Hop 的发送前 pressure snapshot
+   *  - UsageManager 连续：绝不在 Hop 间重新 create（state 从 hostMetadata 载入）
+   * 返回 pressure 决策 + eff 快照；本 Hop 的 projection path 由调用方决定。
+   */
+  async function collectAndEvaluatePressure(opts: {
+    sessionKey: string;
+    chatId?: string;
+    tokenEstimate: number;
+    kernelShouldInject: boolean;
+    kernelReason: string;
+    prevBlocks: number;
+    curBlocks: number;
+    prevNudgeState: Record<string, unknown>;
+    prevStats: AcpRuntimeStats;
+    usageState?: UsageManagerState;
+    config: Config;
+    settings: AdapterSettings;
+    hopNo: number;
+  }): Promise<{
+    pressure: PressureDecision;
+    eff: TokenSnapshot;
+    pressurePct: number;
+    usageManager: ReturnType<typeof createUsageManager>;
+    hostTokens: number | undefined;
+    nextStats: AcpRuntimeStats;
+  }> {
+    const usageManager = createUsageManager(opts.usageState);
+    const nextStats: AcpRuntimeStats = { ...opts.prevStats as AcpRuntimeStats };
+    const prevEpoch = (opts.prevNudgeState as { acpEpoch?: PressureEpoch }).acpEpoch;
+    // —— V0.7.1：effective pressure 由 UsageManager 计算（estimate/actual/host 明确区分）。
+    // 宿主侧测量（尽力而为；DB 不可读返回 undefined，绝不拖垮请求）。
+    const hostTokens = opts.chatId
+      ? await getHostUsageAdapter().getCurrentContextTokens(String(opts.chatId))
+      : undefined;
+    if (hostTokens !== undefined) usageManager.recordHostUsage(hostTokens, opts.hopNo);
+    usageManager.recordEstimate(opts.tokenEstimate, opts.hopNo);
+    // 若插件曾通过工具链路记录过上游 usage，则注入（见 recordUpstreamUsage 调用点）。
+    const eff = usageManager.getEffectiveSnapshot(opts.tokenEstimate);
+    const pressurePct = opts.config.modelContextLimit > 0
+      ? (eff.effectiveTokens || opts.tokenEstimate) / opts.config.modelContextLimit
+      : ((eff.effectiveTokens || opts.tokenEstimate) / 200000);
+    // compression baseline：最近一次压缩成功后的 token 基准（供增长判断）。
+    const lastCompressToken = typeof opts.prevStats.creditBaseToken === "number" ? opts.prevStats.creditBaseToken : undefined;
+    const pressure = evaluatePressure({
+      usagePct: pressurePct,
+      effectiveTokens: eff.effectiveTokens || opts.tokenEstimate,
+      tokenEstimate: opts.tokenEstimate,
+      kernelShouldInject: opts.kernelShouldInject,
+      kernelReason: opts.kernelReason,
+      prevEpoch,
+      prevBlocks: opts.prevBlocks,
+      curBlocks: opts.curBlocks,
+      gentleThresholdPct: opts.settings.gentleThresholdPct,
+      strongThresholdPct: opts.settings.strongThresholdPct,
+      emergencyThresholdPct: opts.settings.hardLimitPct,
+      hostEscalationFloor: opts.settings.hostEscalationFloor,
+      nudgeCooldownTurns: opts.settings.nudgeCooldownTurns,
+      nudgeGrowthFloor: opts.settings.nudgeGrowthFloor,
+      usageCreditTokens: opts.settings.usageCreditTokens,
+      creditBaseToken: lastCompressToken,
+      lastInjectedAt: typeof opts.prevNudgeState.lastInjectedAt === "number" ? opts.prevNudgeState.lastInjectedAt : 0,
+      nudgeCount: typeof opts.prevNudgeState.nudgeCount === "number" ? opts.prevNudgeState.nudgeCount : 0,
+      lastTokensAtInject: typeof opts.prevNudgeState.lastTokensAtInject === "number" ? opts.prevNudgeState.lastTokensAtInject : 0,
+      lastCompressToken,
+      source: eff.source,
+    });
+    // —— V0.7.2：per-hop ledger（发送前决策视图；与 trace 同源，持久化在 usageState）。
+    try {
+      usageManager.recordHopEntry({
+        hop: opts.hopNo,
+        estimateTokens: opts.tokenEstimate,
+        actualTokens: eff.actualTokens,
+        hostTokens: eff.hostTokens,
+        compressionCredit: eff.compressionCredit ?? 0,
+        effectiveTokens: eff.effectiveTokens,
+        source: eff.source,
+        confidence: eff.confidence,
+      });
+    } catch { /* ledger 失败不影响主流程 */ }
+    return { pressure, eff, pressurePct, usageManager, hostTokens, nextStats };
+  }
+
   return {
     core,
     settings,
@@ -291,16 +381,69 @@ export function createEngine(dataDir?: string): AcpEngine {
           const projected = memCached && memCached.projection && Array.isArray(memCached.projection) && memCached.projection.length > 0
             ? memCached.projection
             : undefined;
+          // —— V0.7.3：stage2 也必须经过 pressure（禁止 cache 绕过）。
+          //   pressure 输入：tokenEstimate 用缓存投影的 estimate（无缓存时透传 raw
+          //   turns 估算）；kernelShouldInject 用 kernel 对当前 turns 的 nudge 判断
+          //   （无 processTurn 时以 usage 档位兜底，evaluatePressure 内部处理）。
+          const stage2Estimate = projected && Array.isArray(projected)
+            ? estimateProjectionTokens(promptTurnsToCoreMessages(projected as PromptTurnLike[]).messages, collectCoveredMessageIds(cached.kernelState))
+            : estimateProjectionTokens(promptTurnsToCoreMessages(turns).messages, collectCoveredMessageIds(cached.kernelState));
+          const prevStats2 = { ...(cached.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS) };
+          const hopNo2 = ((cached.hostMetadata.usageState as UsageManagerState | undefined)?.lastHop ?? 0) + 1;
+          const stage2Pressure = await collectAndEvaluatePressure({
+            sessionKey, chatId,
+            tokenEstimate: stage2Estimate,
+            kernelShouldInject: false,
+            kernelReason: "",
+            prevBlocks: cached.kernelState.blocks.length,
+            curBlocks: cached.kernelState.blocks.length,
+            prevNudgeState: (cached.hostMetadata.acpNudge ?? {}) as Record<string, unknown>,
+            prevStats: prevStats2,
+            usageState: cached.hostMetadata.usageState as UsageManagerState | undefined,
+            config, settings,
+            hopNo: hopNo2,
+          });
+          const stage2Level: NudgeLevel = stage2Pressure.pressure.level ??
+            (stage2Pressure.pressurePct >= settings.strongThresholdPct ? "strong"
+              : stage2Pressure.pressurePct >= settings.gentleThresholdPct ? "gentle"
+              : "none");
+          const finalPrepared = projected && Array.isArray(projected) ? [...(projected as PromptTurnLike[])] : [...turns];
+          // nudge 必须最终进入实际发送的 preparedHistory（文档第八节：nudge 是 ephemeral，
+          // 不能因为 stage2 复用缓存而丢失前一个 Hop 的 nudge——本 Hop 重新决策注入）。
+          let stage2NudgeText: string | undefined;
+          if (stage2Pressure.pressure.allowInject && settings.nudgeEnabled) {
+            stage2NudgeText = buildNudgeTextFromReason(stage2Pressure.pressure.decisionReason, stage2Level);
+            finalPrepared.push({ kind: "SYSTEM", content: stage2NudgeText, metadata: { acpNudge: true, acpNudgeLevel: stage2Level } });
+            stage2Pressure.nextStats.nudgeIssued = (stage2Pressure.nextStats.nudgeIssued ?? 0) + 1;
+            if (stage2Level === "gentle") stage2Pressure.nextStats.gentleNudges = (stage2Pressure.nextStats.gentleNudges ?? 0) + 1;
+            else if (stage2Level === "strong") stage2Pressure.nextStats.strongNudges = (stage2Pressure.nextStats.strongNudges ?? 0) + 1;
+            else stage2Pressure.nextStats.emergencyNudges = (stage2Pressure.nextStats.emergencyNudges ?? 0) + 1;
+          }
           try {
-            const p0 = projected && projected[0];
+            const p0 = finalPrepared[0];
             const pLen = p0 && typeof (p0 as PromptTurnLike).content === "string" ? String((p0 as PromptTurnLike).content).length : 0;
             const pHasAcp = p0 && typeof (p0 as PromptTurnLike).content === "string" ? String((p0 as PromptTurnLike).content).includes("[ACP 上下文管理]") : false;
-            console.log(`[acp] project stage2 fp=${fp.slice(0, 12)} cached=${projected ? 1 : 0} sysLen=${pLen} sysHasAcp=${pHasAcp}`);
+            console.log(`[acp] project stage2 fp=${fp.slice(0, 12)} cached=${projected ? 1 : 0} sysLen=${pLen} sysHasAcp=${pHasAcp} nudge=${stage2Pressure.pressure.allowInject ? 1 : 0} eff=${Math.round(stage2Pressure.pressurePct * 100)}%`);
           } catch { /* noop */ }
-          if (projected) {
-            return { preparedHistory: projected as PromptTurnLike[], fingerprint: fp, state: cached.kernelState };
-          }
-          return { preparedHistory: turns, fingerprint: fp, state: cached.kernelState };
+          // 持久化 stage2 的 usageState + acpNudge（ledger 已含 stage2 hop）。
+          const stage2NextState: OperitAcpSessionState = {
+            adapterStateVersion: cached.adapterStateVersion,
+            kernelState: cached.kernelState,
+            hostMetadata: {
+              ...cached.hostMetadata,
+              lastProjectionFingerprint: cached.hostMetadata.lastProjectionFingerprint ?? fp,
+              lastUpdatedAt: Date.now(),
+              ...(chatId ? { lastChatId: String(chatId) } : {}),
+              acpNudge: {
+                ...(stage2Pressure.pressure.nextNudgeState ?? {}),
+                ...(stage2Pressure.pressure.nextEpoch ? { acpEpoch: stage2Pressure.pressure.nextEpoch } : {}),
+              },
+              runtimeStats: stage2Pressure.nextStats,
+              usageState: stage2Pressure.usageManager.snapshot(),
+            },
+          };
+          try { await persistence.save(sessionKey, stage2NextState); } catch { /* stage2 保存失败不影响返回 */ }
+          return { preparedHistory: finalPrepared as PromptTurnLike[], fingerprint: fp, state: cached.kernelState, nudgeText: stage2NudgeText };
         }
         const config = resolveKernelConfig(settings);
         const fingerprint = computeFingerprint(sessionKey, turns, config);
@@ -312,11 +455,64 @@ export function createEngine(dataDir?: string): AcpEngine {
           const projected = memCached && memCached.fingerprint === fingerprint && memCached.stateVersion === stateVersion
             ? memCached.projection
             : undefined;
-          if (projected && Array.isArray(projected) && projected.length > 0) {
-            return { preparedHistory: projected, fingerprint, state: cached.kernelState };
+          // —— V0.7.3：cache hit 也必须经过 pressure（禁止 cache 绕过 pressure）。
+          //   投影可复用缓存，但本 Hop 的 pressure decision 必须重新评估。
+          const cacheEstimate = estimateProjectionTokens(
+            promptTurnsToCoreMessages((projected ?? turns) as PromptTurnLike[]).messages,
+            collectCoveredMessageIds(cached.kernelState),
+          );
+          const cacheHopNo = ((cached.hostMetadata.usageState as UsageManagerState | undefined)?.lastHop ?? 0) + 1;
+          const cachePrevStats = { ...(cached.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS) };
+          const cachePressure = await collectAndEvaluatePressure({
+            sessionKey, chatId,
+            tokenEstimate: cacheEstimate,
+            kernelShouldInject: false,
+            kernelReason: "",
+            prevBlocks: cached.kernelState.blocks.length,
+            curBlocks: cached.kernelState.blocks.length,
+            prevNudgeState: (cached.hostMetadata.acpNudge ?? {}) as Record<string, unknown>,
+            prevStats: cachePrevStats,
+            usageState: cached.hostMetadata.usageState as UsageManagerState | undefined,
+            config, settings,
+            hopNo: cacheHopNo,
+          });
+          const cacheLevel: NudgeLevel = cachePressure.pressure.level ??
+            (cachePressure.pressurePct >= settings.strongThresholdPct ? "strong"
+              : cachePressure.pressurePct >= settings.gentleThresholdPct ? "gentle"
+              : "none");
+          const cacheFinal = projected && Array.isArray(projected) && projected.length > 0
+            ? [...(projected as PromptTurnLike[])]
+            : [...turns];
+          let cacheNudgeText: string | undefined;
+          if (cachePressure.pressure.allowInject && settings.nudgeEnabled) {
+            cacheNudgeText = buildNudgeTextFromReason(cachePressure.pressure.decisionReason, cacheLevel);
+            cacheFinal.push({ kind: "SYSTEM", content: cacheNudgeText, metadata: { acpNudge: true, acpNudgeLevel: cacheLevel } });
+            cachePressure.nextStats.nudgeIssued = (cachePressure.nextStats.nudgeIssued ?? 0) + 1;
+            if (cacheLevel === "gentle") cachePressure.nextStats.gentleNudges = (cachePressure.nextStats.gentleNudges ?? 0) + 1;
+            else if (cacheLevel === "strong") cachePressure.nextStats.strongNudges = (cachePressure.nextStats.strongNudges ?? 0) + 1;
+            else cachePressure.nextStats.emergencyNudges = (cachePressure.nextStats.emergencyNudges ?? 0) + 1;
           }
-          // 兜底：无缓存投影（跨 VM / 内存被清）时透传 raw（不破坏请求）。
-          return { preparedHistory: turns, fingerprint, state: cached.kernelState };
+          const cacheNextState: OperitAcpSessionState = {
+            adapterStateVersion: cached.adapterStateVersion,
+            kernelState: cached.kernelState,
+            hostMetadata: {
+              ...cached.hostMetadata,
+              lastProjectionFingerprint: fingerprint,
+              lastUpdatedAt: Date.now(),
+              ...(chatId ? { lastChatId: String(chatId) } : {}),
+              acpNudge: {
+                ...(cachePressure.pressure.nextNudgeState ?? {}),
+                ...(cachePressure.pressure.nextEpoch ? { acpEpoch: cachePressure.pressure.nextEpoch } : {}),
+              },
+              runtimeStats: cachePressure.nextStats,
+              usageState: cachePressure.usageManager.snapshot(),
+            },
+          };
+          try { await persistence.save(sessionKey, cacheNextState); } catch { /* cache 保存失败不影响返回 */ }
+          try {
+            console.log(`[acp] project CACHE-HIT stage=${hookStage} fp=${fingerprint.slice(0, 12)} nudge=${cachePressure.pressure.allowInject ? 1 : 0} eff=${Math.round(cachePressure.pressurePct * 100)}% reason=${cachePressure.pressure.decisionReason}`);
+          } catch { /* noop */ }
+          return { preparedHistory: cacheFinal as PromptTurnLike[], fingerprint, state: cached.kernelState, nudgeText: cacheNudgeText };
         }
 
         // —— V0.6 Phase7 增量快速路径：stateVersion 未变 + 本次 turns 是上次的
@@ -344,12 +540,66 @@ export function createEngine(dataDir?: string): AcpEngine {
               const deltaTurns = coreMessagesToPromptTurns(deltaMap.messages, deltaMap.byKey);
               const merged = [...memPrev.projection, ...deltaTurns];
               const capped = capProjectionSize(merged, { keepChars: 2000, maxRecent: 3, totalBudgetChars: 200_000 });
-              cacheSetLimited(projectionCache, sessionKey, { fingerprint, stateVersion, projection: capped });
+              // —— V0.7.3：incremental 也必须经过 pressure（禁止 incremental → return → skip pressure）。
+              //   pressure 输入：tokenEstimate 用增量合并投影的估算（与 full path 同源）；
+              //   kernelShouldInject 用 kernel 对增量 turns 的 nudge 判断（无 processTurn 时
+              //   以 usage 档位兜底，evaluatePressure 内部处理）。
+              const incEstimate = estimateProjectionTokens(
+                promptTurnsToCoreMessages(capped as PromptTurnLike[]).messages,
+                collectCoveredMessageIds(cached.kernelState),
+              );
+              const incHopNo = ((cached.hostMetadata.usageState as UsageManagerState | undefined)?.lastHop ?? 0) + 1;
+              const incPrevStats = { ...(cached.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS) };
+              const incPressure = await collectAndEvaluatePressure({
+                sessionKey, chatId,
+                tokenEstimate: incEstimate,
+                kernelShouldInject: false,
+                kernelReason: "",
+                prevBlocks: cached.kernelState.blocks.length,
+                curBlocks: cached.kernelState.blocks.length,
+                prevNudgeState: (cached.hostMetadata.acpNudge ?? {}) as Record<string, unknown>,
+                prevStats: incPrevStats,
+                usageState: cached.hostMetadata.usageState as UsageManagerState | undefined,
+                config, settings,
+                hopNo: incHopNo,
+              });
+              const incLevel: NudgeLevel = incPressure.pressure.level ??
+                (incPressure.pressurePct >= settings.strongThresholdPct ? "strong"
+                  : incPressure.pressurePct >= settings.gentleThresholdPct ? "gentle"
+                  : "none");
+              const incFinal = [...capped];
+              let incNudgeText: string | undefined;
+              if (incPressure.pressure.allowInject && settings.nudgeEnabled) {
+                incNudgeText = buildNudgeTextFromReason(incPressure.pressure.decisionReason, incLevel);
+                incFinal.push({ kind: "SYSTEM", content: incNudgeText, metadata: { acpNudge: true, acpNudgeLevel: incLevel } });
+                incPressure.nextStats.nudgeIssued = (incPressure.nextStats.nudgeIssued ?? 0) + 1;
+                if (incLevel === "gentle") incPressure.nextStats.gentleNudges = (incPressure.nextStats.gentleNudges ?? 0) + 1;
+                else if (incLevel === "strong") incPressure.nextStats.strongNudges = (incPressure.nextStats.strongNudges ?? 0) + 1;
+                else incPressure.nextStats.emergencyNudges = (incPressure.nextStats.emergencyNudges ?? 0) + 1;
+              }
+              cacheSetLimited(projectionCache, sessionKey, { fingerprint, stateVersion, projection: incFinal });
               cacheSetLimited(rawTurnsCache, sessionKey, turns);
+              const incNextState: OperitAcpSessionState = {
+                adapterStateVersion: cached.adapterStateVersion,
+                kernelState: cached.kernelState,
+                hostMetadata: {
+                  ...cached.hostMetadata,
+                  lastProjectionFingerprint: fingerprint,
+                  lastUpdatedAt: Date.now(),
+                  ...(chatId ? { lastChatId: String(chatId) } : {}),
+                  acpNudge: {
+                    ...(incPressure.pressure.nextNudgeState ?? {}),
+                    ...(incPressure.pressure.nextEpoch ? { acpEpoch: incPressure.pressure.nextEpoch } : {}),
+                  },
+                  runtimeStats: incPressure.nextStats,
+                  usageState: incPressure.usageManager.snapshot(),
+                },
+              };
+              try { await persistence.save(sessionKey, incNextState); } catch { /* incremental 保存失败不影响返回 */ }
               try {
-                console.log(`[acp] project INCREMENTAL stage=${hookStage} +${delta.length} raw=${turns.length} proj=${capped.length} (skipped full processTurn)`);
+                console.log(`[acp] project INCREMENTAL stage=${hookStage} +${delta.length} raw=${turns.length} proj=${incFinal.length} nudge=${incPressure.pressure.allowInject ? 1 : 0} eff=${Math.round(incPressure.pressurePct * 100)}% reason=${incPressure.pressure.decisionReason} (skipped full processTurn)`);
               } catch { /* noop */ }
-              return { preparedHistory: capped, fingerprint, state: cached.kernelState };
+              return { preparedHistory: incFinal as PromptTurnLike[], fingerprint, state: cached.kernelState, nudgeText: incNudgeText };
             }
           }
         }
@@ -487,13 +737,11 @@ export function createEngine(dataDir?: string): AcpEngine {
           }
         }
 
-        // —— V0.4：运行时统计累计（nudge/compress/emergency 全链路）。
-        //    autoFolded = emergency 兜底折叠（来源 emergency）；模型 compress 走
-        //    applyCompression 单独计数（source=model）。
         // —— V0.7.1：UsageManager 前置创建（emergency credit 与 effective pressure 共用）。
-        const usageManager = createUsageManager((cached.hostMetadata.usageState as UsageManagerState | undefined));
-        const hopNo = (usageManager.getLastHop() ?? 0) + 1; // V0.7.2 per-hop 计数
-        const nextStats = { ...prevStats };
+        // —— V0.7.3：统一走 collectAndEvaluatePressure（usage sampling + pressure + ledger 一体化，
+        //   full/incremental/cache/stage2 四路径同一条 pressure 链）。
+        const hopNo = (((cached.hostMetadata.usageState as UsageManagerState | undefined)?.lastHop) ?? 0) + 1; // V0.7.2 per-hop 计数
+        const nextStats: AcpRuntimeStats = { ...prevStats };
         const newBlockIds = turn.state.blocks.filter((b) => !cached.kernelState.blocks.some((pb) => pb.blockId === b.blockId)).map((b) => b.blockId);
         if (autoFolded && newBlockIds.length > 0) {
           nextStats.emergencyTriggered += 1;
@@ -516,7 +764,7 @@ export function createEngine(dataDir?: string): AcpEngine {
           nextStats.creditBaseToken = Math.min(tokenEstimate, postEstimate) || tokenEstimate;
           nextStats.creditRemaining = settings.usageCreditTokens;
           // —— V0.7.1：compression credit 独立字段（不再兼任 creditBaseToken；折叠量入 credit）。
-          usageManager.applyCompressionCredit(emergencyFreedTokens);
+          //   实际 credit 发放统一在下方 um2（collectAndEvaluatePressure 返回的 usageManager）。
         }
         // nudge 状态机（Adapter 层 Continuous Pressure Controller）：V0.7
         //  - 取消 kernelShouldInject 作为硬总门，只作辅助 signal
@@ -524,65 +772,32 @@ export function createEngine(dataDir?: string): AcpEngine {
         //  - cooldown/credit 只抑制 gentle；strong/emergency bypass
         //  - hostEscalationFloor：kernel 沉默区 Adapter 自接管
         //  - epoch 无限连续；compression baseline 记录
+        // —— V0.7.3：统一 pressure 链（与 stage2/cache/incremental 完全一致）。
         const prevNudgeState = cached.hostMetadata.acpNudge ?? {};
-        const prevBlocks = cached.kernelState.blocks.length;
-        const curBlocks = turn.state.blocks.length;
-        const prevTokenCount = (cached.hostMetadata.lastTokenEstimate as number) ?? 0;
-        // —— V0.7.1：effective pressure 由 UsageManager 计算（estimate/actual/host 明确区分）。
-        // 删除 fake actualUsage（此前把 tokenEstimate/limit 冒充 actualUsage）。
-        // 宿主侧测量（尽力而为；DB 不可读返回 undefined，绝不拖垮请求）。
-        const hostTokens = chatId ? await getHostUsageAdapter().getCurrentContextTokens(String(chatId)) : undefined;
-        if (hostTokens !== undefined) usageManager.recordHostUsage(hostTokens, hopNo);
-        usageManager.recordEstimate(tokenEstimate, hopNo);
-        // 若插件曾通过工具链路记录过上游 usage，则注入（见 recordUpstreamUsage 调用点）。
-        const eff = usageManager.getEffectiveSnapshot(tokenEstimate);
-        const pressurePct = config.modelContextLimit > 0
-          ? (eff.effectiveTokens || tokenEstimate) / config.modelContextLimit
-          : ((eff.effectiveTokens || tokenEstimate) / 200000);
-        const prevEpoch = (prevNudgeState as { acpEpoch?: PressureEpoch }).acpEpoch;
-        // compression baseline：最近一次压缩成功后的 token 基准（供增长判断）。
-        const lastCompressToken = typeof prevStats.creditBaseToken === "number" ? prevStats.creditBaseToken : undefined;
-        const pressure = evaluatePressure({
-          usagePct: pressurePct,
-          effectiveTokens: eff.effectiveTokens || tokenEstimate,
+        const { pressure, eff, pressurePct, usageManager: um2 } = await collectAndEvaluatePressure({
+          sessionKey, chatId,
           tokenEstimate,
           kernelShouldInject: turn.nudge?.shouldInject === true,
           kernelReason: turn.nudge?.reason ?? "",
-          prevEpoch,
-          prevBlocks,
-          curBlocks,
-          gentleThresholdPct: settings.gentleThresholdPct,
-          strongThresholdPct: settings.strongThresholdPct,
-          emergencyThresholdPct: settings.hardLimitPct,
-          hostEscalationFloor: settings.hostEscalationFloor,
-          nudgeCooldownTurns: settings.nudgeCooldownTurns,
-          nudgeGrowthFloor: settings.nudgeGrowthFloor,
-          usageCreditTokens: settings.usageCreditTokens,
-          creditBaseToken: lastCompressToken,
-          lastInjectedAt: typeof prevNudgeState.lastInjectedAt === "number" ? prevNudgeState.lastInjectedAt : 0,
-          nudgeCount: typeof prevNudgeState.nudgeCount === "number" ? prevNudgeState.nudgeCount : 0,
-          lastTokensAtInject: typeof prevNudgeState.lastTokensAtInject === "number" ? prevNudgeState.lastTokensAtInject : 0,
-          lastCompressToken,
-          source: eff.source,
+          prevBlocks: cached.kernelState.blocks.length,
+          curBlocks: turn.state.blocks.length,
+          prevNudgeState: prevNudgeState as Record<string, unknown>,
+          prevStats: nextStats,
+          usageState: cached.hostMetadata.usageState as UsageManagerState | undefined,
+          config, settings,
+          hopNo,
         });
+        // emergency 已发生的 credit 发放要并入 um2（collectAndEvaluatePressure 内部新建了
+        // 自己的 usageManager，但 credit 已通过 nextStats.creditBaseToken 传递；
+        // 为避免丢失 emergency credit，把 usageManager 的 credit 合并到 um2）。
+        if (autoFolded && newBlockIds.length > 0) {
+          try { um2.applyCompressionCredit(emergencyFreedTokens); } catch { /* noop */ }
+        }
         const nextNudgeState: Record<string, unknown> = {
           ...pressure.nextNudgeState,
           // 持久化 epoch 到 acpNudge（跨轮/跨 VM 恢复压力档位）
           ...(pressure.nextEpoch ? { acpEpoch: pressure.nextEpoch } : {}),
         };
-        // —— V0.7.2：per-hop ledger（发送前决策视图；与 trace 同源，持久化在 usageState）。
-        try {
-          usageManager.recordHopEntry({
-            hop: hopNo,
-            estimateTokens: tokenEstimate,
-            actualTokens: eff.actualTokens,
-            hostTokens: eff.hostTokens,
-            compressionCredit: eff.compressionCredit ?? 0,
-            effectiveTokens: eff.effectiveTokens,
-            source: eff.source,
-            confidence: eff.confidence,
-          });
-        } catch { /* ledger 失败不影响主流程 */ }
 
         // nudge 档位：pressure controller 输出（无注入时按 usage 兜底算档位供 stats）
         const level: NudgeLevel = pressure.level ??
@@ -626,7 +841,7 @@ export function createEngine(dataDir?: string): AcpEngine {
             acpNudge: nextNudgeState,
             runtimeStats: nextStats,
             // V0.7.1：usage 事实持久化（estimate/actual/host/compressionCredit，per-session）
-            usageState: usageManager.snapshot(),
+            usageState: um2.snapshot(),
             absorbCandidates: nextAbsorbCandidates,
             blockSources: {
               ...(cached.hostMetadata.blockSources ?? {}),
@@ -907,6 +1122,26 @@ export function createEngine(dataDir?: string): AcpEngine {
 
 /** NudgeLevel 别名（来自 pressure controller）。 */
 type NudgeLevel = PressureNudgeLevel;
+
+/**
+ * V0.7.3：buildNudgeTextFromReason —— stage2/cache/incremental 路径的 nudge 文案。
+ * 这些路径没有 kernel nudge（turn.nudge 未计算），只有 pressure 决策；
+ * 用 pressure 的档位 + reason 生成同款文案（与 buildNudgeText 同模板）。
+ */
+function buildNudgeTextFromReason(reason: string, level: NudgeLevel): string {
+  const lines: string[] = [];
+  if (level === "gentle") {
+    lines.push("[ACP] 上下文使用率已接近阈值，请注意近期对话的上下文占用，建议在合适时机压缩已消费的旧内容。");
+    lines.push("可选工具：compress（压缩一段范围）、absorb（吸收单条巨型输出）、decompress（恢复）、search_context（搜索）、acp_status（查状态/范围）。");
+  } else if (level === "strong") {
+    lines.push("[ACP] 上下文使用率已较高，请立即压缩已消费的旧内容以释放空间。");
+    lines.push("可选工具：compress（压缩一段范围）、absorb（吸收单条巨型输出）、decompress（恢复）、search_context（搜索）、acp_status（查状态/范围）。");
+  } else {
+    lines.push("[ACP] 上下文已接近硬上限，请立即调用 compress 压缩最旧、已消费的内容。若本提示持续出现，压缩是继续任务的前提，不要忽略。");
+  }
+  if (reason) lines.push(`（pressure: ${reason}）`);
+  return lines.join("\n");
+}
 
 function buildNudgeText(nudge: { reason: string; compressibleRanges: { startRef: string; endRef: string; tokens: number }[] }, level: NudgeLevel): string {
   // 固定模板（不嵌入动态 token 数/百分比——动态内容破坏 LLM 缓存前缀命中率）。

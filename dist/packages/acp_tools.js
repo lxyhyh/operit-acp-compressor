@@ -4060,6 +4060,54 @@ function createEngine(dataDir) {
     await prev;
     return release;
   }
+  async function collectAndEvaluatePressure(opts) {
+    const usageManager = createUsageManager(opts.usageState);
+    const nextStats = { ...opts.prevStats };
+    const prevEpoch = opts.prevNudgeState.acpEpoch;
+    const hostTokens = opts.chatId ? await getHostUsageAdapter().getCurrentContextTokens(String(opts.chatId)) : void 0;
+    if (hostTokens !== void 0) usageManager.recordHostUsage(hostTokens, opts.hopNo);
+    usageManager.recordEstimate(opts.tokenEstimate, opts.hopNo);
+    const eff = usageManager.getEffectiveSnapshot(opts.tokenEstimate);
+    const pressurePct = opts.config.modelContextLimit > 0 ? (eff.effectiveTokens || opts.tokenEstimate) / opts.config.modelContextLimit : (eff.effectiveTokens || opts.tokenEstimate) / 2e5;
+    const lastCompressToken = typeof opts.prevStats.creditBaseToken === "number" ? opts.prevStats.creditBaseToken : void 0;
+    const pressure = evaluatePressure({
+      usagePct: pressurePct,
+      effectiveTokens: eff.effectiveTokens || opts.tokenEstimate,
+      tokenEstimate: opts.tokenEstimate,
+      kernelShouldInject: opts.kernelShouldInject,
+      kernelReason: opts.kernelReason,
+      prevEpoch,
+      prevBlocks: opts.prevBlocks,
+      curBlocks: opts.curBlocks,
+      gentleThresholdPct: opts.settings.gentleThresholdPct,
+      strongThresholdPct: opts.settings.strongThresholdPct,
+      emergencyThresholdPct: opts.settings.hardLimitPct,
+      hostEscalationFloor: opts.settings.hostEscalationFloor,
+      nudgeCooldownTurns: opts.settings.nudgeCooldownTurns,
+      nudgeGrowthFloor: opts.settings.nudgeGrowthFloor,
+      usageCreditTokens: opts.settings.usageCreditTokens,
+      creditBaseToken: lastCompressToken,
+      lastInjectedAt: typeof opts.prevNudgeState.lastInjectedAt === "number" ? opts.prevNudgeState.lastInjectedAt : 0,
+      nudgeCount: typeof opts.prevNudgeState.nudgeCount === "number" ? opts.prevNudgeState.nudgeCount : 0,
+      lastTokensAtInject: typeof opts.prevNudgeState.lastTokensAtInject === "number" ? opts.prevNudgeState.lastTokensAtInject : 0,
+      lastCompressToken,
+      source: eff.source
+    });
+    try {
+      usageManager.recordHopEntry({
+        hop: opts.hopNo,
+        estimateTokens: opts.tokenEstimate,
+        actualTokens: eff.actualTokens,
+        hostTokens: eff.hostTokens,
+        compressionCredit: eff.compressionCredit ?? 0,
+        effectiveTokens: eff.effectiveTokens,
+        source: eff.source,
+        confidence: eff.confidence
+      });
+    } catch {
+    }
+    return { pressure, eff, pressurePct, usageManager, hostTokens, nextStats };
+  }
   return {
     core,
     settings,
@@ -4124,17 +4172,63 @@ function createEngine(dataDir) {
           const fp = computeFingerprint(sessionKey, turns, config2);
           const memCached = projectionCache.get(sessionKey);
           const projected = memCached && memCached.projection && Array.isArray(memCached.projection) && memCached.projection.length > 0 ? memCached.projection : void 0;
+          const stage2Estimate = projected && Array.isArray(projected) ? estimateProjectionTokens(promptTurnsToCoreMessages(projected).messages, collectCoveredMessageIds(cached2.kernelState)) : estimateProjectionTokens(promptTurnsToCoreMessages(turns).messages, collectCoveredMessageIds(cached2.kernelState));
+          const prevStats2 = { ...cached2.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS };
+          const hopNo2 = (cached2.hostMetadata.usageState?.lastHop ?? 0) + 1;
+          const stage2Pressure = await collectAndEvaluatePressure({
+            sessionKey,
+            chatId,
+            tokenEstimate: stage2Estimate,
+            kernelShouldInject: false,
+            kernelReason: "",
+            prevBlocks: cached2.kernelState.blocks.length,
+            curBlocks: cached2.kernelState.blocks.length,
+            prevNudgeState: cached2.hostMetadata.acpNudge ?? {},
+            prevStats: prevStats2,
+            usageState: cached2.hostMetadata.usageState,
+            config: config2,
+            settings,
+            hopNo: hopNo2
+          });
+          const stage2Level = stage2Pressure.pressure.level ?? (stage2Pressure.pressurePct >= settings.strongThresholdPct ? "strong" : stage2Pressure.pressurePct >= settings.gentleThresholdPct ? "gentle" : "none");
+          const finalPrepared = projected && Array.isArray(projected) ? [...projected] : [...turns];
+          let stage2NudgeText;
+          if (stage2Pressure.pressure.allowInject && settings.nudgeEnabled) {
+            stage2NudgeText = buildNudgeTextFromReason(stage2Pressure.pressure.decisionReason, stage2Level);
+            finalPrepared.push({ kind: "SYSTEM", content: stage2NudgeText, metadata: { acpNudge: true, acpNudgeLevel: stage2Level } });
+            stage2Pressure.nextStats.nudgeIssued = (stage2Pressure.nextStats.nudgeIssued ?? 0) + 1;
+            if (stage2Level === "gentle") stage2Pressure.nextStats.gentleNudges = (stage2Pressure.nextStats.gentleNudges ?? 0) + 1;
+            else if (stage2Level === "strong") stage2Pressure.nextStats.strongNudges = (stage2Pressure.nextStats.strongNudges ?? 0) + 1;
+            else stage2Pressure.nextStats.emergencyNudges = (stage2Pressure.nextStats.emergencyNudges ?? 0) + 1;
+          }
           try {
-            const p0 = projected && projected[0];
+            const p0 = finalPrepared[0];
             const pLen = p0 && typeof p0.content === "string" ? String(p0.content).length : 0;
             const pHasAcp = p0 && typeof p0.content === "string" ? String(p0.content).includes("[ACP \u4E0A\u4E0B\u6587\u7BA1\u7406]") : false;
-            console.log(`[acp] project stage2 fp=${fp.slice(0, 12)} cached=${projected ? 1 : 0} sysLen=${pLen} sysHasAcp=${pHasAcp}`);
+            console.log(`[acp] project stage2 fp=${fp.slice(0, 12)} cached=${projected ? 1 : 0} sysLen=${pLen} sysHasAcp=${pHasAcp} nudge=${stage2Pressure.pressure.allowInject ? 1 : 0} eff=${Math.round(stage2Pressure.pressurePct * 100)}%`);
           } catch {
           }
-          if (projected) {
-            return { preparedHistory: projected, fingerprint: fp, state: cached2.kernelState };
+          const stage2NextState = {
+            adapterStateVersion: cached2.adapterStateVersion,
+            kernelState: cached2.kernelState,
+            hostMetadata: {
+              ...cached2.hostMetadata,
+              lastProjectionFingerprint: cached2.hostMetadata.lastProjectionFingerprint ?? fp,
+              lastUpdatedAt: Date.now(),
+              ...chatId ? { lastChatId: String(chatId) } : {},
+              acpNudge: {
+                ...stage2Pressure.pressure.nextNudgeState ?? {},
+                ...stage2Pressure.pressure.nextEpoch ? { acpEpoch: stage2Pressure.pressure.nextEpoch } : {}
+              },
+              runtimeStats: stage2Pressure.nextStats,
+              usageState: stage2Pressure.usageManager.snapshot()
+            }
+          };
+          try {
+            await persistence.save(sessionKey, stage2NextState);
+          } catch {
           }
-          return { preparedHistory: turns, fingerprint: fp, state: cached2.kernelState };
+          return { preparedHistory: finalPrepared, fingerprint: fp, state: cached2.kernelState, nudgeText: stage2NudgeText };
         }
         const config = resolveKernelConfig(settings);
         const fingerprint = computeFingerprint(sessionKey, turns, config);
@@ -4143,10 +4237,63 @@ function createEngine(dataDir) {
         if (cached.hostMetadata.lastProjectionFingerprint === fingerprint) {
           const memCached = projectionCache.get(sessionKey);
           const projected = memCached && memCached.fingerprint === fingerprint && memCached.stateVersion === stateVersion ? memCached.projection : void 0;
-          if (projected && Array.isArray(projected) && projected.length > 0) {
-            return { preparedHistory: projected, fingerprint, state: cached.kernelState };
+          const cacheEstimate = estimateProjectionTokens(
+            promptTurnsToCoreMessages(projected ?? turns).messages,
+            collectCoveredMessageIds(cached.kernelState)
+          );
+          const cacheHopNo = (cached.hostMetadata.usageState?.lastHop ?? 0) + 1;
+          const cachePrevStats = { ...cached.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS };
+          const cachePressure = await collectAndEvaluatePressure({
+            sessionKey,
+            chatId,
+            tokenEstimate: cacheEstimate,
+            kernelShouldInject: false,
+            kernelReason: "",
+            prevBlocks: cached.kernelState.blocks.length,
+            curBlocks: cached.kernelState.blocks.length,
+            prevNudgeState: cached.hostMetadata.acpNudge ?? {},
+            prevStats: cachePrevStats,
+            usageState: cached.hostMetadata.usageState,
+            config,
+            settings,
+            hopNo: cacheHopNo
+          });
+          const cacheLevel = cachePressure.pressure.level ?? (cachePressure.pressurePct >= settings.strongThresholdPct ? "strong" : cachePressure.pressurePct >= settings.gentleThresholdPct ? "gentle" : "none");
+          const cacheFinal = projected && Array.isArray(projected) && projected.length > 0 ? [...projected] : [...turns];
+          let cacheNudgeText;
+          if (cachePressure.pressure.allowInject && settings.nudgeEnabled) {
+            cacheNudgeText = buildNudgeTextFromReason(cachePressure.pressure.decisionReason, cacheLevel);
+            cacheFinal.push({ kind: "SYSTEM", content: cacheNudgeText, metadata: { acpNudge: true, acpNudgeLevel: cacheLevel } });
+            cachePressure.nextStats.nudgeIssued = (cachePressure.nextStats.nudgeIssued ?? 0) + 1;
+            if (cacheLevel === "gentle") cachePressure.nextStats.gentleNudges = (cachePressure.nextStats.gentleNudges ?? 0) + 1;
+            else if (cacheLevel === "strong") cachePressure.nextStats.strongNudges = (cachePressure.nextStats.strongNudges ?? 0) + 1;
+            else cachePressure.nextStats.emergencyNudges = (cachePressure.nextStats.emergencyNudges ?? 0) + 1;
           }
-          return { preparedHistory: turns, fingerprint, state: cached.kernelState };
+          const cacheNextState = {
+            adapterStateVersion: cached.adapterStateVersion,
+            kernelState: cached.kernelState,
+            hostMetadata: {
+              ...cached.hostMetadata,
+              lastProjectionFingerprint: fingerprint,
+              lastUpdatedAt: Date.now(),
+              ...chatId ? { lastChatId: String(chatId) } : {},
+              acpNudge: {
+                ...cachePressure.pressure.nextNudgeState ?? {},
+                ...cachePressure.pressure.nextEpoch ? { acpEpoch: cachePressure.pressure.nextEpoch } : {}
+              },
+              runtimeStats: cachePressure.nextStats,
+              usageState: cachePressure.usageManager.snapshot()
+            }
+          };
+          try {
+            await persistence.save(sessionKey, cacheNextState);
+          } catch {
+          }
+          try {
+            console.log(`[acp] project CACHE-HIT stage=${hookStage} fp=${fingerprint.slice(0, 12)} nudge=${cachePressure.pressure.allowInject ? 1 : 0} eff=${Math.round(cachePressure.pressurePct * 100)}% reason=${cachePressure.pressure.decisionReason}`);
+          } catch {
+          }
+          return { preparedHistory: cacheFinal, fingerprint, state: cached.kernelState, nudgeText: cacheNudgeText };
         }
         if (!(cached.hostMetadata.lastProjectionFingerprint === fingerprint)) {
           const memPrev = projectionCache.get(sessionKey);
@@ -4166,13 +4313,65 @@ function createEngine(dataDir) {
               const deltaTurns = coreMessagesToPromptTurns(deltaMap.messages, deltaMap.byKey);
               const merged = [...memPrev.projection, ...deltaTurns];
               const capped = capProjectionSize(merged, { keepChars: 2e3, maxRecent: 3, totalBudgetChars: 2e5 });
-              cacheSetLimited(projectionCache, sessionKey, { fingerprint, stateVersion, projection: capped });
+              const incEstimate = estimateProjectionTokens(
+                promptTurnsToCoreMessages(capped).messages,
+                collectCoveredMessageIds(cached.kernelState)
+              );
+              const incHopNo = (cached.hostMetadata.usageState?.lastHop ?? 0) + 1;
+              const incPrevStats = { ...cached.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS };
+              const incPressure = await collectAndEvaluatePressure({
+                sessionKey,
+                chatId,
+                tokenEstimate: incEstimate,
+                kernelShouldInject: false,
+                kernelReason: "",
+                prevBlocks: cached.kernelState.blocks.length,
+                curBlocks: cached.kernelState.blocks.length,
+                prevNudgeState: cached.hostMetadata.acpNudge ?? {},
+                prevStats: incPrevStats,
+                usageState: cached.hostMetadata.usageState,
+                config,
+                settings,
+                hopNo: incHopNo
+              });
+              const incLevel = incPressure.pressure.level ?? (incPressure.pressurePct >= settings.strongThresholdPct ? "strong" : incPressure.pressurePct >= settings.gentleThresholdPct ? "gentle" : "none");
+              const incFinal = [...capped];
+              let incNudgeText;
+              if (incPressure.pressure.allowInject && settings.nudgeEnabled) {
+                incNudgeText = buildNudgeTextFromReason(incPressure.pressure.decisionReason, incLevel);
+                incFinal.push({ kind: "SYSTEM", content: incNudgeText, metadata: { acpNudge: true, acpNudgeLevel: incLevel } });
+                incPressure.nextStats.nudgeIssued = (incPressure.nextStats.nudgeIssued ?? 0) + 1;
+                if (incLevel === "gentle") incPressure.nextStats.gentleNudges = (incPressure.nextStats.gentleNudges ?? 0) + 1;
+                else if (incLevel === "strong") incPressure.nextStats.strongNudges = (incPressure.nextStats.strongNudges ?? 0) + 1;
+                else incPressure.nextStats.emergencyNudges = (incPressure.nextStats.emergencyNudges ?? 0) + 1;
+              }
+              cacheSetLimited(projectionCache, sessionKey, { fingerprint, stateVersion, projection: incFinal });
               cacheSetLimited(rawTurnsCache, sessionKey, turns);
+              const incNextState = {
+                adapterStateVersion: cached.adapterStateVersion,
+                kernelState: cached.kernelState,
+                hostMetadata: {
+                  ...cached.hostMetadata,
+                  lastProjectionFingerprint: fingerprint,
+                  lastUpdatedAt: Date.now(),
+                  ...chatId ? { lastChatId: String(chatId) } : {},
+                  acpNudge: {
+                    ...incPressure.pressure.nextNudgeState ?? {},
+                    ...incPressure.pressure.nextEpoch ? { acpEpoch: incPressure.pressure.nextEpoch } : {}
+                  },
+                  runtimeStats: incPressure.nextStats,
+                  usageState: incPressure.usageManager.snapshot()
+                }
+              };
               try {
-                console.log(`[acp] project INCREMENTAL stage=${hookStage} +${delta.length} raw=${turns.length} proj=${capped.length} (skipped full processTurn)`);
+                await persistence.save(sessionKey, incNextState);
               } catch {
               }
-              return { preparedHistory: capped, fingerprint, state: cached.kernelState };
+              try {
+                console.log(`[acp] project INCREMENTAL stage=${hookStage} +${delta.length} raw=${turns.length} proj=${incFinal.length} nudge=${incPressure.pressure.allowInject ? 1 : 0} eff=${Math.round(incPressure.pressurePct * 100)}% reason=${incPressure.pressure.decisionReason} (skipped full processTurn)`);
+              } catch {
+              }
+              return { preparedHistory: incFinal, fingerprint, state: cached.kernelState, nudgeText: incNudgeText };
             }
           }
         }
@@ -4294,8 +4493,7 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
             });
           }
         }
-        const usageManager = createUsageManager(cached.hostMetadata.usageState);
-        const hopNo = (usageManager.getLastHop() ?? 0) + 1;
+        const hopNo = (cached.hostMetadata.usageState?.lastHop ?? 0) + 1;
         const nextStats = { ...prevStats };
         const newBlockIds = turn.state.blocks.filter((b) => !cached.kernelState.blocks.some((pb) => pb.blockId === b.blockId)).map((b) => b.blockId);
         if (autoFolded && newBlockIds.length > 0) {
@@ -4311,60 +4509,34 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           const postEstimate = estimateProjectionTokens(projectedMessages, postCovered);
           nextStats.creditBaseToken = Math.min(tokenEstimate, postEstimate) || tokenEstimate;
           nextStats.creditRemaining = settings.usageCreditTokens;
-          usageManager.applyCompressionCredit(emergencyFreedTokens);
         }
         const prevNudgeState = cached.hostMetadata.acpNudge ?? {};
-        const prevBlocks = cached.kernelState.blocks.length;
-        const curBlocks = turn.state.blocks.length;
-        const prevTokenCount = cached.hostMetadata.lastTokenEstimate ?? 0;
-        const hostTokens = chatId ? await getHostUsageAdapter().getCurrentContextTokens(String(chatId)) : void 0;
-        if (hostTokens !== void 0) usageManager.recordHostUsage(hostTokens, hopNo);
-        usageManager.recordEstimate(tokenEstimate, hopNo);
-        const eff = usageManager.getEffectiveSnapshot(tokenEstimate);
-        const pressurePct = config.modelContextLimit > 0 ? (eff.effectiveTokens || tokenEstimate) / config.modelContextLimit : (eff.effectiveTokens || tokenEstimate) / 2e5;
-        const prevEpoch = prevNudgeState.acpEpoch;
-        const lastCompressToken = typeof prevStats.creditBaseToken === "number" ? prevStats.creditBaseToken : void 0;
-        const pressure = evaluatePressure({
-          usagePct: pressurePct,
-          effectiveTokens: eff.effectiveTokens || tokenEstimate,
+        const { pressure, eff, pressurePct, usageManager: um2 } = await collectAndEvaluatePressure({
+          sessionKey,
+          chatId,
           tokenEstimate,
           kernelShouldInject: turn.nudge?.shouldInject === true,
           kernelReason: turn.nudge?.reason ?? "",
-          prevEpoch,
-          prevBlocks,
-          curBlocks,
-          gentleThresholdPct: settings.gentleThresholdPct,
-          strongThresholdPct: settings.strongThresholdPct,
-          emergencyThresholdPct: settings.hardLimitPct,
-          hostEscalationFloor: settings.hostEscalationFloor,
-          nudgeCooldownTurns: settings.nudgeCooldownTurns,
-          nudgeGrowthFloor: settings.nudgeGrowthFloor,
-          usageCreditTokens: settings.usageCreditTokens,
-          creditBaseToken: lastCompressToken,
-          lastInjectedAt: typeof prevNudgeState.lastInjectedAt === "number" ? prevNudgeState.lastInjectedAt : 0,
-          nudgeCount: typeof prevNudgeState.nudgeCount === "number" ? prevNudgeState.nudgeCount : 0,
-          lastTokensAtInject: typeof prevNudgeState.lastTokensAtInject === "number" ? prevNudgeState.lastTokensAtInject : 0,
-          lastCompressToken,
-          source: eff.source
+          prevBlocks: cached.kernelState.blocks.length,
+          curBlocks: turn.state.blocks.length,
+          prevNudgeState,
+          prevStats: nextStats,
+          usageState: cached.hostMetadata.usageState,
+          config,
+          settings,
+          hopNo
         });
+        if (autoFolded && newBlockIds.length > 0) {
+          try {
+            um2.applyCompressionCredit(emergencyFreedTokens);
+          } catch {
+          }
+        }
         const nextNudgeState = {
           ...pressure.nextNudgeState,
           // 持久化 epoch 到 acpNudge（跨轮/跨 VM 恢复压力档位）
           ...pressure.nextEpoch ? { acpEpoch: pressure.nextEpoch } : {}
         };
-        try {
-          usageManager.recordHopEntry({
-            hop: hopNo,
-            estimateTokens: tokenEstimate,
-            actualTokens: eff.actualTokens,
-            hostTokens: eff.hostTokens,
-            compressionCredit: eff.compressionCredit ?? 0,
-            effectiveTokens: eff.effectiveTokens,
-            source: eff.source,
-            confidence: eff.confidence
-          });
-        } catch {
-        }
         const level = pressure.level ?? (emergency ? "emergency" : pressurePct >= settings.strongThresholdPct ? "strong" : pressurePct >= settings.gentleThresholdPct ? "gentle" : "gentle");
         let nudgeText;
         if (pressure.allowInject && settings.nudgeEnabled) {
@@ -4399,7 +4571,7 @@ ${lines.join("\n")}${active.length > 3 ? `
             acpNudge: nextNudgeState,
             runtimeStats: nextStats,
             // V0.7.1：usage 事实持久化（estimate/actual/host/compressionCredit，per-session）
-            usageState: usageManager.snapshot(),
+            usageState: um2.snapshot(),
             absorbCandidates: nextAbsorbCandidates,
             blockSources: {
               ...cached.hostMetadata.blockSources ?? {},
@@ -4643,6 +4815,20 @@ ${lines.join("\n")}${active.length > 3 ? `
       return persistence.load(sessionKey);
     }
   };
+}
+function buildNudgeTextFromReason(reason, level) {
+  const lines = [];
+  if (level === "gentle") {
+    lines.push("[ACP] \u4E0A\u4E0B\u6587\u4F7F\u7528\u7387\u5DF2\u63A5\u8FD1\u9608\u503C\uFF0C\u8BF7\u6CE8\u610F\u8FD1\u671F\u5BF9\u8BDD\u7684\u4E0A\u4E0B\u6587\u5360\u7528\uFF0C\u5EFA\u8BAE\u5728\u5408\u9002\u65F6\u673A\u538B\u7F29\u5DF2\u6D88\u8D39\u7684\u65E7\u5185\u5BB9\u3002");
+    lines.push("\u53EF\u9009\u5DE5\u5177\uFF1Acompress\uFF08\u538B\u7F29\u4E00\u6BB5\u8303\u56F4\uFF09\u3001absorb\uFF08\u5438\u6536\u5355\u6761\u5DE8\u578B\u8F93\u51FA\uFF09\u3001decompress\uFF08\u6062\u590D\uFF09\u3001search_context\uFF08\u641C\u7D22\uFF09\u3001acp_status\uFF08\u67E5\u72B6\u6001/\u8303\u56F4\uFF09\u3002");
+  } else if (level === "strong") {
+    lines.push("[ACP] \u4E0A\u4E0B\u6587\u4F7F\u7528\u7387\u5DF2\u8F83\u9AD8\uFF0C\u8BF7\u7ACB\u5373\u538B\u7F29\u5DF2\u6D88\u8D39\u7684\u65E7\u5185\u5BB9\u4EE5\u91CA\u653E\u7A7A\u95F4\u3002");
+    lines.push("\u53EF\u9009\u5DE5\u5177\uFF1Acompress\uFF08\u538B\u7F29\u4E00\u6BB5\u8303\u56F4\uFF09\u3001absorb\uFF08\u5438\u6536\u5355\u6761\u5DE8\u578B\u8F93\u51FA\uFF09\u3001decompress\uFF08\u6062\u590D\uFF09\u3001search_context\uFF08\u641C\u7D22\uFF09\u3001acp_status\uFF08\u67E5\u72B6\u6001/\u8303\u56F4\uFF09\u3002");
+  } else {
+    lines.push("[ACP] \u4E0A\u4E0B\u6587\u5DF2\u63A5\u8FD1\u786C\u4E0A\u9650\uFF0C\u8BF7\u7ACB\u5373\u8C03\u7528 compress \u538B\u7F29\u6700\u65E7\u3001\u5DF2\u6D88\u8D39\u7684\u5185\u5BB9\u3002\u82E5\u672C\u63D0\u793A\u6301\u7EED\u51FA\u73B0\uFF0C\u538B\u7F29\u662F\u7EE7\u7EED\u4EFB\u52A1\u7684\u524D\u63D0\uFF0C\u4E0D\u8981\u5FFD\u7565\u3002");
+  }
+  if (reason) lines.push(`\uFF08pressure: ${reason}\uFF09`);
+  return lines.join("\n");
 }
 function buildNudgeText(nudge, level) {
   const lines = [];

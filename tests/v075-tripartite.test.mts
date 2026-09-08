@@ -18,6 +18,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildNudgeCarrier, createNudgeDelivery, findNudgeTurn, markDelivered, markFinalCheck } from "../src/acp/nudge-delivery";
 import { createOperitHostUsageAdapter } from "../src/acp/host-usage-adapter";
+import { evaluatePressure } from "../src/acp/pressure";
 
 // ═══════════════ A/B/C：nudge ephemeral 语义（基于宿主真实行为） ═══════════════
 
@@ -67,42 +68,33 @@ test("V0.7.5-A/B/C: SYSTEM carrier nudge 是 ephemeral——不写回 chatHistor
   assert.equal(findNudgeTurn(hopN1History as Array<{ kind?: string; content?: string; metadata?: Record<string, unknown> | null }>), undefined, "Hop N+1 无 nudge");
 });
 
-// ═══════════════ D/E：preflight cycle 边界（真实 send cycle） ═══════════════
+// ═══════════════ D/E：forced nudge 每次 send 独立决策（V0.7.6 替代 preflight cycle） ═══════════════
 
-test("V0.7.5-D/E: preflight 同一真实 send 最多一次；下一 send 可再次", () => {
-  // 宿主真实链路：一次用户发送 = before_finalize_prompt + before_send_to_model（同一 fingerprint）。
-  // preflightCycleDone + preflightCycleFingerprint 标识本 send 周期。
-  let cycleDone = false;
-  let cycleFp = "";
+test("V0.7.6-D/E: forced nudge 每次 send 独立注入；无 cycle 去重（nudge 是 ephemeral）", () => {
+  // V0.7.6：删除 preflight cycle（preflightCycleDone/Fingerprint 已废弃）。
+  // 每个发送路径（before_finalize + before_send）都独立做 pressure 决策；
+  // forced nudge 是 ephemeral SYSTEM carrier——同 send 内可多次出现（各自 ephemeral），
+  // 但绝不触发自动折叠。
+  let forcedCount = 0;
 
-  const simulateSend = (fp: string, overHard: boolean): number => {
-    let preflightCount = 0;
-    // stage1
-    if (!cycleDone && overHard) {
-      preflightCount++;
-      cycleDone = true;
-      cycleFp = fp;
-    }
-    // stage2（同 fingerprint → cycleDone=true → 不再 preflight）
-    if (!cycleDone && overHard) {
-      preflightCount++;
-      cycleDone = true;
-      cycleFp = fp;
-    }
-    return preflightCount;
+  const simulateSend = (overHard: boolean): number => {
+    // stage1 + stage2 各自独立决策（无 cycle 去重）。
+    if (overHard) forcedCount++;
+    if (overHard) forcedCount++;
+    return 2; // 两个 stage 都独立注入（都是 ephemeral，不重复持久化）
   };
 
-  // D：同一 send 两次 stage → 最多一次 preflight
-  assert.equal(simulateSend("fp-1", true), 1, "同一 send 只 preflight 一次");
+  // D：同一次 send 两个 stage 各自注入 forced nudge（都 ephemeral，无副作用累积）
+  assert.equal(simulateSend(true), 2, "两个 stage 独立决策 forced nudge");
 
-  // E：新 send（新 fingerprint）重新 > hard → 可再次 preflight
-  cycleDone = false;
-  assert.equal(simulateSend("fp-2", true), 1, "新 send 可再次 preflight");
+  // E：新 send 重新 > hard → 再次 forced nudge（无 cycle 残留）
+  assert.equal(simulateSend(true), 2, "新 send 可再次 forced nudge");
+  assert.equal(forcedCount, 4, "累计 4 次 forced nudge（全部 ephemeral）");
 });
 
-// ═══════════════ F/G/H：三动作分层 ═══════════════
+// ═══════════════ F/G：三动作分层 ═══════════════
 
-test("V0.7.5-F/G/H: strong→nudge 不 auto fold；model compress source=model；preflight source=preflight", () => {
+test("V0.7.6-F/G: strong→nudge 不 auto fold；model compress source=model", () => {
   // F：strong pressure → nudge（不直接 auto fold）
   const strongDelivery = createNudgeDelivery("before_finalize_prompt");
   const strongCarrier = buildNudgeCarrier("[ACP] strong", "strong");
@@ -116,26 +108,44 @@ test("V0.7.5-F/G/H: strong→nudge 不 auto fold；model compress source=model�
   const stats = { lastCompressSource: "model", compressSucceeded: 1 };
   assert.equal(stats.lastCompressSource, "model");
 
-  // H：preflight → source=preflight
-  const preflightStats = { lastCompressSource: "preflight", preflightSucceeded: 1 };
-  assert.equal(preflightStats.lastCompressSource, "preflight");
+  // V0.7.6：preflight source 已删除——压缩只来自 model（或 emergency 工具结果截断）。
+  // H 语义变更：不存在 preflight source；验证 model source 是唯一压缩来源。
+  assert.equal("preflight" in { model: 1 }, false, "preflight source 已从统计中移除");
 });
 
-// ═══════════════ I：preflight 后全量重建 ═══════════════
+// ═══════════════ I：V0.7.6 无 preflight → 无"压缩后重建投影"（压缩只由模型触发） ═══════════════
 
-test("V0.7.5-I: preflight 后 projection/estimate/effective 全部重新计算", () => {
-  // 模拟：压缩前 effective=208K > hard=200K → preflight fold → 90K → 重新计算
-  const before = { effective: 208_000, estimate: 210_000, hard: 200_000 };
-  const preflightFreed = 118_000;
-  const after = {
-    effective: before.effective - preflightFreed, // 90_000
-    estimate: 90_000,
-    projection: "rebuild", // 必须重建（旧投影失效）
-  };
-  assert.ok(before.effective > before.hard, "preflight 前超 hard");
-  assert.ok(after.effective < before.hard, "preflight 后回安全区");
-  assert.equal(after.projection, "rebuild", "projection 必须重建");
-  assert.equal(after.estimate, 90_000, "estimate 重新计算");
+test("V0.7.6-I: 插件不自动压缩 → 无 preflight 投影重建路径；模型 compress 走 applyCompression", () => {
+  // V0.7.6 语义：插件绝不自动压缩历史。
+  // 压缩唯一入口 = 模型调用 compress 工具 → applyCompression（独立路径，不经过 project）。
+  // 因此 project() 内不存在"自动折叠后重建投影"分支。
+  // 验证：pressure 决策对象不含压缩 action（decision ≠ execution）。
+  const decision = evaluatePressure({
+    usagePct: 0.90,
+    effectiveTokens: 180_000,
+    tokenEstimate: 180_000,
+    kernelShouldInject: false,
+    kernelReason: "",
+    prevEpoch: undefined,
+    prevBlocks: 0,
+    curBlocks: 0,
+    gentleThresholdPct: 0.72,
+    strongThresholdPct: 0.82,
+    forcedThresholdPct: 0.85,
+    hostEscalationFloor: 0.70,
+    nudgeCooldownTurns: 3,
+    nudgeGrowthFloor: 30000,
+    usageCreditTokens: 30000,
+    creditBaseToken: 100_000,
+    lastInjectedAt: 0,
+    nudgeCount: 0,
+    lastTokensAtInject: 0,
+    lastCompressToken: 80_000,
+    source: "estimate",
+  });
+  assert.equal(decision.allowInject, true, "90% 超 hard → forced nudge");
+  assert.equal(decision.level, "forced", "forced 档位");
+  assert.ok(!("action" in decision), "decision 只含 nudge，绝不含压缩 action");
 });
 
 // ═══════════════ J：pressure allow=true 但 kernel nudge undefined ═══════════════

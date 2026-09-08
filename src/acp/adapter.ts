@@ -45,8 +45,6 @@ import {
 } from "./absorb-candidates";
 import {
   evaluatePressure,
-  evaluatePreflight,
-  type CompressionAction,
   type NudgeLevel as PressureNudgeLevel,
   type PressureEpoch,
   type PressureDecision,
@@ -291,7 +289,7 @@ export function createEngine(dataDir?: string): AcpEngine {
       curBlocks: opts.curBlocks,
       gentleThresholdPct: opts.settings.gentleThresholdPct,
       strongThresholdPct: opts.settings.strongThresholdPct,
-      emergencyThresholdPct: opts.settings.hardLimitPct,
+      forcedThresholdPct: opts.settings.hardLimitPct,
       hostEscalationFloor: opts.settings.hostEscalationFloor,
       nudgeCooldownTurns: opts.settings.nudgeCooldownTurns,
       nudgeGrowthFloor: opts.settings.nudgeGrowthFloor,
@@ -317,207 +315,6 @@ export function createEngine(dataDir?: string): AcpEngine {
       });
     } catch { /* ledger 失败不影响主流程 */ }
     return { pressure, eff, pressurePct, usageManager, hostTokens, nextStats };
-  }
-
-  /**
-   * V0.7.4：runPreflight —— 新一轮发送前的 preflight-over-hard 主动自愈压缩。
-   *
-   * 语义（与普通 pressure compression 明确分离，见用户需求 3/4/5/7/10）：
-   * - 触发条件：effectiveTokens > hardLimitTokens（evaluatePreflight 判定，host/estimate 采样）。
-   * - 只执行一次：本 send 周期（同一 fingerprint 周期）已 preflight 后不再重复；
-   *   压缩后仍超 → 走 safety-emergency（最终兜底，不无限循环）。
-   * - 压缩后必须 rebuild projection → re-estimate → re-sample host → recompute pressure，
-   *   绝不复用压缩前的 tokenEstimate / effectiveTokens / pressurePct / hard-limit 状态。
-   * - 返回 preflight 结果（是否折叠、释放 token、压缩后状态），调用方据此：
-   *   1) 更新投影（projectedTurns/capped）为压缩后视图；
-   *   2) 用压缩后状态重新 collectAndEvaluatePressure（重新采样 host + 重算 pressure）。
-   * - preflight 成功关闭当前 epoch（等价一次压缩），下一轮可继续增长/再压缩。
-   *
-   * 折叠策略：取 kernel 当前最旧可压缩范围（compressibleRanges 按 token 降序），
-   * 一次压 2 段；摘要带 [ACP 自动折叠] 标记（可 decompress 恢复）。绝不触碰
-   * preparedHistory 之外的消息（不动用户本轮新增输入）。
-   */
-  async function runPreflight(opts: {
-    sessionKey: string;
-    chatId?: string;
-    mapping: ReturnType<typeof promptTurnsToCoreMessages>;
-    state: CompressionState;
-    config: Config;
-    tokenEstimate: number;
-    /** 触发 preflight 时采样的 effective/hard 信息（供 trace）。 */
-    trigger: { effectiveTokens: number; hardLimitTokens: number };
-  }): Promise<{
-    folded: boolean;
-    freedTokens: number;
-    rounds: number;
-    nextState: CompressionState;
-    stillOverHard: boolean;
-  }> {
-    const maxRounds = 3; // 一次 preflight 最多连续压 3 轮（防失控；一轮=压 2 段）
-    let curState = opts.state;
-    let freed = 0;
-    let rounds = 0;
-    for (let round = 0; round < maxRounds; round++) {
-      const curTurn = core.processTurn({
-        messages: opts.mapping.messages,
-        state: curState,
-        config: opts.config,
-        tokenCount: opts.tokenEstimate,
-        renderTags: "none",
-      });
-      // 压缩后重新评估 usage（基于最新状态投影），而不是用触发时的旧值。
-      const curCovered = collectCoveredMessageIds(curState);
-      const curEstimate = estimateProjectionTokens(curTurn.messages, curCovered);
-      const stillOver = curEstimate > opts.trigger.hardLimitTokens;
-      if (!stillOver) break; // 已回到安全区，停止
-      const ranges = ((curTurn.nudge?.compressibleRanges ?? []) as { startRef: string; endRef: string; tokens?: number }[])
-        .filter((r) => r.startRef && r.endRef)
-        .sort((a, b) => (b.tokens ?? 0) - (a.tokens ?? 0))
-        .slice(0, 2);
-      if (ranges.length === 0) break; // 无可压缩范围（受保护/已全压缩）→ 留给 safety-emergency
-      try {
-        const applied = core.applyCompression({
-          ranges: ranges.map((r) => {
-            const byRef = (curState.messageRefs?.byRef ?? {}) as Record<string, string>;
-            const startMsg = messageForRef(opts.mapping.messages, byRef, opts.mapping.byKey, r.startRef);
-            const endMsg = messageForRef(opts.mapping.messages, byRef, opts.mapping.byKey, r.endRef);
-            const startIdx = startMsg ? opts.mapping.messages.indexOf(startMsg) : -1;
-            const endIdx = endMsg ? opts.mapping.messages.indexOf(endMsg) : -1;
-            const lo = startIdx >= 0 ? startIdx : 0;
-            const hi = endIdx >= startIdx ? endIdx : Math.min(opts.mapping.messages.length - 1, lo + 200);
-            const seg = lo >= 0 ? opts.mapping.messages.slice(lo, hi + 1) : [];
-            const excerpt = seg.length > 0 ? buildDeterministicSummary(seg) : "";
-            const summary = excerpt.length > 0
-              ? `[ACP 自动折叠] 早期 ${seg.length} 条消息的压缩摘要（需要原文可调用 decompress 恢复）：\n${excerpt}`
-              : `[ACP 自动折叠] 早期 ${Math.max(1, hi - lo + 1)} 条消息因超出上下文窗口上限已被自动折叠压缩，关键信息与结论已尽量保留在摘要中，如需查看原文可随时调用 decompress 工具恢复对应 block。`;
-            return { startRef: r.startRef, endRef: r.endRef, summary, topic: "早期对话（自动折叠）" };
-          }),
-          messages: opts.mapping.messages,
-          state: curState,
-          config: opts.config,
-        });
-        if (applied.result.blocksCreated > 0) {
-          curState = applied.state;
-          freed += applied.result.tokensCompressed;
-          rounds++;
-          continue;
-        }
-        break; // 本段无法再压
-      } catch {
-        break; // 单轮失败不阻塞（留给 safety-emergency）
-      }
-    }
-    // 压缩后重新估算（基于最终状态），判断是否仍超硬限。
-    const finalCovered = collectCoveredMessageIds(curState);
-    const finalEstimate = estimateProjectionTokens(
-      core.processTurn({ messages: opts.mapping.messages, state: curState, config: opts.config, tokenCount: opts.tokenEstimate, renderTags: "none" }).messages,
-      finalCovered,
-    );
-    const stillOverHard = finalEstimate > opts.trigger.hardLimitTokens;
-    return { folded: freed > 0, freedTokens: freed, rounds, nextState: curState, stillOverHard };
-  }
-
-  /** V0.7.4：checkAndRunPreflight 的返回形态（供 stage2/cache/incremental 局部变量类型）。 */
-  type PreflightOutcome = {
-    triggered: boolean;
-    folded: boolean;
-    freedTokens: number;
-    rounds: number;
-    stillOverHard: boolean;
-    nextState: CompressionState;
-    nextProjection?: PromptTurnLike[];
-    trigger?: { effectiveTokens: number; hardLimitTokens: number };
-  };
-
-  /**
-   * V0.7.4：checkAndRunPreflight —— 统一 preflight 判定 + 执行（供四条发送路径共用）。
-   *
-   * full / incremental / cache-hit / stage2 在真正发送 preparedHistory 之前都调用它：
-   * 1) 采样 host + estimate → effective（与 collectAndEvaluatePressure 同源语义）；
-   * 2) evaluatePreflight 判定：
-   *    - 未超 hard limit → { triggered:false }（正常 pressure 管理，不额外压缩）；
-   *    - 超 hard limit 且本周期未 preflight → 执行 runPreflight（主动压缩一次）；
-   *    - 压缩后仍超 / 本周期已 preflight → safety-emergency（最终兜底）。
-   * 3) 压缩后调用方必须用返回的 nextState / nextProjection 重建投影并重新 pressure。
-   *
-   * 注意：preflightDoneForCycle 由调用方传入（stage1 已 preflight 则 stage2 不再重复）。
-   */
-  async function checkAndRunPreflight(opts: {
-    sessionKey: string;
-    chatId?: string;
-    mapping: ReturnType<typeof promptTurnsToCoreMessages>;
-    state: CompressionState;
-    config: Config;
-    /** 发送视图估算（投影后 estimate）。 */
-    tokenEstimate: number;
-    /** 当前 usageState（调用方已 load；供 effective 采样）。 */
-    usageState?: UsageManagerState;
-    /** 本 send 周期是否已执行过一次 preflight（防同轮内无限压缩）。 */
-    preflightDoneForCycle?: boolean;
-  }): Promise<{
-    triggered: boolean;
-    folded: boolean;
-    freedTokens: number;
-    rounds: number;
-    stillOverHard: boolean;
-    nextState: CompressionState;
-    /** 压缩后投影重建（若触发且折叠成功）。 */
-    nextProjection?: PromptTurnLike[];
-    /** 触发时 effective/hard 信息（trace 用）。 */
-    trigger?: { effectiveTokens: number; hardLimitTokens: number };
-    action: CompressionAction;
-  }> {
-    const hostTokensNow = opts.chatId
-      ? await getHostUsageAdapter().getCurrentContextTokens(String(opts.chatId)).catch(() => undefined)
-      : undefined;
-    const um = createUsageManager(opts.usageState);
-    if (hostTokensNow !== undefined) um.recordHostUsage(hostTokensNow);
-    um.recordEstimate(opts.tokenEstimate);
-    const eff = um.getEffectiveSnapshot(opts.tokenEstimate);
-    const hardTokens = Math.round(opts.config.modelContextLimit * settings.hardLimitPct);
-    const decision = evaluatePreflight({
-      effectiveTokens: eff.effectiveTokens || opts.tokenEstimate,
-      modelContextLimit: opts.config.modelContextLimit,
-      hardLimitPct: settings.hardLimitPct,
-      preflightDoneForCycle: opts.preflightDoneForCycle,
-    });
-    const action = decision.action;
-    if (action.kind === "none") {
-      return { triggered: false, folded: false, freedTokens: 0, rounds: 0, stillOverHard: false, nextState: opts.state, action };
-    }
-    // preflight-over-hard 或 safety-emergency（本周期已压仍超）。
-    const pf = await runPreflight({
-      sessionKey: opts.sessionKey,
-      chatId: opts.chatId,
-      mapping: opts.mapping,
-      state: opts.state,
-      config: opts.config,
-      tokenEstimate: opts.tokenEstimate,
-      trigger: { effectiveTokens: eff.effectiveTokens || opts.tokenEstimate, hardLimitTokens: hardTokens },
-    });
-    let nextProjection: PromptTurnLike[] | undefined;
-    if (pf.folded) {
-      // 压缩后重建投影（含占位）。
-      try {
-        const turn2 = core.processTurn({ messages: opts.mapping.messages, state: pf.nextState, config: opts.config, tokenCount: opts.tokenEstimate, renderTags: "none" });
-        let projMsgs = turn2.messages;
-        if (settings.hideConsumedCompressCalls && turn2.state.blocks.length > 0) {
-          try { projMsgs = kernelHideConsumedCompressCalls(turn2.state, turn2.messages).messages; } catch { /* noop */ }
-        }
-        nextProjection = coreMessagesToPromptTurns(projMsgs, opts.mapping.byKey);
-      } catch { /* 重建失败不阻塞（调用方用原投影） */ }
-    }
-    return {
-      triggered: true,
-      folded: pf.folded,
-      freedTokens: pf.freedTokens,
-      rounds: pf.rounds,
-      stillOverHard: pf.stillOverHard,
-      nextState: pf.nextState,
-      nextProjection,
-      trigger: { effectiveTokens: eff.effectiveTokens || opts.tokenEstimate, hardLimitTokens: hardTokens },
-      action,
-    };
   }
 
   return {
@@ -621,56 +418,10 @@ export function createEngine(dataDir?: string): AcpEngine {
               : stage2Pressure.pressurePct >= settings.gentleThresholdPct ? "gentle"
               : "none");
           const finalPrepared = projected && Array.isArray(projected) ? [...(projected as PromptTurnLike[])] : [...turns];
-          // —— V0.7.4：stage2（before_send_to_model）也必须能触发 preflight-over-hard（需求 G）。
-          //   真正发送边界在这里（宿主把 stage1 投影作为最终请求内容），若 stage1 未 preflight
-          //   且 stage2 采样发现仍超 hard limit（例如 stage1 时 host 采样失败、或跨轮直接进 stage2），
-          //   必须在此自愈。stage1 已 preflight（同 fingerprint）则不再重复（需求 5：只触发一次）。
-          //   stage2 无 processTurn 的 kernel state 变更（复用缓存），但 preflight 需要 kernel
-          //   压缩 → 必须基于 cached.kernelState 构造 mapping（与 full path 同源）执行 runPreflight。
-          let stage2Preflight: PreflightOutcome | undefined;
-          const stage2CycleDone = cached.hostMetadata.preflightCycleDone === true
-            && cached.hostMetadata.preflightCycleFingerprint === fp;
-          if (!stage2CycleDone && projected && Array.isArray(projected)) {
-            const stage2Mapping = promptTurnsToCoreMessages(projected as PromptTurnLike[]);
-            stage2Preflight = await checkAndRunPreflight({
-              sessionKey, chatId,
-              mapping: stage2Mapping,
-              state: cached.kernelState,
-              config,
-              tokenEstimate: stage2Estimate,
-              usageState: cached.hostMetadata.usageState as UsageManagerState | undefined,
-              preflightDoneForCycle: stage2CycleDone,
-            });
-            if (stage2Preflight.triggered) {
-              // 更新 stats（preflight/safety 统计与 full path 一致）。
-              stage2Pressure.nextStats.preflightTriggered = (stage2Pressure.nextStats.preflightTriggered ?? 0) + 1;
-              if (stage2Preflight.folded) {
-                stage2Pressure.nextStats.preflightSucceeded = (stage2Pressure.nextStats.preflightSucceeded ?? 0) + 1;
-                stage2Pressure.nextStats.preflightSavedTokens = (stage2Pressure.nextStats.preflightSavedTokens ?? 0) + stage2Preflight.freedTokens;
-                stage2Pressure.nextStats.lastCompressSource = "preflight";
-                stage2Pressure.nextStats.lastCompressAt = Date.now();
-                // 更新最终投影为压缩后视图。
-                if (stage2Preflight.nextProjection && stage2Preflight.nextProjection.length > 0) {
-                  finalPrepared.length = 0;
-                  finalPrepared.push(...stage2Preflight.nextProjection);
-                }
-                chatTrace(chatId, {
-                  type: "preflight",
-                  level: "preflight-over-hard",
-                  detail: { path: "stage2", blocks: 0, tokens: stage2Preflight.freedTokens, rounds: stage2Preflight.rounds, stillOverHard: stage2Preflight.stillOverHard },
-                });
-              } else {
-                stage2Pressure.nextStats.preflightFailed = (stage2Pressure.nextStats.preflightFailed ?? 0) + 1;
-                stage2Pressure.nextStats.safetyEmergencyTriggered = (stage2Pressure.nextStats.safetyEmergencyTriggered ?? 0) + 1;
-                stage2Pressure.nextStats.emergencyTriggered = (stage2Pressure.nextStats.emergencyTriggered ?? 0) + 1;
-                chatTrace(chatId, {
-                  type: "emergency",
-                  level: "safety-emergency",
-                  detail: { path: "stage2", preflightRounds: stage2Preflight.rounds, stillOverHard: stage2Preflight.stillOverHard, context: stage2Preflight.trigger?.effectiveTokens, hard: stage2Preflight.trigger?.hardLimitTokens },
-                });
-              }
-            }
-          }
+          // —— V0.7.6：删除 preflight/safety-emergency 自动折叠。
+          //   硬限（hardLimitPct）只作为 forcedThresholdPct 传入 evaluatePressure →
+          //   产生 forced nudge（绕过 growth/cadence/credit 的强提示），绝不自动压缩历史。
+          //   压缩只由模型主动调用 compress 工具执行。
           // nudge 必须最终进入实际发送的 preparedHistory（文档第八节：nudge 是 ephemeral，
           // 不能因为 stage2 复用缓存而丢失前一个 Hop 的 nudge——本 Hop 重新决策注入）。
           let stage2NudgeText: string | undefined;
@@ -695,11 +446,10 @@ export function createEngine(dataDir?: string): AcpEngine {
           // 持久化 stage2 的 usageState + acpNudge（ledger 已含 stage2 hop）。
           const stage2NextState: OperitAcpSessionState = {
             adapterStateVersion: cached.adapterStateVersion,
-            kernelState: stage2Preflight && stage2Preflight.triggered ? stage2Preflight.nextState : cached.kernelState,
+            kernelState: cached.kernelState,
             hostMetadata: {
               ...cached.hostMetadata,
-              // V0.7.4：stage2 preflight 折叠改变了 kernelState → stateVersion 递增。
-              stateVersion: (cached.hostMetadata.stateVersion ?? 0) + (stage2Preflight && stage2Preflight.triggered && stage2Preflight.folded ? 1 : 0),
+              stateVersion: cached.hostMetadata.stateVersion ?? 0,
               lastProjectionFingerprint: cached.hostMetadata.lastProjectionFingerprint ?? fp,
               lastUpdatedAt: Date.now(),
               ...(chatId ? { lastChatId: String(chatId) } : {}),
@@ -709,22 +459,6 @@ export function createEngine(dataDir?: string): AcpEngine {
               },
               runtimeStats: stage2Pressure.nextStats,
               usageState: stage2Pressure.usageManager.snapshot(),
-              // V0.7.4：stage2 触发了 preflight → 本周期标记（同 fingerprint 不重复）。
-              ...(stage2Preflight && stage2Preflight.triggered
-                ? {
-                    preflightCycleDone: true,
-                    preflightCycleFingerprint: fp,
-                    lastPreflight: {
-                      at: Date.now(),
-                      rounds: stage2Preflight.rounds,
-                      freedTokens: stage2Preflight.freedTokens,
-                      stillOverHard: stage2Preflight.stillOverHard,
-                      contextTokens: stage2Preflight.trigger?.effectiveTokens ?? stage2Estimate,
-                      hardLimitTokens: stage2Preflight.trigger?.hardLimitTokens ?? Math.round(config.modelContextLimit * settings.hardLimitPct),
-                      source: "stage2",
-                    },
-                  }
-                : {}),
             },
           };
           try { await persistence.save(sessionKey, stage2NextState); } catch { /* stage2 保存失败不影响返回 */ }
@@ -768,51 +502,8 @@ export function createEngine(dataDir?: string): AcpEngine {
           const cacheFinal = projected && Array.isArray(projected) && projected.length > 0
             ? [...(projected as PromptTurnLike[])]
             : [...turns];
-          // —— V0.7.4：cache hit 也必须能触发 preflight-over-hard（需求 F）。
-          //   同一 fingerprint 复用缓存（可能是新一轮开始、或工具循环重发），若采样发现
-          //   effective 超 hard limit 且本周期未 preflight → 自愈压缩。
-          let cachePreflight: PreflightOutcome | undefined;
-          const cacheCycleDone = cached.hostMetadata.preflightCycleDone === true
-            && cached.hostMetadata.preflightCycleFingerprint === fingerprint;
-          if (!cacheCycleDone && projected && Array.isArray(projected) && projected.length > 0) {
-            const cacheMapping = promptTurnsToCoreMessages(projected as PromptTurnLike[]);
-            cachePreflight = await checkAndRunPreflight({
-              sessionKey, chatId,
-              mapping: cacheMapping,
-              state: cached.kernelState,
-              config,
-              tokenEstimate: cacheEstimate,
-              usageState: cached.hostMetadata.usageState as UsageManagerState | undefined,
-              preflightDoneForCycle: cacheCycleDone,
-            });
-            if (cachePreflight.triggered) {
-              cachePressure.nextStats.preflightTriggered = (cachePressure.nextStats.preflightTriggered ?? 0) + 1;
-              if (cachePreflight.folded) {
-                cachePressure.nextStats.preflightSucceeded = (cachePressure.nextStats.preflightSucceeded ?? 0) + 1;
-                cachePressure.nextStats.preflightSavedTokens = (cachePressure.nextStats.preflightSavedTokens ?? 0) + cachePreflight.freedTokens;
-                cachePressure.nextStats.lastCompressSource = "preflight";
-                cachePressure.nextStats.lastCompressAt = Date.now();
-                if (cachePreflight.nextProjection && cachePreflight.nextProjection.length > 0) {
-                  cacheFinal.length = 0;
-                  cacheFinal.push(...cachePreflight.nextProjection);
-                }
-                chatTrace(chatId, {
-                  type: "preflight",
-                  level: "preflight-over-hard",
-                  detail: { path: "cache", blocks: 0, tokens: cachePreflight.freedTokens, rounds: cachePreflight.rounds, stillOverHard: cachePreflight.stillOverHard },
-                });
-              } else {
-                cachePressure.nextStats.preflightFailed = (cachePressure.nextStats.preflightFailed ?? 0) + 1;
-                cachePressure.nextStats.safetyEmergencyTriggered = (cachePressure.nextStats.safetyEmergencyTriggered ?? 0) + 1;
-                cachePressure.nextStats.emergencyTriggered = (cachePressure.nextStats.emergencyTriggered ?? 0) + 1;
-                chatTrace(chatId, {
-                  type: "emergency",
-                  level: "safety-emergency",
-                  detail: { path: "cache", preflightRounds: cachePreflight.rounds, stillOverHard: cachePreflight.stillOverHard, context: cachePreflight.trigger?.effectiveTokens, hard: cachePreflight.trigger?.hardLimitTokens },
-                });
-              }
-            }
-          }
+          // —— V0.7.6：删除 cache-hit 的 preflight/safety-emergency 自动折叠。
+          //   硬限只作为 forcedThresholdPct 产生 forced nudge，绝不自动压缩历史。
           let cacheNudgeText: string | undefined;
           let cacheDelivery: NudgeDelivery | undefined;
           if (cachePressure.pressure.allowInject && settings.nudgeEnabled) {
@@ -828,11 +519,10 @@ export function createEngine(dataDir?: string): AcpEngine {
           }
           const cacheNextState: OperitAcpSessionState = {
             adapterStateVersion: cached.adapterStateVersion,
-            kernelState: cachePreflight && cachePreflight.triggered ? cachePreflight.nextState : cached.kernelState,
+            kernelState: cached.kernelState,
             hostMetadata: {
               ...cached.hostMetadata,
-              // V0.7.4：cache hit preflight 折叠改变了 kernelState → stateVersion 递增。
-              stateVersion: (cached.hostMetadata.stateVersion ?? 0) + (cachePreflight && cachePreflight.triggered && cachePreflight.folded ? 1 : 0),
+              stateVersion: cached.hostMetadata.stateVersion ?? 0,
               lastProjectionFingerprint: fingerprint,
               lastUpdatedAt: Date.now(),
               ...(chatId ? { lastChatId: String(chatId) } : {}),
@@ -842,22 +532,6 @@ export function createEngine(dataDir?: string): AcpEngine {
               },
               runtimeStats: cachePressure.nextStats,
               usageState: cachePressure.usageManager.snapshot(),
-              // V0.7.4：cache hit 触发 preflight → 周期标记（同 fingerprint 不重复）。
-              ...(cachePreflight && cachePreflight.triggered
-                ? {
-                    preflightCycleDone: true,
-                    preflightCycleFingerprint: fingerprint,
-                    lastPreflight: {
-                      at: Date.now(),
-                      rounds: cachePreflight.rounds,
-                      freedTokens: cachePreflight.freedTokens,
-                      stillOverHard: cachePreflight.stillOverHard,
-                      contextTokens: cachePreflight.trigger?.effectiveTokens ?? cacheEstimate,
-                      hardLimitTokens: cachePreflight.trigger?.hardLimitTokens ?? Math.round(config.modelContextLimit * settings.hardLimitPct),
-                      source: "cache",
-                    },
-                  }
-                : {}),
             },
           };
           try { await persistence.save(sessionKey, cacheNextState); } catch { /* cache 保存失败不影响返回 */ }
@@ -920,51 +594,8 @@ export function createEngine(dataDir?: string): AcpEngine {
                   : incPressure.pressurePct >= settings.gentleThresholdPct ? "gentle"
                   : "none");
               const incFinal = [...capped];
-              // —— V0.7.4：incremental 路径也必须能触发 preflight-over-hard（需求 E）。
-              //   增量投影是新一轮发送前的最终视图；采样发现 effective 超 hard limit
-              //   且本周期未 preflight → 自愈压缩（重建投影后再返回）。
-              let incPreflight: PreflightOutcome | undefined;
-              const incCycleDone = cached.hostMetadata.preflightCycleDone === true
-                && cached.hostMetadata.preflightCycleFingerprint === fingerprint;
-              if (!incCycleDone) {
-                const incMapping = promptTurnsToCoreMessages(capped as PromptTurnLike[]);
-                incPreflight = await checkAndRunPreflight({
-                  sessionKey, chatId,
-                  mapping: incMapping,
-                  state: cached.kernelState,
-                  config,
-                  tokenEstimate: incEstimate,
-                  usageState: cached.hostMetadata.usageState as UsageManagerState | undefined,
-                  preflightDoneForCycle: incCycleDone,
-                });
-                if (incPreflight.triggered) {
-                  incPressure.nextStats.preflightTriggered = (incPressure.nextStats.preflightTriggered ?? 0) + 1;
-                  if (incPreflight.folded) {
-                    incPressure.nextStats.preflightSucceeded = (incPressure.nextStats.preflightSucceeded ?? 0) + 1;
-                    incPressure.nextStats.preflightSavedTokens = (incPressure.nextStats.preflightSavedTokens ?? 0) + incPreflight.freedTokens;
-                    incPressure.nextStats.lastCompressSource = "preflight";
-                    incPressure.nextStats.lastCompressAt = Date.now();
-                    if (incPreflight.nextProjection && incPreflight.nextProjection.length > 0) {
-                      incFinal.length = 0;
-                      incFinal.push(...incPreflight.nextProjection);
-                    }
-                    chatTrace(chatId, {
-                      type: "preflight",
-                      level: "preflight-over-hard",
-                      detail: { path: "incremental", blocks: 0, tokens: incPreflight.freedTokens, rounds: incPreflight.rounds, stillOverHard: incPreflight.stillOverHard },
-                    });
-                  } else {
-                    incPressure.nextStats.preflightFailed = (incPressure.nextStats.preflightFailed ?? 0) + 1;
-                    incPressure.nextStats.safetyEmergencyTriggered = (incPressure.nextStats.safetyEmergencyTriggered ?? 0) + 1;
-                    incPressure.nextStats.emergencyTriggered = (incPressure.nextStats.emergencyTriggered ?? 0) + 1;
-                    chatTrace(chatId, {
-                      type: "emergency",
-                      level: "safety-emergency",
-                      detail: { path: "incremental", preflightRounds: incPreflight.rounds, stillOverHard: incPreflight.stillOverHard, context: incPreflight.trigger?.effectiveTokens, hard: incPreflight.trigger?.hardLimitTokens },
-                    });
-                  }
-                }
-              }
+              // —— V0.7.6：删除 incremental 的 preflight/safety-emergency 自动折叠。
+              //   硬限只作为 forcedThresholdPct 产生 forced nudge，绝不自动压缩历史。
               let incNudgeText: string | undefined;
               let incDelivery: NudgeDelivery | undefined;
               if (incPressure.pressure.allowInject && settings.nudgeEnabled) {
@@ -982,11 +613,10 @@ export function createEngine(dataDir?: string): AcpEngine {
               cacheSetLimited(rawTurnsCache, sessionKey, turns);
               const incNextState: OperitAcpSessionState = {
                 adapterStateVersion: cached.adapterStateVersion,
-                kernelState: incPreflight && incPreflight.triggered ? incPreflight.nextState : cached.kernelState,
+                kernelState: cached.kernelState,
                 hostMetadata: {
                   ...cached.hostMetadata,
-                  // V0.7.4：incremental preflight 折叠改变了 kernelState → stateVersion 递增。
-                  stateVersion: (cached.hostMetadata.stateVersion ?? 0) + (incPreflight && incPreflight.triggered && incPreflight.folded ? 1 : 0),
+                  stateVersion: cached.hostMetadata.stateVersion ?? 0,
                   lastProjectionFingerprint: fingerprint,
                   lastUpdatedAt: Date.now(),
                   ...(chatId ? { lastChatId: String(chatId) } : {}),
@@ -996,22 +626,6 @@ export function createEngine(dataDir?: string): AcpEngine {
                   },
                   runtimeStats: incPressure.nextStats,
                   usageState: incPressure.usageManager.snapshot(),
-                  // V0.7.4：incremental 触发 preflight → 周期标记（同 fingerprint 不重复）。
-                  ...(incPreflight && incPreflight.triggered
-                    ? {
-                        preflightCycleDone: true,
-                        preflightCycleFingerprint: fingerprint,
-                        lastPreflight: {
-                          at: Date.now(),
-                          rounds: incPreflight.rounds,
-                          freedTokens: incPreflight.freedTokens,
-                          stillOverHard: incPreflight.stillOverHard,
-                          contextTokens: incPreflight.trigger?.effectiveTokens ?? incEstimate,
-                          hardLimitTokens: incPreflight.trigger?.hardLimitTokens ?? Math.round(config.modelContextLimit * settings.hardLimitPct),
-                          source: "incremental",
-                        },
-                      }
-                    : {}),
                 },
               };
               try { await persistence.save(sessionKey, incNextState); } catch { /* incremental 保存失败不影响返回 */ }
@@ -1083,52 +697,13 @@ export function createEngine(dataDir?: string): AcpEngine {
         //      nudge 是提示模型自行 compress。
         let autoFolded = false;
         let emergencyFreedTokens = 0;
-        let preflightRounds = 0;
-        let preflightTriggered = false;
-        let preflightStillOver = false;
         const prevStats = { ...(cached.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS) };
 
-        // —— Preflight 判定 + 执行（V0.7.4 统一入口，与 stage2/cache/incremental 同源）。
-        //   processTurn 已执行（turn.state 是当前投影状态），这里把投影后的 turns 重新
-        //   转回 mapping 供 runPreflight 折叠（mapping 与 processTurn 输入同源，稳定）。
-        //   full path 是 stage1（第一次真正发送边界）→ preflightDoneForCycle=false。
-        const preflightCheck = await checkAndRunPreflight({
-          sessionKey, chatId,
-          mapping,
-          state: turn.state,
-          config,
-          tokenEstimate,
-          usageState: cached.hostMetadata.usageState as UsageManagerState | undefined,
-          preflightDoneForCycle: false,
-        });
-        preflightTriggered = preflightCheck.triggered;
-        preflightStillOver = preflightCheck.stillOverHard;
-        preflightRounds = preflightCheck.rounds;
-        emergencyFreedTokens += preflightCheck.freedTokens;
-        if (preflightCheck.folded) {
-          autoFolded = true;
-          turn.state = preflightCheck.nextState;
-          // —— 压缩后必须 rebuild projection（投影含占位）。
-          const turn2 = core.processTurn({ messages: mapping.messages, state: turn.state, config, tokenCount: tokenEstimate, renderTags: "none" });
-          projectedMessages = turn2.messages;
-          if (settings.hideConsumedCompressCalls && turn2.state.blocks.length > 0) {
-            try { projectedMessages = kernelHideConsumedCompressCalls(turn2.state, turn2.messages).messages; } catch { /* noop */ }
-          }
-          const projTurns2 = coreMessagesToPromptTurns(projectedMessages, mapping.byKey);
-          projectedTurns.length = 0;
-          projectedTurns.push(...projTurns2);
-          turn.state = turn2.state;
-          // —— 压缩结果可视化（对齐 billion-context 的"压缩完成"反馈）。
-          const newBlocks = turn2.state.blocks.length - cached.kernelState.blocks.length;
-          if (newBlocks > 0) {
-            const tokensFreed = (turn2.state.stats?.tokensCompressed ?? 0) - (cached.kernelState.stats?.tokensCompressed ?? 0);
-            projectedTurns.push({
-              kind: "SYSTEM",
-              content: `上下文压缩完成：已将 ${newBlocks} 段较早的对话折叠为摘要，释放约 ${tokensFreed} tokens 空间。如需查看被压缩的原文可调用 decompress。`,
-              metadata: { acpFoldNotice: true },
-            });
-          }
-        }
+        // —— V0.7.6：删除 preflight/safety-emergency 自动折叠（对齐 billion-context 原版语义：
+        //   pressure decision ≠ compression execution）。
+        //   硬限（hardLimitPct）只作为 forcedThresholdPct 传入 evaluatePressure →
+        //   产生 forced nudge（绕过 growth/cadence/credit 的强提示），绝不自动压缩历史。
+        //   压缩只由模型主动调用 compress 工具执行。
 
         // —— V0.7.1：UsageManager 前置创建（emergency credit 与 effective pressure 共用）。
         // —— V0.7.3：统一走 collectAndEvaluatePressure（usage sampling + pressure + ledger 一体化，
@@ -1136,49 +711,6 @@ export function createEngine(dataDir?: string): AcpEngine {
         const hopNo = (((cached.hostMetadata.usageState as UsageManagerState | undefined)?.lastHop) ?? 0) + 1; // V0.7.2 per-hop 计数
         const nextStats: AcpRuntimeStats = { ...prevStats };
         const newBlockIds = turn.state.blocks.filter((b) => !cached.kernelState.blocks.some((pb) => pb.blockId === b.blockId)).map((b) => b.blockId);
-        // —— V0.7.4：preflight 与 safety-emergency 统计分离。
-        //   preflight-over-hard：新一轮发送前超硬限 → 主动压缩成功（插件自愈）。
-        //   safety-emergency：preflight 压缩后仍超 / preflight 失败 / 本周期已 preflight
-        //     仍超 → 最终兜底（发 emergency nudge 让模型立即 compress，不强制改 preparedHistory）。
-        if (preflightTriggered) {
-          nextStats.preflightTriggered += 1;
-          if (autoFolded && newBlockIds.length > 0) {
-            nextStats.preflightSucceeded += 1;
-            nextStats.preflightSavedTokens += emergencyFreedTokens;
-            nextStats.lastCompressSource = "preflight";
-            nextStats.lastCompressAt = Date.now();
-            // ACP Trace：preflight-over-hard 自愈折叠
-            chatTrace(chatId, {
-              type: "preflight",
-              level: "preflight-over-hard",
-              detail: { blocks: newBlockIds.length, tokens: emergencyFreedTokens, rounds: preflightRounds, stillOverHard: preflightStillOver },
-            });
-          } else {
-            // preflight 未折叠或压缩后仍超 → 计入 safety-emergency（本周期已 preflight）。
-            nextStats.preflightFailed += 1;
-            nextStats.safetyEmergencyTriggered += 1;
-            nextStats.emergencyTriggered += 1;
-            nextStats.lastCompressSource = "emergency";
-            nextStats.lastCompressAt = Date.now();
-            chatTrace(chatId, {
-              type: "emergency",
-              level: "safety-emergency",
-              detail: { blocks: newBlockIds.length, tokens: emergencyFreedTokens, preflightRounds, stillOverHard: preflightStillOver, context: preflightCheck.trigger?.effectiveTokens ?? tokenEstimate, hard: preflightCheck.trigger?.hardLimitTokens ?? Math.round(config.modelContextLimit * settings.hardLimitPct) },
-            });
-          }
-          // V0.4.1 usage credit：压缩完成当轮 usage 为基准，credit 内免打扰。
-          // V0.7.1 修复：基准必须取"压缩后投影低位"，而非压缩前全量 tokenEstimate。
-          //   根因：emergency 压缩发生在 tokenEstimate 计算之后，tokenEstimate 仍是
-          //   压缩前全量估算（实测某会话 267,446），而压缩后窗口仅 2.2万~15.4万，
-          //   于是 credit 判定 `creditBase+30k - tokenEstimate` 恒 > 0 → 永久免打扰，
-          //   导致上下文涨到几百万 token 也无任何 nudge（另一会话实测 6.2 亿 token 全程静默）。
-          const postCovered = collectCoveredMessageIds(turn.state);
-          const postEstimate = estimateProjectionTokens(projectedMessages, postCovered);
-          nextStats.creditBaseToken = Math.min(tokenEstimate, postEstimate) || tokenEstimate;
-          nextStats.creditRemaining = settings.usageCreditTokens;
-          // —— V0.7.1：compression credit 独立字段（不再兼任 creditBaseToken；折叠量入 credit）。
-          //   实际 credit 发放统一在下方 um2（collectAndEvaluatePressure 返回的 usageManager）。
-        }
         // nudge 状态机（Adapter 层 Continuous Pressure Controller）：V0.7
         //  - 取消 kernelShouldInject 作为硬总门，只作辅助 signal
         //  - effective pressure：usage 缺失/为0 用 estimate 兜底
@@ -1192,9 +724,7 @@ export function createEngine(dataDir?: string): AcpEngine {
         //   hard-limit 状态全是压缩前旧值 → 违反"compress → rebuild projection →
         //   re-estimate → resample host → recompute effective → recompute pressure"。
         //   故：autoFolded 时用压缩后投影重新估算 tokenEstimate 作为本 Hop 的发送视图。
-        const sendEstimate = autoFolded
-          ? estimateProjectionTokens(projectedMessages, collectCoveredMessageIds(turn.state))
-          : tokenEstimate;
+        const sendEstimate = tokenEstimate;
         const prevNudgeState = cached.hostMetadata.acpNudge ?? {};
         const { pressure, eff, pressurePct, usageManager: um2 } = await collectAndEvaluatePressure({
           sessionKey, chatId,
@@ -1209,22 +739,14 @@ export function createEngine(dataDir?: string): AcpEngine {
           config, settings,
           hopNo,
         });
-        // emergency 已发生的 credit 发放要并入 um2（collectAndEvaluatePressure 内部新建了
-        // 自己的 usageManager，但 credit 已通过 nextStats.creditBaseToken 传递；
-        // 为避免丢失 emergency credit，把 usageManager 的 credit 合并到 um2）。
-        if (autoFolded && newBlockIds.length > 0) {
-          try { um2.applyCompressionCredit(emergencyFreedTokens); } catch { /* noop */ }
-        }
         const nextNudgeState: Record<string, unknown> = {
           ...pressure.nextNudgeState,
           // 持久化 epoch 到 acpNudge（跨轮/跨 VM 恢复压力档位）
           ...(pressure.nextEpoch ? { acpEpoch: pressure.nextEpoch } : {}),
         };
-
         // nudge 档位：pressure controller 输出（无注入时按 usage 兜底算档位供 stats）
         const level: NudgeLevel = pressure.level ??
-          (preflightTriggered && preflightStillOver ? "emergency"
-            : pressurePct >= settings.strongThresholdPct ? "strong"
+          (pressurePct >= settings.strongThresholdPct ? "strong"
             : pressurePct >= settings.gentleThresholdPct ? "gentle"
             : "gentle");
 
@@ -1259,8 +781,7 @@ export function createEngine(dataDir?: string): AcpEngine {
           kernelState: turn.state,
           hostMetadata: {
             ...cached.hostMetadata,
-            // V0.7.4：preflight 折叠改变了 kernelState → stateVersion 递增，旧投影失效。
-            stateVersion: (cached.hostMetadata.stateVersion ?? 0) + (autoFolded ? 1 : 0),
+            stateVersion: cached.hostMetadata.stateVersion ?? 0,
             lastProjectionFingerprint: fingerprint,
             toolLoopCoverage: "main-request-only",
             lastUpdatedAt: Date.now(),
@@ -1272,25 +793,6 @@ export function createEngine(dataDir?: string): AcpEngine {
             // V0.7.1：usage 事实持久化（estimate/actual/host/compressionCredit，per-session）
             usageState: um2.snapshot(),
             absorbCandidates: nextAbsorbCandidates,
-            blockSources: {
-              ...(cached.hostMetadata.blockSources ?? {}),
-              // 新 emergency block 标记来源；保留历史标记。
-              ...(autoFolded && newBlockIds.length > 0
-                ? Object.fromEntries(newBlockIds.map((id) => [id, (preflightTriggered ? "preflight" : "emergency")]))
-                : {}),
-            },
-            // V0.7.4：本周期 preflight 标记（stage2 复用判断；同 fingerprint 视为同一发送周期）。
-            preflightCycleDone: preflightTriggered,
-            preflightCycleFingerprint: fingerprint,
-            lastPreflight: preflightTriggered ? {
-              at: Date.now(),
-              rounds: preflightRounds,
-              freedTokens: emergencyFreedTokens,
-              stillOverHard: preflightStillOver,
-              contextTokens: preflightCheck.trigger?.effectiveTokens ?? tokenEstimate,
-              hardLimitTokens: preflightCheck.trigger?.hardLimitTokens ?? Math.round(config.modelContextLimit * settings.hardLimitPct),
-              source: "full",
-            } : cached.hostMetadata.lastPreflight,
           },
         };
         // 写内存投影缓存 + raw turns 缓存（save 剥离不落盘）。
@@ -1306,7 +808,7 @@ export function createEngine(dataDir?: string): AcpEngine {
           const nudgeReason = turn.nudge?.reason ? turn.nudge.reason.slice(0, 120) : "(kernel:no-nudge)";
           const gateInfo = `allow=${pressure.allowInject ? 1 : 0} kShould=${turn.nudge?.shouldInject ? 1 : 0} reason=${pressure.decisionReason} eff=${Math.round(pressurePct * 100)}% src=${eff.source}`;
           const st = nextStats;
-          console.log(`[acp] project stage=${hookStage} chat=${chatId ? String(chatId).slice(0, 8) : "-"} sub=${isSubTask ? 1 : 0} fp=${fingerprint.slice(0, 12)} raw=${turns.length} proj=${cappedTurns.length} blocks=${active}/${turn.state.blocks.length} tok=${sendEstimate}${autoFolded ? ` preflight=${preflightRounds}r freed=${emergencyFreedTokens}` : ""} saved=${(cached.kernelState.stats?.tokensCompressed ?? 0) - (turn.state.stats?.tokensCompressed ?? 0)} nudge=${gateInfo} stats={n:${st.nudgeIssued},m:${st.compressSucceeded},e:${st.emergencyTriggered},pf:${st.preflightTriggered}} ${nudgeReason}`);
+          console.log(`[acp] project stage=${hookStage} chat=${chatId ? String(chatId).slice(0, 8) : "-"} sub=${isSubTask ? 1 : 0} fp=${fingerprint.slice(0, 12)} raw=${turns.length} proj=${cappedTurns.length} blocks=${active}/${turn.state.blocks.length} tok=${sendEstimate} saved=${(cached.kernelState.stats?.tokensCompressed ?? 0) - (turn.state.stats?.tokensCompressed ?? 0)} nudge=${gateInfo} stats={n:${st.nudgeIssued},m:${st.compressSucceeded},e:${st.emergencyTriggered}} ${nudgeReason}`);
           // ACP Trace：投影事件（含 pressure 决策原因 + V0.7.1 多源 token 指标）
           chatTrace(chatId, {
             type: "project", stage: hookStage,
@@ -1321,8 +823,6 @@ export function createEngine(dataDir?: string): AcpEngine {
               effPct: Math.round(pressurePct * 100),
               level, nudgeAllow: pressure.allowInject, reason: pressure.decisionReason,
               source: eff.source, confidence: eff.confidence,
-              emergency: autoFolded,
-              preflight: preflightTriggered ? { rounds: preflightRounds, freed: emergencyFreedTokens, stillOverHard: preflightStillOver, context: preflightCheck.trigger?.effectiveTokens ?? tokenEstimate, hard: preflightCheck.trigger?.hardLimitTokens ?? Math.round(config.modelContextLimit * settings.hardLimitPct) } : undefined,
             },
           });
         } catch { /* noop */ }

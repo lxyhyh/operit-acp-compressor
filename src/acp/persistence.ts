@@ -31,20 +31,10 @@ export interface AcpRuntimeStats {
   emergencySavedTokens: number;
   /** 模型主动压缩释放 token。 */
   modelSavedTokens: number;
-  /** V0.7.4：preflight-over-hard 主动自愈压缩次数（新一轮发送前超硬限）。 */
-  preflightTriggered: number;
-  /** V0.7.4：preflight 成功次数。 */
-  preflightSucceeded: number;
-  /** V0.7.4：preflight 失败（压缩后仍超硬限 → 进入 safety-emergency）次数。 */
-  preflightFailed: number;
-  /** V0.7.4：preflight 释放 token。 */
-  preflightSavedTokens: number;
-  /** V0.7.4：safety-emergency（preflight 失败后的最终兜底）触发次数。 */
-  safetyEmergencyTriggered: number;
   /** nudge 后经历轮数（用于算 ignore 率）。 */
   nudgeIgnored: number;
-  /** 最近一次 compress 来源（model/emergency/preflight）。 */
-  lastCompressSource?: "model" | "emergency" | "preflight";
+  /** 最近一次 compress 来源（model/emergency）。 */
+  lastCompressSource?: "model" | "emergency";
   lastCompressAt?: number;
   /** V0.4.1 usage credit：compress 后 N token 内免除 nudge（防刚压缩又提醒）。 */
   creditUntilToken?: number;
@@ -65,11 +55,6 @@ export const EMPTY_RUNTIME_STATS: AcpRuntimeStats = {
   emergencyTriggered: 0,
   emergencySavedTokens: 0,
   modelSavedTokens: 0,
-  preflightTriggered: 0,
-  preflightSucceeded: 0,
-  preflightFailed: 0,
-  preflightSavedTokens: 0,
-  safetyEmergencyTriggered: 0,
   nudgeIgnored: 0,
 };
 
@@ -109,22 +94,8 @@ export interface OperitAcpSessionState {
     };
     /** V0.7.2：最近一次真实 chatId（hook 链路记录；供 applyCompression 按真实 chatId 查 host DB）。 */
     lastChatId?: string;
-    /** V0.4：block 来源映射 blockId → model | emergency | preflight（搜索/统计用）。 */
-    blockSources?: Record<string, "model" | "emergency" | "preflight">;
-    /** V0.7.4：本 send 周期（同 fingerprint 发送周期）是否已执行过 preflight（防 stage2 重复压缩）。 */
-    preflightCycleDone?: boolean;
-    /** V0.7.4：preflightCycleDone 对应的 fingerprint（跨轮重置：新 fingerprint 视为新一轮）。 */
-    preflightCycleFingerprint?: string;
-    /** V0.7.4：最近一次 preflight 触发信息（stage2 复用判断 + UI trace）。 */
-    lastPreflight?: {
-      at: number;
-      rounds: number;
-      freedTokens: number;
-      stillOverHard: boolean;
-      contextTokens: number;
-      hardLimitTokens: number;
-      source: "full" | "incremental" | "cache" | "stage2";
-    };
+    /** V0.4：block 来源映射 blockId → model | emergency（搜索/统计用）。 */
+    blockSources?: Record<string, "model" | "emergency">;
     /** V0.6 Phase3.1：巨型工具输出 absorb 候选（持久化，跨 Hop 幂等）。 */
     absorbCandidates?: AbsorbCandidate[];
   };

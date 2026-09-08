@@ -1,19 +1,22 @@
 /**
- * acp/pressure.ts — V0.7 Continuous Per-Hop Pressure Controller。
+ * acp/pressure.ts — V0.7.6 Pressure Controller（对齐 billion-context 原版 kernel）。
  *
- * 设计对齐文档（billion-context continuous per-Hop pressure control）：
- * - 取消 kernelShouldInject 作为"硬总门"，只作为辅助 signal
- * - effective pressure：usage 缺失/为0 时不视为 0 压力（用 estimate 兜底）
- * - cooldown 只防 gentle 刷屏；strong/emergency 必须能 bypass cooldown
- * - usage credit 只抑制 gentle；strong/emergency bypass credit
- * - pressure epoch 支持无限连续（压缩成功关 epoch，再增长开新 epoch）
- * - compression baseline 记录，判断"tokens since compression"
- * - 压力档位单调升级（仅一个 epoch 内）
- * - hostEscalationFloor：约 0.70 允许 Adapter 自接管沉默区（配合增长条件防 spam）
- * - 每个决策都产出明确 decisionReason（供 trace/日志直接回答"为何不 nudge"）
+ * V0.7.6 语义（用户需求文档：pressure decision ≠ compression execution）：
+ * - 四档决策：NONE / GENTLE_NUDGE / STRONG_NUDGE / FORCED_NUDGE。
+ *   FORCED_NUDGE = 达到 maxContextLimit（原 maxContextLimitPct 阈值）后触发，
+ *   绕过 growth/cadence/credit 的静默机制 —— 但只改变 nudge 强度，不改变 executor。
+ * - 所有压缩只由模型主动调用 compress 工具执行（applyCompression）；
+ *   插件绝不因 usage 超限自动折叠整个历史。
+ * - emergency 语义只保留给巨型 TOOL_RESULT（absorb 建议 / truncate），
+ *   不再表示"历史压缩档位"。
+ * - pressure epoch 支持无限连续（压缩成功关 epoch，再增长开新 epoch）。
+ * - 每个决策都产出明确 decisionReason（供 trace/日志直接回答"为何不 nudge"）。
  */
 
-export type NudgeLevel = "gentle" | "strong" | "emergency" | "none";
+export type NudgeLevel = "gentle" | "strong" | "forced" | "none";
+
+/** 超过 maxContextLimitPct 后使用 forced 档（对齐 kernel overLimit 分支）。 */
+export const FORCED_LEVEL: Exclude<NudgeLevel, "none"> = "forced";
 
 /** pressure epoch（存 hostMetadata.acpNudge.acpEpoch，跨 Hop/跨 VM 恢复）。 */
 export interface PressureEpoch {
@@ -33,30 +36,36 @@ export function computePressureLevel(input: {
   usagePct: number;
   gentleThresholdPct: number;
   strongThresholdPct: number;
-  emergencyThresholdPct: number;
+  forcedThresholdPct: number;
   epoch?: PressureEpoch;
 }): NudgeLevel {
-  const base: NudgeLevel = input.usagePct >= input.emergencyThresholdPct ? "emergency"
+  const base: NudgeLevel = input.usagePct >= input.forcedThresholdPct ? "forced"
     : input.usagePct >= input.strongThresholdPct ? "strong"
     : input.usagePct >= input.gentleThresholdPct ? "gentle"
     : "none";
   if (base === "none") return "none";
   if (!input.epoch || input.epoch.closed) return base;
-  const order: Array<Exclude<NudgeLevel, "none">> = ["gentle", "strong", "emergency"];
+  const order: Array<Exclude<NudgeLevel, "none">> = ["gentle", "strong", "forced"];
   const curIdx = order.indexOf(input.epoch.maxLevel);
   const baseIdx = order.indexOf(base as Exclude<NudgeLevel, "none">);
   return order[Math.max(curIdx, baseIdx)] ?? base;
 }
 
-/** strong/emergency 必须升级（不受 cooldown/credit 抑制）。 */
+/** strong/forced 必须升级（不受 cooldown/credit 抑制）。 */
 export function shouldEscalate(usagePct: number, strongThresholdPct: number): boolean {
   return usagePct >= strongThresholdPct;
+}
+
+/** forced：达到 maxContextLimit 后无条件注入（绕过 growth/cadence/credit）。 */
+export function isForced(usagePct: number, forcedThresholdPct: number): boolean {
+  return usagePct >= forcedThresholdPct;
 }
 
 /**
  * evaluatePressureInner：Continuous Pressure Controller 内部实现。
  * 返回是否注入 + 档位 + nextEpoch + decisionReason。
  * V0.7.1：effectiveTokens/pressurePct/source 由导出包装统一附加。
+ * V0.7.6：档位改 gentle/strong/forced；forced 绕过 growth/cadence/credit。
  */
 function evaluatePressureInner(input: {
   usagePct: number;
@@ -70,7 +79,7 @@ function evaluatePressureInner(input: {
   // 阈值
   gentleThresholdPct: number;
   strongThresholdPct: number;
-  emergencyThresholdPct: number;
+  forcedThresholdPct: number;
   hostEscalationFloor: number;
   // 冷却（只防 gentle）
   nudgeCooldownTurns: number;
@@ -97,7 +106,6 @@ function evaluatePressureInner(input: {
     nudgeCount: input.nudgeCount,
     lastTokensAtInject: input.lastTokensAtInject,
   };
-  const emergency = /EMERGENCY/i.test(input.kernelReason);
   const prevEpoch = input.prevEpoch;
   const usage = input.usagePct;
 
@@ -130,7 +138,7 @@ function evaluatePressureInner(input: {
     usagePct: usage,
     gentleThresholdPct: input.gentleThresholdPct,
     strongThresholdPct: input.strongThresholdPct,
-    emergencyThresholdPct: input.emergencyThresholdPct,
+    forcedThresholdPct: input.forcedThresholdPct,
     epoch: prevEpoch && !prevEpoch.closed ? prevEpoch : undefined,
   });
 
@@ -144,15 +152,17 @@ function evaluatePressureInner(input: {
   };
 
   const escalate = shouldEscalate(usage, input.strongThresholdPct);
+  const forced = isForced(usage, input.forcedThresholdPct);
 
-  // 4) 紧急：无条件注入（bypass 一切）。
-  if (emergency || usage >= input.emergencyThresholdPct) {
+  // 4) forced：达到 maxContextLimit/hard 后无条件注入（绕过 growth/cadence/credit）。
+  //    —— 只改变 nudge 强度，不改变 executor（对齐 kernel overLimit 分支）。
+  if (forced) {
     return {
       allowInject: true,
-      level: "emergency",
+      level: "forced",
       nextEpoch,
       nextNudgeState: { lastInjectedAt: Date.now(), nudgeCount: prev.nudgeCount + 1, lastTokensAtInject: input.tokenEstimate },
-      decisionReason: "emergency-unconditional",
+      decisionReason: "forced-bypassed-growth-cadence-credit",
     };
   }
 
@@ -255,55 +265,4 @@ export function evaluatePressure(input: PressureInput): PressureDecision {
     effectiveTokens: input.effectiveTokens,
     source: input.source,
   };
-}
-
-// ═══════════════ V0.7.4：Preflight Over-Hard 决策 ═══════════════
-
-/**
- * 压缩动作分类（V0.7.4 语义，明确区分）：
- * - pressure-gentle / pressure-strong：正常持续上下文管理（nudge，模型主动 compress）
- * - preflight-over-hard：新一轮发送前发现 effective 已超 hard limit → 主动自愈压缩
- * - safety-emergency：preflight 压缩失败 / 压缩后仍严重超窗 / 本周期已压仍超 → 最终兜底
- * 注意：preflight 不通过本类型返回——它由 evaluatePreflight 判定后由 Adapter 执行折叠；
- *       pressure-gentle/strong 仍由 evaluatePressure 产出（NudgeLevel）。
- */
-export type CompressionAction =
-  | { kind: "none" }
-  | { kind: "preflight-over-hard"; hardLimitTokens: number; effectiveTokens: number }
-  | { kind: "safety-emergency"; hardLimitTokens: number; effectiveTokens: number };
-
-/**
- * V0.7.4：evaluatePreflight —— 新一轮发送前的安全自愈触发条件。
- *
- * 语义（用户需求 4/5/6/12）：
- * - Hard Limit = 新一轮发送前的安全自愈触发条件，不是普通 Hop 的即时强制折叠阈值。
- * - effectiveTokens <= hardLimitTokens：不触发（正常 gentle/strong pressure 管理）。
- * - effectiveTokens >  hardLimitTokens 且本 send 周期未 preflight → preflight-over-hard
- *   （主动压缩一次，压缩后重新评估）。
- * - effectiveTokens >  hardLimitTokens 且本 send 周期已 preflight（压缩后仍超）→
- *   safety-emergency（最终兜底，不再无限循环压缩）。
- *
- * 纯函数：可单测；不触碰 UsageManager / HostUsageAdapter（由调用方采样后传入）。
- */
-export function evaluatePreflight(input: {
-  effectiveTokens: number;
-  modelContextLimit: number;
-  hardLimitPct: number;
-  /** 本 send 周期是否已执行过一次 preflight compression（防同轮内无限压缩）。 */
-  preflightDoneForCycle?: boolean;
-}): { action: CompressionAction; hardLimitTokens: number } {
-  const hardLimitTokens = Math.round(input.modelContextLimit * input.hardLimitPct);
-  if (input.effectiveTokens > hardLimitTokens) {
-    if (input.preflightDoneForCycle) {
-      return {
-        action: { kind: "safety-emergency", hardLimitTokens, effectiveTokens: input.effectiveTokens },
-        hardLimitTokens,
-      };
-    }
-    return {
-      action: { kind: "preflight-over-hard", hardLimitTokens, effectiveTokens: input.effectiveTokens },
-      hardLimitTokens,
-    };
-  }
-  return { action: { kind: "none" }, hardLimitTokens };
 }

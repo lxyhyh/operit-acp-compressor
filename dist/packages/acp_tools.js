@@ -3416,11 +3416,6 @@ var EMPTY_RUNTIME_STATS = {
   emergencyTriggered: 0,
   emergencySavedTokens: 0,
   modelSavedTokens: 0,
-  preflightTriggered: 0,
-  preflightSucceeded: 0,
-  preflightFailed: 0,
-  preflightSavedTokens: 0,
-  safetyEmergencyTriggered: 0,
   nudgeIgnored: 0
 };
 var ADAPTER_STATE_VERSION = 2;
@@ -3642,10 +3637,10 @@ function markAbsorbed(candidates, ref) {
 
 // src/acp/pressure.ts
 function computePressureLevel(input) {
-  const base = input.usagePct >= input.emergencyThresholdPct ? "emergency" : input.usagePct >= input.strongThresholdPct ? "strong" : input.usagePct >= input.gentleThresholdPct ? "gentle" : "none";
+  const base = input.usagePct >= input.forcedThresholdPct ? "forced" : input.usagePct >= input.strongThresholdPct ? "strong" : input.usagePct >= input.gentleThresholdPct ? "gentle" : "none";
   if (base === "none") return "none";
   if (!input.epoch || input.epoch.closed) return base;
-  const order = ["gentle", "strong", "emergency"];
+  const order = ["gentle", "strong", "forced"];
   const curIdx = order.indexOf(input.epoch.maxLevel);
   const baseIdx = order.indexOf(base);
   return order[Math.max(curIdx, baseIdx)] ?? base;
@@ -3653,13 +3648,15 @@ function computePressureLevel(input) {
 function shouldEscalate(usagePct, strongThresholdPct) {
   return usagePct >= strongThresholdPct;
 }
+function isForced(usagePct, forcedThresholdPct) {
+  return usagePct >= forcedThresholdPct;
+}
 function evaluatePressureInner(input) {
   const prev = {
     lastInjectedAt: input.lastInjectedAt,
     nudgeCount: input.nudgeCount,
     lastTokensAtInject: input.lastTokensAtInject
   };
-  const emergency = /EMERGENCY/i.test(input.kernelReason);
   const prevEpoch = input.prevEpoch;
   const usage = input.usagePct;
   if (input.curBlocks > input.prevBlocks) {
@@ -3683,7 +3680,7 @@ function evaluatePressureInner(input) {
     usagePct: usage,
     gentleThresholdPct: input.gentleThresholdPct,
     strongThresholdPct: input.strongThresholdPct,
-    emergencyThresholdPct: input.emergencyThresholdPct,
+    forcedThresholdPct: input.forcedThresholdPct,
     epoch: prevEpoch && !prevEpoch.closed ? prevEpoch : void 0
   });
   const epochActive = prevEpoch && !prevEpoch.closed;
@@ -3695,13 +3692,14 @@ function evaluatePressureInner(input) {
     closed: false
   };
   const escalate = shouldEscalate(usage, input.strongThresholdPct);
-  if (emergency || usage >= input.emergencyThresholdPct) {
+  const forced = isForced(usage, input.forcedThresholdPct);
+  if (forced) {
     return {
       allowInject: true,
-      level: "emergency",
+      level: "forced",
       nextEpoch,
       nextNudgeState: { lastInjectedAt: Date.now(), nudgeCount: prev.nudgeCount + 1, lastTokensAtInject: input.tokenEstimate },
-      decisionReason: "emergency-unconditional"
+      decisionReason: "forced-bypassed-growth-cadence-credit"
     };
   }
   if (escalate) {
@@ -3758,22 +3756,6 @@ function evaluatePressure(input) {
     effectiveTokens: input.effectiveTokens,
     source: input.source
   };
-}
-function evaluatePreflight(input) {
-  const hardLimitTokens = Math.round(input.modelContextLimit * input.hardLimitPct);
-  if (input.effectiveTokens > hardLimitTokens) {
-    if (input.preflightDoneForCycle) {
-      return {
-        action: { kind: "safety-emergency", hardLimitTokens, effectiveTokens: input.effectiveTokens },
-        hardLimitTokens
-      };
-    }
-    return {
-      action: { kind: "preflight-over-hard", hardLimitTokens, effectiveTokens: input.effectiveTokens },
-      hardLimitTokens
-    };
-  }
-  return { action: { kind: "none" }, hardLimitTokens };
 }
 
 // src/acp/token-source.ts
@@ -4049,38 +4031,6 @@ function cacheSetLimited(map, key, value) {
     if (oldest !== void 0) map.delete(oldest);
   }
 }
-function isNoiseText(text) {
-  const t = (text ?? "").trimStart();
-  if (!t) return false;
-  if (t.startsWith("[ACP]") || t.startsWith("[ACP ") || t.startsWith("[Compressed conversation section]")) return true;
-  if (t.startsWith('{"main"')) return true;
-  return false;
-}
-function buildDeterministicSummary(seg, maxLen = 6e3, perMsg = 120) {
-  const lines = [];
-  let total = 0;
-  for (let i = 0; i < seg.length; i++) {
-    const m = seg[i];
-    const text = (m.text ?? "").trim();
-    if (!text || isNoiseText(text)) continue;
-    const who = m.role === "assistant" ? "\u52A9\u624B" : m.role === "user" ? "\u7528\u6237" : m.role ?? "\u6D88\u606F";
-    let excerpt = text.slice(0, perMsg);
-    const cut = excerpt.search(/[。！？!?\n]/);
-    if (cut > 10) excerpt = excerpt.slice(0, cut + 1);
-    const line = `[${i + 1}] ${who}: ${excerpt}`;
-    if (total + line.length > maxLen) break;
-    lines.push(line);
-    total += line.length;
-  }
-  return lines.join("\n");
-}
-function messageForRef(messages, byRef, byKey, ref) {
-  const key = byRef ? byRef[ref] : void 0;
-  if (key && byKey.has(key)) {
-    return messages.find((m) => m.id === key);
-  }
-  return void 0;
-}
 function computeFingerprint(sessionKey, turns, config) {
   let h = "";
   for (const t of turns) {
@@ -4127,7 +4077,7 @@ function createEngine(dataDir) {
       curBlocks: opts.curBlocks,
       gentleThresholdPct: opts.settings.gentleThresholdPct,
       strongThresholdPct: opts.settings.strongThresholdPct,
-      emergencyThresholdPct: opts.settings.hardLimitPct,
+      forcedThresholdPct: opts.settings.hardLimitPct,
       hostEscalationFloor: opts.settings.hostEscalationFloor,
       nudgeCooldownTurns: opts.settings.nudgeCooldownTurns,
       nudgeGrowthFloor: opts.settings.nudgeGrowthFloor,
@@ -4153,117 +4103,6 @@ function createEngine(dataDir) {
     } catch {
     }
     return { pressure, eff, pressurePct, usageManager, hostTokens, nextStats };
-  }
-  async function runPreflight(opts) {
-    const maxRounds = 3;
-    let curState = opts.state;
-    let freed = 0;
-    let rounds = 0;
-    for (let round = 0; round < maxRounds; round++) {
-      const curTurn = core.processTurn({
-        messages: opts.mapping.messages,
-        state: curState,
-        config: opts.config,
-        tokenCount: opts.tokenEstimate,
-        renderTags: "none"
-      });
-      const curCovered = collectCoveredMessageIds(curState);
-      const curEstimate = estimateProjectionTokens(curTurn.messages, curCovered);
-      const stillOver = curEstimate > opts.trigger.hardLimitTokens;
-      if (!stillOver) break;
-      const ranges = (curTurn.nudge?.compressibleRanges ?? []).filter((r) => r.startRef && r.endRef).sort((a, b) => (b.tokens ?? 0) - (a.tokens ?? 0)).slice(0, 2);
-      if (ranges.length === 0) break;
-      try {
-        const applied = core.applyCompression({
-          ranges: ranges.map((r) => {
-            const byRef = curState.messageRefs?.byRef ?? {};
-            const startMsg = messageForRef(opts.mapping.messages, byRef, opts.mapping.byKey, r.startRef);
-            const endMsg = messageForRef(opts.mapping.messages, byRef, opts.mapping.byKey, r.endRef);
-            const startIdx = startMsg ? opts.mapping.messages.indexOf(startMsg) : -1;
-            const endIdx = endMsg ? opts.mapping.messages.indexOf(endMsg) : -1;
-            const lo = startIdx >= 0 ? startIdx : 0;
-            const hi = endIdx >= startIdx ? endIdx : Math.min(opts.mapping.messages.length - 1, lo + 200);
-            const seg = lo >= 0 ? opts.mapping.messages.slice(lo, hi + 1) : [];
-            const excerpt = seg.length > 0 ? buildDeterministicSummary(seg) : "";
-            const summary = excerpt.length > 0 ? `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${seg.length} \u6761\u6D88\u606F\u7684\u538B\u7F29\u6458\u8981\uFF08\u9700\u8981\u539F\u6587\u53EF\u8C03\u7528 decompress \u6062\u590D\uFF09\uFF1A
-${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo + 1)} \u6761\u6D88\u606F\u56E0\u8D85\u51FA\u4E0A\u4E0B\u6587\u7A97\u53E3\u4E0A\u9650\u5DF2\u88AB\u81EA\u52A8\u6298\u53E0\u538B\u7F29\uFF0C\u5173\u952E\u4FE1\u606F\u4E0E\u7ED3\u8BBA\u5DF2\u5C3D\u91CF\u4FDD\u7559\u5728\u6458\u8981\u4E2D\uFF0C\u5982\u9700\u67E5\u770B\u539F\u6587\u53EF\u968F\u65F6\u8C03\u7528 decompress \u5DE5\u5177\u6062\u590D\u5BF9\u5E94 block\u3002`;
-            return { startRef: r.startRef, endRef: r.endRef, summary, topic: "\u65E9\u671F\u5BF9\u8BDD\uFF08\u81EA\u52A8\u6298\u53E0\uFF09" };
-          }),
-          messages: opts.mapping.messages,
-          state: curState,
-          config: opts.config
-        });
-        if (applied.result.blocksCreated > 0) {
-          curState = applied.state;
-          freed += applied.result.tokensCompressed;
-          rounds++;
-          continue;
-        }
-        break;
-      } catch {
-        break;
-      }
-    }
-    const finalCovered = collectCoveredMessageIds(curState);
-    const finalEstimate = estimateProjectionTokens(
-      core.processTurn({ messages: opts.mapping.messages, state: curState, config: opts.config, tokenCount: opts.tokenEstimate, renderTags: "none" }).messages,
-      finalCovered
-    );
-    const stillOverHard = finalEstimate > opts.trigger.hardLimitTokens;
-    return { folded: freed > 0, freedTokens: freed, rounds, nextState: curState, stillOverHard };
-  }
-  async function checkAndRunPreflight(opts) {
-    const hostTokensNow = opts.chatId ? await getHostUsageAdapter().getCurrentContextTokens(String(opts.chatId)).catch(() => void 0) : void 0;
-    const um = createUsageManager(opts.usageState);
-    if (hostTokensNow !== void 0) um.recordHostUsage(hostTokensNow);
-    um.recordEstimate(opts.tokenEstimate);
-    const eff = um.getEffectiveSnapshot(opts.tokenEstimate);
-    const hardTokens = Math.round(opts.config.modelContextLimit * settings.hardLimitPct);
-    const decision = evaluatePreflight({
-      effectiveTokens: eff.effectiveTokens || opts.tokenEstimate,
-      modelContextLimit: opts.config.modelContextLimit,
-      hardLimitPct: settings.hardLimitPct,
-      preflightDoneForCycle: opts.preflightDoneForCycle
-    });
-    const action = decision.action;
-    if (action.kind === "none") {
-      return { triggered: false, folded: false, freedTokens: 0, rounds: 0, stillOverHard: false, nextState: opts.state, action };
-    }
-    const pf = await runPreflight({
-      sessionKey: opts.sessionKey,
-      chatId: opts.chatId,
-      mapping: opts.mapping,
-      state: opts.state,
-      config: opts.config,
-      tokenEstimate: opts.tokenEstimate,
-      trigger: { effectiveTokens: eff.effectiveTokens || opts.tokenEstimate, hardLimitTokens: hardTokens }
-    });
-    let nextProjection;
-    if (pf.folded) {
-      try {
-        const turn2 = core.processTurn({ messages: opts.mapping.messages, state: pf.nextState, config: opts.config, tokenCount: opts.tokenEstimate, renderTags: "none" });
-        let projMsgs = turn2.messages;
-        if (settings.hideConsumedCompressCalls && turn2.state.blocks.length > 0) {
-          try {
-            projMsgs = hideConsumedCompressCalls(turn2.state, turn2.messages).messages;
-          } catch {
-          }
-        }
-        nextProjection = coreMessagesToPromptTurns(projMsgs, opts.mapping.byKey);
-      } catch {
-      }
-    }
-    return {
-      triggered: true,
-      folded: pf.folded,
-      freedTokens: pf.freedTokens,
-      rounds: pf.rounds,
-      stillOverHard: pf.stillOverHard,
-      nextState: pf.nextState,
-      nextProjection,
-      trigger: { effectiveTokens: eff.effectiveTokens || opts.tokenEstimate, hardLimitTokens: hardTokens },
-      action
-    };
   }
   return {
     core,
@@ -4349,48 +4188,6 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           });
           const stage2Level = stage2Pressure.pressure.level ?? (stage2Pressure.pressurePct >= settings.strongThresholdPct ? "strong" : stage2Pressure.pressurePct >= settings.gentleThresholdPct ? "gentle" : "none");
           const finalPrepared = projected && Array.isArray(projected) ? [...projected] : [...turns];
-          let stage2Preflight;
-          const stage2CycleDone = cached2.hostMetadata.preflightCycleDone === true && cached2.hostMetadata.preflightCycleFingerprint === fp;
-          if (!stage2CycleDone && projected && Array.isArray(projected)) {
-            const stage2Mapping = promptTurnsToCoreMessages(projected);
-            stage2Preflight = await checkAndRunPreflight({
-              sessionKey,
-              chatId,
-              mapping: stage2Mapping,
-              state: cached2.kernelState,
-              config: config2,
-              tokenEstimate: stage2Estimate,
-              usageState: cached2.hostMetadata.usageState,
-              preflightDoneForCycle: stage2CycleDone
-            });
-            if (stage2Preflight.triggered) {
-              stage2Pressure.nextStats.preflightTriggered = (stage2Pressure.nextStats.preflightTriggered ?? 0) + 1;
-              if (stage2Preflight.folded) {
-                stage2Pressure.nextStats.preflightSucceeded = (stage2Pressure.nextStats.preflightSucceeded ?? 0) + 1;
-                stage2Pressure.nextStats.preflightSavedTokens = (stage2Pressure.nextStats.preflightSavedTokens ?? 0) + stage2Preflight.freedTokens;
-                stage2Pressure.nextStats.lastCompressSource = "preflight";
-                stage2Pressure.nextStats.lastCompressAt = Date.now();
-                if (stage2Preflight.nextProjection && stage2Preflight.nextProjection.length > 0) {
-                  finalPrepared.length = 0;
-                  finalPrepared.push(...stage2Preflight.nextProjection);
-                }
-                chatTrace(chatId, {
-                  type: "preflight",
-                  level: "preflight-over-hard",
-                  detail: { path: "stage2", blocks: 0, tokens: stage2Preflight.freedTokens, rounds: stage2Preflight.rounds, stillOverHard: stage2Preflight.stillOverHard }
-                });
-              } else {
-                stage2Pressure.nextStats.preflightFailed = (stage2Pressure.nextStats.preflightFailed ?? 0) + 1;
-                stage2Pressure.nextStats.safetyEmergencyTriggered = (stage2Pressure.nextStats.safetyEmergencyTriggered ?? 0) + 1;
-                stage2Pressure.nextStats.emergencyTriggered = (stage2Pressure.nextStats.emergencyTriggered ?? 0) + 1;
-                chatTrace(chatId, {
-                  type: "emergency",
-                  level: "safety-emergency",
-                  detail: { path: "stage2", preflightRounds: stage2Preflight.rounds, stillOverHard: stage2Preflight.stillOverHard, context: stage2Preflight.trigger?.effectiveTokens, hard: stage2Preflight.trigger?.hardLimitTokens }
-                });
-              }
-            }
-          }
           let stage2NudgeText;
           let stage2Delivery;
           if (stage2Pressure.pressure.allowInject && settings.nudgeEnabled) {
@@ -4413,11 +4210,10 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           }
           const stage2NextState = {
             adapterStateVersion: cached2.adapterStateVersion,
-            kernelState: stage2Preflight && stage2Preflight.triggered ? stage2Preflight.nextState : cached2.kernelState,
+            kernelState: cached2.kernelState,
             hostMetadata: {
               ...cached2.hostMetadata,
-              // V0.7.4：stage2 preflight 折叠改变了 kernelState → stateVersion 递增。
-              stateVersion: (cached2.hostMetadata.stateVersion ?? 0) + (stage2Preflight && stage2Preflight.triggered && stage2Preflight.folded ? 1 : 0),
+              stateVersion: cached2.hostMetadata.stateVersion ?? 0,
               lastProjectionFingerprint: cached2.hostMetadata.lastProjectionFingerprint ?? fp,
               lastUpdatedAt: Date.now(),
               ...chatId ? { lastChatId: String(chatId) } : {},
@@ -4426,21 +4222,7 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
                 ...stage2Pressure.pressure.nextEpoch ? { acpEpoch: stage2Pressure.pressure.nextEpoch } : {}
               },
               runtimeStats: stage2Pressure.nextStats,
-              usageState: stage2Pressure.usageManager.snapshot(),
-              // V0.7.4：stage2 触发了 preflight → 本周期标记（同 fingerprint 不重复）。
-              ...stage2Preflight && stage2Preflight.triggered ? {
-                preflightCycleDone: true,
-                preflightCycleFingerprint: fp,
-                lastPreflight: {
-                  at: Date.now(),
-                  rounds: stage2Preflight.rounds,
-                  freedTokens: stage2Preflight.freedTokens,
-                  stillOverHard: stage2Preflight.stillOverHard,
-                  contextTokens: stage2Preflight.trigger?.effectiveTokens ?? stage2Estimate,
-                  hardLimitTokens: stage2Preflight.trigger?.hardLimitTokens ?? Math.round(config2.modelContextLimit * settings.hardLimitPct),
-                  source: "stage2"
-                }
-              } : {}
+              usageState: stage2Pressure.usageManager.snapshot()
             }
           };
           try {
@@ -4479,48 +4261,6 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           });
           const cacheLevel = cachePressure.pressure.level ?? (cachePressure.pressurePct >= settings.strongThresholdPct ? "strong" : cachePressure.pressurePct >= settings.gentleThresholdPct ? "gentle" : "none");
           const cacheFinal = projected && Array.isArray(projected) && projected.length > 0 ? [...projected] : [...turns];
-          let cachePreflight;
-          const cacheCycleDone = cached.hostMetadata.preflightCycleDone === true && cached.hostMetadata.preflightCycleFingerprint === fingerprint;
-          if (!cacheCycleDone && projected && Array.isArray(projected) && projected.length > 0) {
-            const cacheMapping = promptTurnsToCoreMessages(projected);
-            cachePreflight = await checkAndRunPreflight({
-              sessionKey,
-              chatId,
-              mapping: cacheMapping,
-              state: cached.kernelState,
-              config,
-              tokenEstimate: cacheEstimate,
-              usageState: cached.hostMetadata.usageState,
-              preflightDoneForCycle: cacheCycleDone
-            });
-            if (cachePreflight.triggered) {
-              cachePressure.nextStats.preflightTriggered = (cachePressure.nextStats.preflightTriggered ?? 0) + 1;
-              if (cachePreflight.folded) {
-                cachePressure.nextStats.preflightSucceeded = (cachePressure.nextStats.preflightSucceeded ?? 0) + 1;
-                cachePressure.nextStats.preflightSavedTokens = (cachePressure.nextStats.preflightSavedTokens ?? 0) + cachePreflight.freedTokens;
-                cachePressure.nextStats.lastCompressSource = "preflight";
-                cachePressure.nextStats.lastCompressAt = Date.now();
-                if (cachePreflight.nextProjection && cachePreflight.nextProjection.length > 0) {
-                  cacheFinal.length = 0;
-                  cacheFinal.push(...cachePreflight.nextProjection);
-                }
-                chatTrace(chatId, {
-                  type: "preflight",
-                  level: "preflight-over-hard",
-                  detail: { path: "cache", blocks: 0, tokens: cachePreflight.freedTokens, rounds: cachePreflight.rounds, stillOverHard: cachePreflight.stillOverHard }
-                });
-              } else {
-                cachePressure.nextStats.preflightFailed = (cachePressure.nextStats.preflightFailed ?? 0) + 1;
-                cachePressure.nextStats.safetyEmergencyTriggered = (cachePressure.nextStats.safetyEmergencyTriggered ?? 0) + 1;
-                cachePressure.nextStats.emergencyTriggered = (cachePressure.nextStats.emergencyTriggered ?? 0) + 1;
-                chatTrace(chatId, {
-                  type: "emergency",
-                  level: "safety-emergency",
-                  detail: { path: "cache", preflightRounds: cachePreflight.rounds, stillOverHard: cachePreflight.stillOverHard, context: cachePreflight.trigger?.effectiveTokens, hard: cachePreflight.trigger?.hardLimitTokens }
-                });
-              }
-            }
-          }
           let cacheNudgeText;
           let cacheDelivery;
           if (cachePressure.pressure.allowInject && settings.nudgeEnabled) {
@@ -4536,11 +4276,10 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           }
           const cacheNextState = {
             adapterStateVersion: cached.adapterStateVersion,
-            kernelState: cachePreflight && cachePreflight.triggered ? cachePreflight.nextState : cached.kernelState,
+            kernelState: cached.kernelState,
             hostMetadata: {
               ...cached.hostMetadata,
-              // V0.7.4：cache hit preflight 折叠改变了 kernelState → stateVersion 递增。
-              stateVersion: (cached.hostMetadata.stateVersion ?? 0) + (cachePreflight && cachePreflight.triggered && cachePreflight.folded ? 1 : 0),
+              stateVersion: cached.hostMetadata.stateVersion ?? 0,
               lastProjectionFingerprint: fingerprint,
               lastUpdatedAt: Date.now(),
               ...chatId ? { lastChatId: String(chatId) } : {},
@@ -4549,21 +4288,7 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
                 ...cachePressure.pressure.nextEpoch ? { acpEpoch: cachePressure.pressure.nextEpoch } : {}
               },
               runtimeStats: cachePressure.nextStats,
-              usageState: cachePressure.usageManager.snapshot(),
-              // V0.7.4：cache hit 触发 preflight → 周期标记（同 fingerprint 不重复）。
-              ...cachePreflight && cachePreflight.triggered ? {
-                preflightCycleDone: true,
-                preflightCycleFingerprint: fingerprint,
-                lastPreflight: {
-                  at: Date.now(),
-                  rounds: cachePreflight.rounds,
-                  freedTokens: cachePreflight.freedTokens,
-                  stillOverHard: cachePreflight.stillOverHard,
-                  contextTokens: cachePreflight.trigger?.effectiveTokens ?? cacheEstimate,
-                  hardLimitTokens: cachePreflight.trigger?.hardLimitTokens ?? Math.round(config.modelContextLimit * settings.hardLimitPct),
-                  source: "cache"
-                }
-              } : {}
+              usageState: cachePressure.usageManager.snapshot()
             }
           };
           try {
@@ -4617,48 +4342,6 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
               });
               const incLevel = incPressure.pressure.level ?? (incPressure.pressurePct >= settings.strongThresholdPct ? "strong" : incPressure.pressurePct >= settings.gentleThresholdPct ? "gentle" : "none");
               const incFinal = [...capped];
-              let incPreflight;
-              const incCycleDone = cached.hostMetadata.preflightCycleDone === true && cached.hostMetadata.preflightCycleFingerprint === fingerprint;
-              if (!incCycleDone) {
-                const incMapping = promptTurnsToCoreMessages(capped);
-                incPreflight = await checkAndRunPreflight({
-                  sessionKey,
-                  chatId,
-                  mapping: incMapping,
-                  state: cached.kernelState,
-                  config,
-                  tokenEstimate: incEstimate,
-                  usageState: cached.hostMetadata.usageState,
-                  preflightDoneForCycle: incCycleDone
-                });
-                if (incPreflight.triggered) {
-                  incPressure.nextStats.preflightTriggered = (incPressure.nextStats.preflightTriggered ?? 0) + 1;
-                  if (incPreflight.folded) {
-                    incPressure.nextStats.preflightSucceeded = (incPressure.nextStats.preflightSucceeded ?? 0) + 1;
-                    incPressure.nextStats.preflightSavedTokens = (incPressure.nextStats.preflightSavedTokens ?? 0) + incPreflight.freedTokens;
-                    incPressure.nextStats.lastCompressSource = "preflight";
-                    incPressure.nextStats.lastCompressAt = Date.now();
-                    if (incPreflight.nextProjection && incPreflight.nextProjection.length > 0) {
-                      incFinal.length = 0;
-                      incFinal.push(...incPreflight.nextProjection);
-                    }
-                    chatTrace(chatId, {
-                      type: "preflight",
-                      level: "preflight-over-hard",
-                      detail: { path: "incremental", blocks: 0, tokens: incPreflight.freedTokens, rounds: incPreflight.rounds, stillOverHard: incPreflight.stillOverHard }
-                    });
-                  } else {
-                    incPressure.nextStats.preflightFailed = (incPressure.nextStats.preflightFailed ?? 0) + 1;
-                    incPressure.nextStats.safetyEmergencyTriggered = (incPressure.nextStats.safetyEmergencyTriggered ?? 0) + 1;
-                    incPressure.nextStats.emergencyTriggered = (incPressure.nextStats.emergencyTriggered ?? 0) + 1;
-                    chatTrace(chatId, {
-                      type: "emergency",
-                      level: "safety-emergency",
-                      detail: { path: "incremental", preflightRounds: incPreflight.rounds, stillOverHard: incPreflight.stillOverHard, context: incPreflight.trigger?.effectiveTokens, hard: incPreflight.trigger?.hardLimitTokens }
-                    });
-                  }
-                }
-              }
               let incNudgeText;
               let incDelivery;
               if (incPressure.pressure.allowInject && settings.nudgeEnabled) {
@@ -4676,11 +4359,10 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
               cacheSetLimited(rawTurnsCache, sessionKey, turns);
               const incNextState = {
                 adapterStateVersion: cached.adapterStateVersion,
-                kernelState: incPreflight && incPreflight.triggered ? incPreflight.nextState : cached.kernelState,
+                kernelState: cached.kernelState,
                 hostMetadata: {
                   ...cached.hostMetadata,
-                  // V0.7.4：incremental preflight 折叠改变了 kernelState → stateVersion 递增。
-                  stateVersion: (cached.hostMetadata.stateVersion ?? 0) + (incPreflight && incPreflight.triggered && incPreflight.folded ? 1 : 0),
+                  stateVersion: cached.hostMetadata.stateVersion ?? 0,
                   lastProjectionFingerprint: fingerprint,
                   lastUpdatedAt: Date.now(),
                   ...chatId ? { lastChatId: String(chatId) } : {},
@@ -4689,21 +4371,7 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
                     ...incPressure.pressure.nextEpoch ? { acpEpoch: incPressure.pressure.nextEpoch } : {}
                   },
                   runtimeStats: incPressure.nextStats,
-                  usageState: incPressure.usageManager.snapshot(),
-                  // V0.7.4：incremental 触发 preflight → 周期标记（同 fingerprint 不重复）。
-                  ...incPreflight && incPreflight.triggered ? {
-                    preflightCycleDone: true,
-                    preflightCycleFingerprint: fingerprint,
-                    lastPreflight: {
-                      at: Date.now(),
-                      rounds: incPreflight.rounds,
-                      freedTokens: incPreflight.freedTokens,
-                      stillOverHard: incPreflight.stillOverHard,
-                      contextTokens: incPreflight.trigger?.effectiveTokens ?? incEstimate,
-                      hardLimitTokens: incPreflight.trigger?.hardLimitTokens ?? Math.round(config.modelContextLimit * settings.hardLimitPct),
-                      source: "incremental"
-                    }
-                  } : {}
+                  usageState: incPressure.usageManager.snapshot()
                 }
               };
               try {
@@ -4756,82 +4424,11 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
         }
         let autoFolded = false;
         let emergencyFreedTokens = 0;
-        let preflightRounds = 0;
-        let preflightTriggered = false;
-        let preflightStillOver = false;
         const prevStats = { ...cached.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS };
-        const preflightCheck = await checkAndRunPreflight({
-          sessionKey,
-          chatId,
-          mapping,
-          state: turn.state,
-          config,
-          tokenEstimate,
-          usageState: cached.hostMetadata.usageState,
-          preflightDoneForCycle: false
-        });
-        preflightTriggered = preflightCheck.triggered;
-        preflightStillOver = preflightCheck.stillOverHard;
-        preflightRounds = preflightCheck.rounds;
-        emergencyFreedTokens += preflightCheck.freedTokens;
-        if (preflightCheck.folded) {
-          autoFolded = true;
-          turn.state = preflightCheck.nextState;
-          const turn2 = core.processTurn({ messages: mapping.messages, state: turn.state, config, tokenCount: tokenEstimate, renderTags: "none" });
-          projectedMessages = turn2.messages;
-          if (settings.hideConsumedCompressCalls && turn2.state.blocks.length > 0) {
-            try {
-              projectedMessages = hideConsumedCompressCalls(turn2.state, turn2.messages).messages;
-            } catch {
-            }
-          }
-          const projTurns2 = coreMessagesToPromptTurns(projectedMessages, mapping.byKey);
-          projectedTurns.length = 0;
-          projectedTurns.push(...projTurns2);
-          turn.state = turn2.state;
-          const newBlocks = turn2.state.blocks.length - cached.kernelState.blocks.length;
-          if (newBlocks > 0) {
-            const tokensFreed = (turn2.state.stats?.tokensCompressed ?? 0) - (cached.kernelState.stats?.tokensCompressed ?? 0);
-            projectedTurns.push({
-              kind: "SYSTEM",
-              content: `\u4E0A\u4E0B\u6587\u538B\u7F29\u5B8C\u6210\uFF1A\u5DF2\u5C06 ${newBlocks} \u6BB5\u8F83\u65E9\u7684\u5BF9\u8BDD\u6298\u53E0\u4E3A\u6458\u8981\uFF0C\u91CA\u653E\u7EA6 ${tokensFreed} tokens \u7A7A\u95F4\u3002\u5982\u9700\u67E5\u770B\u88AB\u538B\u7F29\u7684\u539F\u6587\u53EF\u8C03\u7528 decompress\u3002`,
-              metadata: { acpFoldNotice: true }
-            });
-          }
-        }
         const hopNo = (cached.hostMetadata.usageState?.lastHop ?? 0) + 1;
         const nextStats = { ...prevStats };
         const newBlockIds = turn.state.blocks.filter((b) => !cached.kernelState.blocks.some((pb) => pb.blockId === b.blockId)).map((b) => b.blockId);
-        if (preflightTriggered) {
-          nextStats.preflightTriggered += 1;
-          if (autoFolded && newBlockIds.length > 0) {
-            nextStats.preflightSucceeded += 1;
-            nextStats.preflightSavedTokens += emergencyFreedTokens;
-            nextStats.lastCompressSource = "preflight";
-            nextStats.lastCompressAt = Date.now();
-            chatTrace(chatId, {
-              type: "preflight",
-              level: "preflight-over-hard",
-              detail: { blocks: newBlockIds.length, tokens: emergencyFreedTokens, rounds: preflightRounds, stillOverHard: preflightStillOver }
-            });
-          } else {
-            nextStats.preflightFailed += 1;
-            nextStats.safetyEmergencyTriggered += 1;
-            nextStats.emergencyTriggered += 1;
-            nextStats.lastCompressSource = "emergency";
-            nextStats.lastCompressAt = Date.now();
-            chatTrace(chatId, {
-              type: "emergency",
-              level: "safety-emergency",
-              detail: { blocks: newBlockIds.length, tokens: emergencyFreedTokens, preflightRounds, stillOverHard: preflightStillOver, context: preflightCheck.trigger?.effectiveTokens ?? tokenEstimate, hard: preflightCheck.trigger?.hardLimitTokens ?? Math.round(config.modelContextLimit * settings.hardLimitPct) }
-            });
-          }
-          const postCovered = collectCoveredMessageIds(turn.state);
-          const postEstimate = estimateProjectionTokens(projectedMessages, postCovered);
-          nextStats.creditBaseToken = Math.min(tokenEstimate, postEstimate) || tokenEstimate;
-          nextStats.creditRemaining = settings.usageCreditTokens;
-        }
-        const sendEstimate = autoFolded ? estimateProjectionTokens(projectedMessages, collectCoveredMessageIds(turn.state)) : tokenEstimate;
+        const sendEstimate = tokenEstimate;
         const prevNudgeState = cached.hostMetadata.acpNudge ?? {};
         const { pressure, eff, pressurePct, usageManager: um2 } = await collectAndEvaluatePressure({
           sessionKey,
@@ -4848,18 +4445,12 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           settings,
           hopNo
         });
-        if (autoFolded && newBlockIds.length > 0) {
-          try {
-            um2.applyCompressionCredit(emergencyFreedTokens);
-          } catch {
-          }
-        }
         const nextNudgeState = {
           ...pressure.nextNudgeState,
           // 持久化 epoch 到 acpNudge（跨轮/跨 VM 恢复压力档位）
           ...pressure.nextEpoch ? { acpEpoch: pressure.nextEpoch } : {}
         };
-        const level = pressure.level ?? (preflightTriggered && preflightStillOver ? "emergency" : pressurePct >= settings.strongThresholdPct ? "strong" : pressurePct >= settings.gentleThresholdPct ? "gentle" : "gentle");
+        const level = pressure.level ?? (pressurePct >= settings.strongThresholdPct ? "strong" : pressurePct >= settings.gentleThresholdPct ? "gentle" : "gentle");
         let nudgeText;
         let delivery;
         if (pressure.allowInject && settings.nudgeEnabled) {
@@ -4888,8 +4479,7 @@ ${lines.join("\n")}${active.length > 3 ? `
           kernelState: turn.state,
           hostMetadata: {
             ...cached.hostMetadata,
-            // V0.7.4：preflight 折叠改变了 kernelState → stateVersion 递增，旧投影失效。
-            stateVersion: (cached.hostMetadata.stateVersion ?? 0) + (autoFolded ? 1 : 0),
+            stateVersion: cached.hostMetadata.stateVersion ?? 0,
             lastProjectionFingerprint: fingerprint,
             toolLoopCoverage: "main-request-only",
             lastUpdatedAt: Date.now(),
@@ -4900,24 +4490,7 @@ ${lines.join("\n")}${active.length > 3 ? `
             runtimeStats: nextStats,
             // V0.7.1：usage 事实持久化（estimate/actual/host/compressionCredit，per-session）
             usageState: um2.snapshot(),
-            absorbCandidates: nextAbsorbCandidates,
-            blockSources: {
-              ...cached.hostMetadata.blockSources ?? {},
-              // 新 emergency block 标记来源；保留历史标记。
-              ...autoFolded && newBlockIds.length > 0 ? Object.fromEntries(newBlockIds.map((id) => [id, preflightTriggered ? "preflight" : "emergency"])) : {}
-            },
-            // V0.7.4：本周期 preflight 标记（stage2 复用判断；同 fingerprint 视为同一发送周期）。
-            preflightCycleDone: preflightTriggered,
-            preflightCycleFingerprint: fingerprint,
-            lastPreflight: preflightTriggered ? {
-              at: Date.now(),
-              rounds: preflightRounds,
-              freedTokens: emergencyFreedTokens,
-              stillOverHard: preflightStillOver,
-              contextTokens: preflightCheck.trigger?.effectiveTokens ?? tokenEstimate,
-              hardLimitTokens: preflightCheck.trigger?.hardLimitTokens ?? Math.round(config.modelContextLimit * settings.hardLimitPct),
-              source: "full"
-            } : cached.hostMetadata.lastPreflight
+            absorbCandidates: nextAbsorbCandidates
           }
         };
         cacheSetLimited(projectionCache, sessionKey, { fingerprint, stateVersion, projection: cappedTurns });
@@ -4930,7 +4503,7 @@ ${lines.join("\n")}${active.length > 3 ? `
           const nudgeReason = turn.nudge?.reason ? turn.nudge.reason.slice(0, 120) : "(kernel:no-nudge)";
           const gateInfo = `allow=${pressure.allowInject ? 1 : 0} kShould=${turn.nudge?.shouldInject ? 1 : 0} reason=${pressure.decisionReason} eff=${Math.round(pressurePct * 100)}% src=${eff.source}`;
           const st = nextStats;
-          console.log(`[acp] project stage=${hookStage} chat=${chatId ? String(chatId).slice(0, 8) : "-"} sub=${isSubTask ? 1 : 0} fp=${fingerprint.slice(0, 12)} raw=${turns.length} proj=${cappedTurns.length} blocks=${active}/${turn.state.blocks.length} tok=${sendEstimate}${autoFolded ? ` preflight=${preflightRounds}r freed=${emergencyFreedTokens}` : ""} saved=${(cached.kernelState.stats?.tokensCompressed ?? 0) - (turn.state.stats?.tokensCompressed ?? 0)} nudge=${gateInfo} stats={n:${st.nudgeIssued},m:${st.compressSucceeded},e:${st.emergencyTriggered},pf:${st.preflightTriggered}} ${nudgeReason}`);
+          console.log(`[acp] project stage=${hookStage} chat=${chatId ? String(chatId).slice(0, 8) : "-"} sub=${isSubTask ? 1 : 0} fp=${fingerprint.slice(0, 12)} raw=${turns.length} proj=${cappedTurns.length} blocks=${active}/${turn.state.blocks.length} tok=${sendEstimate} saved=${(cached.kernelState.stats?.tokensCompressed ?? 0) - (turn.state.stats?.tokensCompressed ?? 0)} nudge=${gateInfo} stats={n:${st.nudgeIssued},m:${st.compressSucceeded},e:${st.emergencyTriggered}} ${nudgeReason}`);
           chatTrace(chatId, {
             type: "project",
             stage: hookStage,
@@ -4949,9 +4522,7 @@ ${lines.join("\n")}${active.length > 3 ? `
               nudgeAllow: pressure.allowInject,
               reason: pressure.decisionReason,
               source: eff.source,
-              confidence: eff.confidence,
-              emergency: autoFolded,
-              preflight: preflightTriggered ? { rounds: preflightRounds, freed: emergencyFreedTokens, stillOverHard: preflightStillOver, context: preflightCheck.trigger?.effectiveTokens ?? tokenEstimate, hard: preflightCheck.trigger?.hardLimitTokens ?? Math.round(config.modelContextLimit * settings.hardLimitPct) } : void 0
+              confidence: eff.confidence
             }
           });
         } catch {

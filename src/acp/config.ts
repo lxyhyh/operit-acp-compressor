@@ -28,7 +28,7 @@ export interface AdapterSettings {
   nudgeEnabled: boolean;
   /** 触发 nudge 建议的上下文使用率阈值（0~1）。默认 0.75。 */
   nudgeThresholdPct: number;
-  /** 硬顶阈值（0~1）：超过后 preflight 自动折叠兜底。默认 0.85。 */
+  /** hard/maxContextLimit 阈值（0~1）：usage ≥ 此值发 forced nudge（绕过 growth/cadence/credit，但绝不自动压缩历史）。默认 0.85。 */
   hardLimitPct: number;
   /** 单次压缩的最小字符数门槛。默认 5000。 */
   minCompressRange: number;

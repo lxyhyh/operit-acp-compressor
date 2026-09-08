@@ -24,7 +24,6 @@ import assert from "node:assert/strict";
 import {
   computePressureLevel,
   evaluatePressure,
-  evaluatePreflight,
   type PressureEpoch,
 } from "../src/acp/pressure.ts";
 import { computeEffectiveTokens, normalizeUsage } from "../src/acp/token-source.ts";
@@ -34,7 +33,7 @@ const C = {
   limit: 200_000,
   gentle: 0.72,
   strong: 0.82,
-  emergency: 0.85,
+  forced: 0.85,
   hostFloor: 0.70,
   cooldownTurns: 3,
   growthFloor: 10_000,
@@ -66,7 +65,7 @@ function hop(input: {
     curBlocks: input.curBlocks ?? 0,
     gentleThresholdPct: C.gentle,
     strongThresholdPct: C.strong,
-    emergencyThresholdPct: C.emergency,
+    forcedThresholdPct: C.forced,
     hostEscalationFloor: C.hostFloor,
     nudgeCooldownTurns: C.cooldownTurns,
     nudgeGrowthFloor: C.growthFloor,
@@ -93,7 +92,7 @@ test("P1: usage 缺失/为0 时 effective estimate 仍发现压力 (effective so
     usagePct: 0.75, effectiveTokens: eff.effectiveTokens, tokenEstimate: 150_000,
     kernelShouldInject: false, kernelReason: "", prevEpoch: undefined,
     prevBlocks: 0, curBlocks: 0, gentleThresholdPct: C.gentle, strongThresholdPct: C.strong,
-    emergencyThresholdPct: C.emergency, hostEscalationFloor: C.hostFloor,
+    forcedThresholdPct: C.forced, hostEscalationFloor: C.hostFloor,
     nudgeCooldownTurns: C.cooldownTurns, nudgeGrowthFloor: C.growthFloor,
     usageCreditTokens: C.credit, creditBaseToken: undefined,
     lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0,
@@ -128,10 +127,11 @@ test("P4: strong 不被 usage credit 拦截", () => {
   assert.equal(r.level, "strong");
 });
 
-test("P5: emergency 无条件注入", () => {
+test("P5: forced 无条件注入（86% > forced 85%，绕过 credit/cooldown）", () => {
   const r = hop({ usagePct: 0.86, tokenEstimate: tokensAt(0.86), creditBaseToken: tokensAt(0.68), nudgeCount: 99 });
   assert.equal(r.allowInject, true);
-  assert.equal(r.level, "emergency");
+  assert.equal(r.level, "forced");
+  assert.match(r.decisionReason, /forced/);
 });
 
 test("P6: gentle 受 credit 抑制（credit 只抑制 gentle）", () => {
@@ -466,77 +466,61 @@ test("V0.7.2-U3: hop ledger 逐 hop 持久化 estimate/actual/host/credit/source
   assert.equal(rebuilt.getLatestActual(), 95_000);
 });
 
-// ═══════════════ V0.7.4：Preflight Over-Hard（安全自愈触发条件） ═══════════════
+// ═══════════════ V0.7.6：forced nudge（替代 preflight，pressure decision ≠ compression execution） ═══════════════
 
-test("V0.7.4-P1: 未超 hard limit → 不触发 preflight（正常 pressure 管理）", () => {
-  // 需求 A：context < hard → 新一轮开始 → 不发生 preflight compression。
-  // context = 160k (80%)，hard = 170k (85%) → 不触发。
-  const r = evaluatePreflight({
-    effectiveTokens: 160_000,
-    modelContextLimit: C.limit,
-    hardLimitPct: 0.85,
-    preflightDoneForCycle: false,
+test("V0.7.6-F1: 超过 hard/maxContextLimit → forced nudge（绕过 growth/cadence/credit），但绝不自动折叠", () => {
+  // 需求：hard 只作 forcedThresholdPct → 产生 forced nudge，绝不执行压缩。
+  const forced = evaluatePressure({
+    usagePct: 0.87, // > hardLimitPct 0.85
+    effectiveTokens: 174_000,
+    tokenEstimate: 174_000,
+    kernelShouldInject: false, // kernel 沉默 → 也要 forced（forced 绕过一切）
+    kernelReason: "growth below floor",
+    prevEpoch: undefined,
+    prevBlocks: 0,
+    curBlocks: 0,
+    gentleThresholdPct: 0.72,
+    strongThresholdPct: 0.82,
+    forcedThresholdPct: 0.85,
+    hostEscalationFloor: 0.70,
+    nudgeCooldownTurns: 3,
+    nudgeGrowthFloor: 30000,
+    usageCreditTokens: 30000,
+    creditBaseToken: 120_000,
+    lastInjectedAt: Date.now() - 100, // 刚 nudge 过
+    nudgeCount: 5, // 冷却中
+    lastTokensAtInject: 100_000,
+    lastCompressToken: 100_000,
+    source: "estimate",
   });
-  assert.equal(r.action.kind, "none", "未超 hard limit 不触发 preflight");
-  assert.equal(r.hardLimitTokens, 170_000);
+  assert.equal(forced.allowInject, true, "forced 无条件注入");
+  assert.equal(forced.level, "forced", "forced 档位");
+  assert.ok(!("action" in forced) || (forced as { action?: unknown }).action === undefined, "forced 只是 nudge，不带压缩 action");
 });
 
-test("V0.7.4-P2: 超 hard limit 且本周期未 preflight → preflight-over-hard", () => {
-  // 需求 B：context > hard → 新一轮开始 → preflight compression 发生一次 → 成功后发送模型。
-  // context = 175k (> 170k hard) → preflight-over-hard。
-  const r = evaluatePreflight({
-    effectiveTokens: 175_000,
-    modelContextLimit: C.limit,
-    hardLimitPct: 0.85,
-    preflightDoneForCycle: false,
+test("V0.7.6-F2: 正常 70%/80% pressure 不触发 forced（需求 H 保留）", () => {
+  const r70 = evaluatePressure({
+    usagePct: 0.70, effectiveTokens: 140_000, tokenEstimate: 140_000,
+    kernelShouldInject: false, kernelReason: "growth below floor",
+    prevEpoch: undefined, prevBlocks: 0, curBlocks: 0,
+    gentleThresholdPct: 0.72, strongThresholdPct: 0.82, forcedThresholdPct: 0.85,
+    hostEscalationFloor: 0.70, nudgeCooldownTurns: 3, nudgeGrowthFloor: 30000,
+    usageCreditTokens: 30000, creditBaseToken: 120_000,
+    lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0, lastCompressToken: 100_000,
+    source: "estimate",
   });
-  assert.equal(r.action.kind, "preflight-over-hard");
-  if (r.action.kind === "preflight-over-hard") {
-    assert.equal(r.action.effectiveTokens, 175_000);
-    assert.equal(r.action.hardLimitTokens, 170_000);
-  }
-});
+  // 70% < gentle 0.72 → host escalation 也不够（需要 grew）→ 不注入，但非 forced
+  assert.notEqual(r70.level, "forced", "70% 不是 forced");
 
-test("V0.7.4-P3: 超 hard 且本周期已 preflight → safety-emergency（不无限循环）", () => {
-  // 需求 D：compression 后仍 > hard → 允许 safety fallback → 但不能无限循环。
-  // 第一次 preflight 后仍超 → 第二次判定 preflightDoneForCycle=true → safety-emergency。
-  const r1 = evaluatePreflight({
-    effectiveTokens: 175_000,
-    modelContextLimit: C.limit,
-    hardLimitPct: 0.85,
-    preflightDoneForCycle: false,
+  const r80 = evaluatePressure({
+    usagePct: 0.80, effectiveTokens: 160_000, tokenEstimate: 160_000,
+    kernelShouldInject: false, kernelReason: "growth below floor",
+    prevEpoch: undefined, prevBlocks: 0, curBlocks: 0,
+    gentleThresholdPct: 0.72, strongThresholdPct: 0.82, forcedThresholdPct: 0.85,
+    hostEscalationFloor: 0.70, nudgeCooldownTurns: 3, nudgeGrowthFloor: 30000,
+    usageCreditTokens: 30000, creditBaseToken: 120_000,
+    lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0, lastCompressToken: 100_000,
+    source: "estimate",
   });
-  assert.equal(r1.action.kind, "preflight-over-hard");
-  // 压缩后仍 172k (>170k)，且本周期已 preflight → safety-emergency（不重复 preflight）。
-  const r2 = evaluatePreflight({
-    effectiveTokens: 172_000,
-    modelContextLimit: C.limit,
-    hardLimitPct: 0.85,
-    preflightDoneForCycle: true,
-  });
-  assert.equal(r2.action.kind, "safety-emergency", "压缩后仍超且已 preflight → safety-emergency");
-  if (r2.action.kind === "safety-emergency") {
-    assert.equal(r2.action.effectiveTokens, 172_000);
-  }
-});
-
-test("V0.7.4-P4: 压缩后回到安全区 → 不再触发（需求 C）", () => {
-  // 需求 C：context > hard → preflight 后重新降到安全区 → 不重复 compression。
-  // 压缩后 90k (<170k) → 不触发。
-  const r = evaluatePreflight({
-    effectiveTokens: 90_000,
-    modelContextLimit: C.limit,
-    hardLimitPct: 0.85,
-    preflightDoneForCycle: true, // 即便本周期已 preflight，回到安全区也不触发
-  });
-  assert.equal(r.action.kind, "none", "压缩后回到安全区不再触发");
-});
-
-test("V0.7.4-P5: 正常 70%/80% pressure 不触发 emergency（需求 H）", () => {
-  // 需求 H：正常 70%/80% pressure → 不因为跨普通阈值就立即 emergency。
-  // 70% (140k) 和 80% (160k) 都 < hard (170k) → 都 none。
-  const r70 = evaluatePreflight({ effectiveTokens: tokensAt(0.70), modelContextLimit: C.limit, hardLimitPct: 0.85 });
-  assert.equal(r70.action.kind, "none", "70% 不触发 preflight");
-  const r80 = evaluatePreflight({ effectiveTokens: tokensAt(0.80), modelContextLimit: C.limit, hardLimitPct: 0.85 });
-  assert.equal(r80.action.kind, "none", "80% 不触发 preflight（低于 hard 85%）");
+  assert.notEqual(r80.level, "forced", "80% 低于 forced 0.85 → 非 forced（strong 区）");
 });

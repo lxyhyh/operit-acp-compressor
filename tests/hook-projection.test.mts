@@ -297,91 +297,89 @@ test("V0.7.3-F: Cache hit 仍执行 pressure（ledger 增加 + pressure 决策�
 });
 
 // ═══════════════ V0.7.4：Preflight Over-Hard 四路径（E/F/G/I） ═══════════════
+// ═══════════════ V0.7.6：forced nudge 四路径（替代 preflight，pressure decision ≠ compression execution） ═══════════════
 
-import { evaluatePreflight } from "../src/acp/pressure.ts";
+import { evaluatePressure } from "../src/acp/pressure.ts";
 
-/** 模拟某发送路径的 preflight 判定（与 adapter checkAndRunPreflight 同源 evaluatePreflight）。 */
-function simulatePathPreflight(opts: {
+/** 模拟某发送路径的 forced 判定（与 adapter collectAndEvaluatePressure 同源 evaluatePressure）。 */
+function simulatePathForced(opts: {
   path: "incremental" | "cache" | "stage2" | "full";
   effectiveTokens: number;
-  modelContextLimit: number;
-  hardLimitPct: number;
-  cycleDone: boolean;
+  gentleThresholdPct: number;
+  strongThresholdPct: number;
+  forcedThresholdPct: number;
 }): {
-  kind: string;
-  hardLimitTokens: number;
-  effectiveTokens: number;
-  actionTaken: "preflight" | "safety" | "none";
+  allowInject: boolean;
+  level?: string;
 } {
-  const r = evaluatePreflight({
+  const r = evaluatePressure({
+    usagePct: opts.effectiveTokens / C.limit,
     effectiveTokens: opts.effectiveTokens,
-    modelContextLimit: opts.modelContextLimit,
-    hardLimitPct: opts.hardLimitPct,
-    preflightDoneForCycle: opts.cycleDone,
+    tokenEstimate: opts.effectiveTokens,
+    kernelShouldInject: false,
+    kernelReason: "growth below floor",
+    prevEpoch: undefined,
+    prevBlocks: 0,
+    curBlocks: 0,
+    gentleThresholdPct: opts.gentleThresholdPct,
+    strongThresholdPct: opts.strongThresholdPct,
+    forcedThresholdPct: opts.forcedThresholdPct,
+    hostEscalationFloor: 0.70,
+    nudgeCooldownTurns: 3,
+    nudgeGrowthFloor: 30000,
+    usageCreditTokens: 30000,
+    creditBaseToken: 120_000,
+    lastInjectedAt: Date.now() - 100,
+    nudgeCount: 5,
+    lastTokensAtInject: 100_000,
+    lastCompressToken: 100_000,
+    source: "estimate",
   });
-  return {
-    kind: r.action.kind,
-    hardLimitTokens: r.hardLimitTokens,
-    effectiveTokens: opts.effectiveTokens,
-    actionTaken: r.action.kind === "preflight-over-hard" ? "preflight"
-      : r.action.kind === "safety-emergency" ? "safety"
-      : "none",
-  };
+  return { allowInject: r.allowInject, level: r.level };
 }
 
-test("V0.7.4-E: incremental path 也能触发 preflight-over-hard", () => {
-  // 需求 E：incremental path → 同样能触发 preflight-over-hard。
-  // 175k > 170k (hard) 且本周期未 preflight → preflight。
-  const r = simulatePathPreflight({ path: "incremental", effectiveTokens: 175_000, modelContextLimit: C.limit, hardLimitPct: 0.85, cycleDone: false });
-  assert.equal(r.actionTaken, "preflight", "incremental 超 hard 且未 preflight → preflight");
+test("V0.7.6-E: incremental path 超过 hard → forced nudge（不自动压缩）", () => {
+  // incremental path 采样超 hard（87%）→ forced nudge（绝不 auto-fold）。
+  const r = simulatePathForced({ path: "incremental", effectiveTokens: 174_000, gentleThresholdPct: 0.72, strongThresholdPct: 0.82, forcedThresholdPct: 0.85 });
+  assert.equal(r.allowInject, true, "incremental 超 hard → forced 注入");
+  assert.equal(r.level, "forced", "forced 档位");
 });
 
-test("V0.7.4-F: cache hit path 也能触发 preflight-over-hard", () => {
-  // 需求 F：cache hit path → 同样能触发 preflight-over-hard。
-  const r = simulatePathPreflight({ path: "cache", effectiveTokens: 178_000, modelContextLimit: C.limit, hardLimitPct: 0.85, cycleDone: false });
-  assert.equal(r.actionTaken, "preflight", "cache hit 超 hard 且未 preflight → preflight");
+test("V0.7.6-F: cache hit path 超过 hard → forced nudge（不自动压缩）", () => {
+  const r = simulatePathForced({ path: "cache", effectiveTokens: 178_000, gentleThresholdPct: 0.72, strongThresholdPct: 0.82, forcedThresholdPct: 0.85 });
+  assert.equal(r.allowInject, true, "cache hit 超 hard → forced 注入");
+  assert.equal(r.level, "forced", "forced 档位");
 });
 
-test("V0.7.4-G: stage2 before_send 也能触发 preflight-over-hard", () => {
-  // 需求 G：stage2 before_send → 同样能触发 preflight-over-hard。
-  // stage1 未 preflight（cycleDone=false）→ stage2 采样超 hard → preflight。
-  const r = simulatePathPreflight({ path: "stage2", effectiveTokens: 180_000, modelContextLimit: C.limit, hardLimitPct: 0.85, cycleDone: false });
-  assert.equal(r.actionTaken, "preflight", "stage2 超 hard 且本周期未 preflight → preflight");
-  // stage1 已 preflight（cycleDone=true）→ 同一周期不再重复（需求 5）。
-  const r2 = simulatePathPreflight({ path: "stage2", effectiveTokens: 180_000, modelContextLimit: C.limit, hardLimitPct: 0.85, cycleDone: true });
-  assert.equal(r2.actionTaken, "safety", "stage2 本周期已 preflight 仍超 → safety-emergency（不重复）");
+test("V0.7.6-G: stage2 before_send 超过 hard → forced nudge（每次 send 独立决策）", () => {
+  // stage2 超 hard → forced nudge。V0.7.6 无 cycle 去重——每个发送路径都独立决策（nudge 是 ephemeral）。
+  const r = simulatePathForced({ path: "stage2", effectiveTokens: 180_000, gentleThresholdPct: 0.72, strongThresholdPct: 0.82, forcedThresholdPct: 0.85 });
+  assert.equal(r.allowInject, true, "stage2 超 hard → forced 注入");
+  assert.equal(r.level, "forced", "forced 档位");
 });
 
-test("V0.7.4-I: 50+ synthetic Hop — 多次正常 compression + hard crossing 在新轮次触发 preflight + emergency 极少", () => {
-  // 需求 I：50+ synthetic Hop → 中间可以出现多次正常 compression；
-  //   hard crossing 在新轮次时触发 preflight；emergency 应为极少数 fallback。
-  //
-  // 模拟 60 个 hop：显式构造一个长期运行上下文——
-  // - 前 40 个 hop：usage 在 60%~84% 间波动（gentle/strong 区），模型多次主动压缩（回落）。
-  // - 第 41 个 hop（新一轮开始）：usage 冲到 87%（>85% hard）→ 触发 preflight-over-hard（自愈）。
-  // - preflight 后 usage 回落 45%，继续增长（第 50 轮又一次 hard crossing → 第二次 preflight）。
-  // - safety-emergency 应极少（≤2）。
-  let cycleDone = false; // 本周期是否已 preflight
-  let preflightCount = 0;
-  let safetyCount = 0;
+test("V0.7.6-I: 50+ synthetic Hop — 多次正常 compression + hard crossing 触发 forced nudge + 不 auto-fold", () => {
+  // 需求 I（V0.7.6 版）：50+ synthetic Hop → 多次正常 compression；
+  //   hard crossing → forced nudge（不自动折叠，模型响应后主动 compress）。
+  let forcedNudgeCount = 0;
   let normalCompress = 0; // 模型主动 compress
+  let autoFoldCount = 0; // 绝不应发生（pressure decision ≠ compression execution）
   let usage = 0.62;
 
   // 显式 usage 序列：前 40 hop 波动（多次 normal compress），41 起 hard crossing。
   const usageSeq: number[] = [];
   for (let hop = 1; hop <= 60; hop++) {
     if (hop <= 40) {
-      // 60% ~ 84% 波动，每 8 hop 一次压缩回落
       const phase = (hop - 1) % 8;
       usageSeq.push(hop === 1 ? 0.62 : (phase === 0 ? 0.50 : Math.min(0.50 + phase * 0.05, 0.84)));
     } else if (hop === 41) {
-      usageSeq.push(0.87); // 新一轮开始（41%10=1）：跨 hard（>85%）→ preflight
+      usageSeq.push(0.87); // 新一轮开始：跨 hard（>85%）→ forced nudge
     } else if (hop === 42) {
-      usageSeq.push(0.45); // preflight 后回落
+      usageSeq.push(0.45); // 模型 compress 后回落
     } else if (hop === 51) {
-      usageSeq.push(0.86); // 新一轮开始（51%10=1）：第二次 hard crossing → preflight
+      usageSeq.push(0.86); // 第二次 hard crossing → forced nudge
     } else if (hop === 52) {
-      usageSeq.push(0.44); // preflight 后回落
+      usageSeq.push(0.44); // compress 后回落
     } else {
       usageSeq.push(0.55); // 平稳区
     }
@@ -389,37 +387,26 @@ test("V0.7.4-I: 50+ synthetic Hop — 多次正常 compression + hard crossing �
 
   for (let hop = 1; hop <= 60; hop++) {
     usage = usageSeq[hop - 1];
-    // —— 新一轮开始边界：每 10 hop 视为新用户轮次，重置 cycleDone。
-    if (hop % 10 === 1) cycleDone = false;
 
-    // preflight 判定（在新一轮开始时）
     const effective = Math.round(C.limit * usage);
-    const pf = evaluatePreflight({
-      effectiveTokens: effective,
-      modelContextLimit: C.limit,
-      hardLimitPct: 0.85,
-      preflightDoneForCycle: cycleDone,
-    });
+    const r = simulatePathForced({ path: "full", effectiveTokens: effective, gentleThresholdPct: 0.72, strongThresholdPct: 0.82, forcedThresholdPct: 0.85 });
 
-    if (pf.action.kind === "preflight-over-hard") {
-      // 超 hard 且未 preflight → 主动压缩一次（模拟压缩成功）。
-      preflightCount++;
-      cycleDone = true;
+    if (r.allowInject && r.level === "forced") {
+      forcedNudgeCount++;
+      // 模型收到 forced nudge → 下一 hop 主动 compress（此处模拟为下一 hop usage 回落）。
       continue;
     }
-    if (pf.action.kind === "safety-emergency") {
-      safetyCount++;
-      continue; // 兜底（不无限循环）
-    }
+    // forced 只是 nudge：绝无任何 auto-fold 动作（evaluatePressure 无 action 字段）。
+    assert.ok(!("action" in r), "pressure decision 绝不携带压缩 action");
 
     // 正常 pressure 管理：gentle/strong → 模型主动 compress（部分 hop 压缩）。
     const level = usage >= 0.82 ? "strong" : usage >= 0.72 ? "gentle" : "none";
     if (level !== "none" && hop % 5 === 0) {
-      normalCompress++; // 模型 compress（模拟回落由 usageSeq 下一 hop 体现）
+      normalCompress++; // 模型 compress
     }
   }
 
   assert.ok(normalCompress >= 3, `50+ Hop 应出现多次正常 compression（实际 ${normalCompress}）`);
-  assert.ok(preflightCount >= 2, `hard crossing 在新轮次应触发 preflight（实际 ${preflightCount}）`);
-  assert.ok(safetyCount <= 2, `emergency/safety 应为极少数 fallback（实际 ${safetyCount}）`);
+  assert.ok(forcedNudgeCount >= 2, `hard crossing 应触发 forced nudge（实际 ${forcedNudgeCount}）`);
+  assert.equal(autoFoldCount, 0, "绝不允许 auto-fold（pressure decision ≠ compression execution）");
 });

@@ -210,3 +210,26 @@ test("P10: gentle 在 cooldown 内且无增长 → 抑制", () => {
   assert.equal(r.allowInject, false, "刚注入过且无增长 → gentle 抑制");
   assert.match(r.decisionReason, /no-growth/);
 });
+
+test("P11: V0.7.1 回归 — credit 基准错位（base>est）时不得永久压制", () => {
+  // 真实事故：某会话 emergency 后 creditBaseToken=267446（压缩前全量估算），
+  // 压缩后窗口 tokenEstimate 仅 154018（< base），旧逻辑 creditLeft=base+30k-est 恒>0
+  // → 从此每 Hop 都 gentle-suppressed-by-credit → 上下文涨到几百万 token 仍无任何压缩提示。
+  //
+  // a) 基准错位 + usage 已过 gentle 阈值 → 必须放行（交给 hostEscalation/增长判断）
+  const base = 267_446;
+  const est = 154_018; // 压缩后低位，明显 < base
+  const usage = est / C.limit; // ≈ 0.770
+  const r = hop({ usagePct: usage, tokenEstimate: est, creditBaseToken: base, kernelShouldInject: false });
+  assert.equal(r.allowInject, true, "base>est 且 usage≥gentle 时不得被 credit 永久压制");
+  assert.match(r.decisionReason, /host-escalation|gentle-inject|strong-bypassed|emergency/);
+
+  // b) 基准错位 + 压力确实低（usage < gentle）→ 仍应安静，不 spam
+  const low = hop({ usagePct: 0.11, tokenEstimate: 22_000, creditBaseToken: base, kernelShouldInject: false });
+  assert.equal(low.allowInject, false, "低压仍允许 credit 静默（合理免打扰）");
+
+  // c) 基准正常（base<est，credit 窗口内）→ 仍正常抑制（不破坏原 credit 语义）
+  const ok = hop({ usagePct: 0.73, tokenEstimate: tokensAt(0.73), creditBaseToken: tokensAt(0.68), kernelShouldInject: true });
+  assert.equal(ok.allowInject, false, "正常 credit 窗口内 gentle 仍抑制");
+  assert.match(ok.decisionReason, /credit/);
+});

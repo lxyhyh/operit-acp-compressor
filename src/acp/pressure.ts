@@ -199,11 +199,21 @@ export function evaluatePressure(input: {
   const level = (levelRaw === "none" ? "gentle" : levelRaw) as Exclude<NudgeLevel, "none">;
 
   // credit 只抑制 gentle：压缩后 credit 窗口内不 gentle（文档第七节）。
-  const creditLeft = input.usageCreditTokens > 0 && typeof input.creditBaseToken === "number"
-    ? input.creditBaseToken + input.usageCreditTokens - input.tokenEstimate
-    : 0;
+  // V0.7.1 修复：credit 基准绝不允许无限压制——
+  //   a) 防御 creditBaseToken 异常（基准 > 当前 usage 且 usage 已过 gentle 阈值）：
+  //      说明压缩后窗口严重低于基准（基准可能记录了压缩前/错误的大值），
+  //      此时若仍按 credit 静默将导致上下文永久无人管理（另一会话实测 6.2 亿 token 无压缩）。
+  //      故：这种"基准错位"场景直接跳过 credit，交给后续增长判断/hostEscalation 决定。
+  //   b) usage 已 ≥ strong 阈值时由上方 escalate 分支硬放行（本就 bypass credit）。
+  const creditEnabled = input.usageCreditTokens > 0 && typeof input.creditBaseToken === "number";
+  const creditBroken = creditEnabled
+    && input.tokenEstimate < (input.creditBaseToken as number)
+    && input.usagePct >= input.gentleThresholdPct;
+  const creditLeft = !creditEnabled || creditBroken
+    ? 0
+    : (input.creditBaseToken as number) + input.usageCreditTokens - input.tokenEstimate;
   if (creditLeft > 0) {
-    return { allowInject: false, nextEpoch, nextNudgeState: prev, decisionReason: "gentle-suppressed-by-credit" };
+    return { allowInject: false, nextEpoch, nextNudgeState: prev, decisionReason: creditBroken ? "credit-broken-baseline-force-release" : "gentle-suppressed-by-credit" };
   }
 
   // 增长判断：gentle 需"自上次注入以来有实质增长"或"自压缩以来跨越 baseline 增长"

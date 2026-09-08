@@ -26,6 +26,7 @@
 | **v0.5** | `c57273e` `b6406e9` `07459a0` | absorb 注册 + UI 状态卡/IPC + ACP Trace |
 | **v0.6** | `1617348` | 检测巨型工具输出 → nudge 建议 absorb（无 ToolLifecycleHook 方案） |
 | **v0.7** | `6483a23` | Continuous Per-Hop Pressure Controller + Phase7 增量投影 + Phase3.1 稳定候选 |
+| **v0.7.1** | 修复 | **usage credit 永久压制修复**：credit 基准错位（压缩前大值被记为基准）时强档/增长档无限静默，导致会话语义涨到数亿 token 也无任何压缩提示——现已修正基准为压缩后低位 + 错位强制放行 + 回归测试 P11 |
 
 > 根因修复：`e8a08b9` 修复 ACP 系统提示在发送链路丢失（模型从不主动压缩的根因）；`5add59c` 移除宿主不支持的 ToolLifecycleHook（曾导致全工具拦截崩溃）。
 
@@ -108,7 +109,7 @@ operit-acp-plugin/
 ## 验证
 
 - `npm run typecheck`：0 错误
-- `npm test`：**40/40 通过**（内核往返 / 投影幂等 / 估算链路 / 消息配对 / pressure 契约 P1-P10 / absorb 候选 / 增量投影）
+- `npm test`：**41/41 通过**（内核往返 / 投影幂等 / 估算链路 / 消息配对 / pressure 契约 P1-P11 / absorb 候选 / 增量投影）
 - `pressure.test.mts` 覆盖文档第十五节 15 项验收，含 20-Hop soak（多轮 model compress + 多 epoch、strong bypass cooldown/credit、effective estimate 兜底等）
 - 云端：GitHub Actions（`.github/workflows/build.yml`）push 自动 typecheck+test+build+package，已实测通过
 - 实机安装：`debug_install_toolpkg` 成功；估算/发送双链路日志正常，右上角计数随压缩回落，模型主动压缩已实测生效（`source=model`）

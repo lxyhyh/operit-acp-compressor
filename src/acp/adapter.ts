@@ -487,7 +487,14 @@ export function createEngine(dataDir?: string): AcpEngine {
             detail: { blocks: newBlockIds.length, tokens: emergencyFreedTokens },
           });
           // V0.4.1 usage credit：压缩完成当轮 usage 为基准，credit 内免打扰。
-          nextStats.creditBaseToken = tokenEstimate;
+          // V0.7.1 修复：基准必须取"压缩后投影低位"，而非压缩前全量 tokenEstimate。
+          //   根因：emergency 压缩发生在 tokenEstimate 计算之后，tokenEstimate 仍是
+          //   压缩前全量估算（实测某会话 267,446），而压缩后窗口仅 2.2万~15.4万，
+          //   于是 credit 判定 `creditBase+30k - tokenEstimate` 恒 > 0 → 永久免打扰，
+          //   导致上下文涨到几百万 token 也无任何 nudge（另一会话实测 6.2 亿 token 全程静默）。
+          const postCovered = collectCoveredMessageIds(turn.state);
+          const postEstimate = estimateProjectionTokens(projectedMessages, postCovered);
+          nextStats.creditBaseToken = Math.min(tokenEstimate, postEstimate) || tokenEstimate;
           nextStats.creditRemaining = settings.usageCreditTokens;
         }
         // nudge 状态机（Adapter 层 Continuous Pressure Controller）：V0.7
@@ -669,9 +676,11 @@ export function createEngine(dataDir?: string): AcpEngine {
             detail: { blocks: applied.result.blocksCreated, tokens: applied.result.tokensCompressed, ranges: ranges.length },
           });
           // V0.4.1 usage credit：模型主动压缩后同样获得免打扰窗口。
+          // V0.7.1 修复：基准取"上次 estimate − 本次释放 token"（压缩后低位），
+          //   避免压缩前大值被记为基准导致 credit 永久有效（见 project 内同款修复）。
           const est = loaded.hostMetadata.lastTokenEstimate;
-          if (typeof est === "number") {
-            nextStats.creditBaseToken = est;
+          if (typeof est === "number" && est > 0) {
+            nextStats.creditBaseToken = Math.max(0, est - applied.result.tokensCompressed);
             nextStats.creditRemaining = settings.usageCreditTokens;
           }
         } else if (applied.result.blocksCreated === 0) {

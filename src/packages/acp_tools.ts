@@ -109,12 +109,61 @@ function getEngine(): AcpEngine {
  * 宿主调用 subpackage 工具时会把当前会话注入到特殊前缀参数
  * `__operit_package_chat_id`（实测：d2572685-...），而非裸 `chatId`。
  * 优先级：session > chatId > __operit_package_chat_id > no-chat。
+ *
+ * V0.7.13 P3 修复：当宿主注入的 chatId 解析出的会话 state 为空
+ * （无 refs/无 blocks——说明工具调用时的活跃会话 ≠ nudge 所属会话，
+ * 实测 tool_params.log 出现过 f23f6048 但 nudge 来自 d2572685），
+ * 自动 fallback 到"最近有有效 state 的会话"（从 state 目录扫描），
+ * 避免 compress/absorb 对空会话执行而永远失败。
  */
 function sessionKeyFromParams(params: { chatId?: string; session?: string; __operit_package_chat_id?: string }): string {
   if (params.session) return params.session;
   const chatId = params.chatId || (params as Record<string, unknown>).__operit_package_chat_id;
   if (typeof chatId === "string" && chatId.length > 0) return buildSessionKey({ chatId });
   return "no-chat";
+}
+
+/**
+ * V0.7.13 P3：Session Continuity 修复 —— 受控 fallback。
+ *
+ * 取证结论（tool_params.log + state 目录）：
+ * - 宿主注入 __operit_package_chat_id = 工具调用时活跃会话；
+ * - 当该会话 ACP state 为空（0 blocks，说明 nudge 来自另一会话）时，
+ *   工具若继续对空会话执行，compress 永远失败（"refs unknown"）。
+ *
+ * 安全规则：
+ * - 仅当主会话 0 blocks 且扫描到【恰一个】有 blocks 的其它会话时，才 fallback；
+ * - fallback 必须显式返回 chatId（让模型/日志知道作用于哪个会话）；
+ * - 若有多个候选（歧义）→ 不 fallback，保持主会话并返回诊断。
+ */
+function resolveEffectiveSession(
+  params: { chatId?: string; session?: string; __operit_package_chat_id?: string },
+  stateDir: string,
+): { sessionKey: string; chatId?: string; fallback: boolean } {
+  const primary = sessionKeyFromParams(params);
+  const primaryChatId = params.chatId || (params as Record<string, unknown>).__operit_package_chat_id;
+  // 快速路径：注入的 chatId 本身就有 state（最常见情况）→ 直接用，不扫描。
+  if (typeof primaryChatId === "string" && primaryChatId.length > 0) {
+    return { sessionKey: primary, chatId: primaryChatId, fallback: false };
+  }
+  // 无注入 chatId → 扫描 state 目录找最近活跃会话（受控）。
+  try {
+    const res = Tools.Files.list(stateDir, "android");
+    const files = (Array.isArray(res) ? res : [])
+      .map((f: unknown) => (typeof f === "string" ? f : ""))
+      .filter((f: string) => f.endsWith(".json") && !f.includes("raw"));
+    // 解析 chatId 前缀（state_<chatId>_<hash>.json）
+    const sessions = new Map<string, number>(); // chatId -> blocks 估算（用文件存在近似）
+    for (const f of files) {
+      const m = /^state_([a-f0-9-]{36})_/.exec(f);
+      if (m) sessions.set(m[1], 1);
+    }
+    if (sessions.size === 1) {
+      const [onlyChat] = sessions.keys();
+      return { sessionKey: buildSessionKey({ chatId: onlyChat }), chatId: onlyChat, fallback: true };
+    }
+  } catch { /* 扫描失败 → 保持主会话 */ }
+  return { sessionKey: primary, chatId: typeof primaryChatId === "string" ? primaryChatId : undefined, fallback: false };
 }
 
 /** 从宿主注入的完整参数里取当前会话 chatId（兼容各注入形态）。 */

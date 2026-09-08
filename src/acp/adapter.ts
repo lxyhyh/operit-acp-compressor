@@ -220,6 +220,7 @@ export function createEngine(dataDir?: string): AcpEngine {
   const persistence = createPersistence(dataDir || settings.dataDir);
 
   // —— V0.7.8：Identity Bridge state（session 隔离，module 级单例；不跨 chat 泄漏）。
+  // V0.7.9：从持久化恢复（跨 VM/工具路径共享）；project 保存时写回 hostMetadata.identityBridge。
   let identityState: IdentityBridgeState = createIdentityBridgeState();
 
   /** V0.7.8：用 identity-bridge 生成 id 的 mapping（legacy continuity + virtual tool identity）。 */
@@ -501,6 +502,10 @@ export function createEngine(dataDir?: string): AcpEngine {
         const fingerprint = computeFingerprint(sessionKey, turns, config);
 
         const cached = await persistence.load(sessionKey);
+        // V0.7.9：从持久化恢复 identity-bridge state（工具路径/跨 VM 共享）。
+        if (cached.hostMetadata.identityBridge) {
+          identityState = loadIdentityBridgeState(cached.hostMetadata.identityBridge);
+        }
         const stateVersion = cached.hostMetadata.stateVersion ?? 0;
         if (cached.hostMetadata.lastProjectionFingerprint === fingerprint) {
           const memCached = projectionCache.get(sessionKey);
@@ -825,6 +830,8 @@ export function createEngine(dataDir?: string): AcpEngine {
             runtimeStats: nextStats,
             // V0.7.1：usage 事实持久化（estimate/actual/host/compressionCredit，per-session）
             usageState: um2.snapshot(),
+            // V0.7.9：identity-bridge state 持久化（跨 VM/工具路径共享）。
+            identityBridge: identityState,
             absorbCandidates: nextAbsorbCandidates,
           },
         };
@@ -879,6 +886,10 @@ export function createEngine(dataDir?: string): AcpEngine {
       try {
         const config = resolveKernelConfig(settings);
         const loaded = await persistence.load(sessionKey);
+        // V0.7.9：compress 工具路径恢复 identity-bridge state（跨 VM 共享）。
+        if (loaded.hostMetadata.identityBridge) {
+          identityState = loadIdentityBridgeState(loaded.hostMetadata.identityBridge);
+        }
         const rawTurns = Array.isArray(messages) && messages.length > 0
           ? messages
           : (rawTurnsCache.get(sessionKey) ?? loaded.lastRawTurns ?? await persistence.loadRawTurns(sessionKey));
@@ -889,7 +900,7 @@ export function createEngine(dataDir?: string): AcpEngine {
         if (invalid) {
           return { state: loaded.kernelState, blocksCreated: 0, tokensCompressed: 0, errors: ["compress: messages 参数结构非法（需要 PromptTurn[] 或省略）"], warnings: [] };
         }
-        const mapping = promptTurnsToCoreMessages(rawTurns as PromptTurnLike[]);
+        const mapping = mapTurnsWithIdentity(rawTurns as PromptTurnLike[]);
         const applied = core.applyCompression({
           ranges: ranges.map((r) => ({
             startRef: r.startRef,
@@ -956,6 +967,8 @@ export function createEngine(dataDir?: string): AcpEngine {
             lastProjectionFingerprint: undefined as string | undefined,
             runtimeStats: nextStats,
             ...(usageStateForSave ? { usageState: usageStateForSave } : {}),
+            // V0.7.9：identity-bridge state 持久化（compress/absorb 工具路径）。
+            identityBridge: identityState,
             blockSources: {
               ...(loaded.hostMetadata.blockSources ?? {}),
               ...(newBlockIds.length > 0
@@ -1009,8 +1022,12 @@ export function createEngine(dataDir?: string): AcpEngine {
       try {
         const config = resolveKernelConfig(settings);
         const loaded = await persistence.load(sessionKey);
+        // V0.7.9：absorb 工具路径恢复 identity-bridge state（跨 VM 共享）。
+        if (loaded.hostMetadata.identityBridge) {
+          identityState = loadIdentityBridgeState(loaded.hostMetadata.identityBridge);
+        }
         const rawTurns = (rawTurnsCache.get(sessionKey) ?? loaded.lastRawTurns ?? await persistence.loadRawTurns(sessionKey)) as PromptTurnLike[];
-        const mapping = promptTurnsToCoreMessages(rawTurns);
+        const mapping = mapTurnsWithIdentity(rawTurns as PromptTurnLike[]);
         const result = kernelApplyAbsorb({
           ref,
           summary,

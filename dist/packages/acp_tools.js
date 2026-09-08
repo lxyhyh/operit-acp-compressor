@@ -3404,6 +3404,16 @@ function classifyTurn(turn) {
 function createIdentityBridgeState() {
   return { toolAlignments: {}, toolSeqCounter: 0 };
 }
+function loadIdentityBridgeState(raw) {
+  if (raw && typeof raw === "object") {
+    const r = raw;
+    return {
+      toolAlignments: r.toolAlignments && typeof r.toolAlignments === "object" ? r.toolAlignments : {},
+      toolSeqCounter: typeof r.toolSeqCounter === "number" ? r.toolSeqCounter : 0
+    };
+  }
+  return createIdentityBridgeState();
+}
 function normalizeToolCallSignature(content) {
   return content.replace(/<tool_[a-zA-Z0-9_]+/g, "<tool").replace(/<\/tool_[a-zA-Z0-9_]+>/g, "</tool>").trim();
 }
@@ -4410,6 +4420,9 @@ function createEngine(dataDir) {
         const config = resolveKernelConfig(settings);
         const fingerprint = computeFingerprint(sessionKey, turns, config);
         const cached = await persistence.load(sessionKey);
+        if (cached.hostMetadata.identityBridge) {
+          identityState = loadIdentityBridgeState(cached.hostMetadata.identityBridge);
+        }
         const stateVersion = cached.hostMetadata.stateVersion ?? 0;
         if (cached.hostMetadata.lastProjectionFingerprint === fingerprint) {
           const memCached = projectionCache.get(sessionKey);
@@ -4666,6 +4679,8 @@ ${lines.join("\n")}${active.length > 3 ? `
             runtimeStats: nextStats,
             // V0.7.1：usage 事实持久化（estimate/actual/host/compressionCredit，per-session）
             usageState: um2.snapshot(),
+            // V0.7.9：identity-bridge state 持久化（跨 VM/工具路径共享）。
+            identityBridge: identityState,
             absorbCandidates: nextAbsorbCandidates
           }
         };
@@ -4721,6 +4736,9 @@ ${lines.join("\n")}${active.length > 3 ? `
       try {
         const config = resolveKernelConfig(settings);
         const loaded = await persistence.load(sessionKey);
+        if (loaded.hostMetadata.identityBridge) {
+          identityState = loadIdentityBridgeState(loaded.hostMetadata.identityBridge);
+        }
         const rawTurns = Array.isArray(messages) && messages.length > 0 ? messages : rawTurnsCache.get(sessionKey) ?? loaded.lastRawTurns ?? await persistence.loadRawTurns(sessionKey);
         const invalid = rawTurns.find((t) => {
           const tt = t;
@@ -4729,7 +4747,7 @@ ${lines.join("\n")}${active.length > 3 ? `
         if (invalid) {
           return { state: loaded.kernelState, blocksCreated: 0, tokensCompressed: 0, errors: ["compress: messages \u53C2\u6570\u7ED3\u6784\u975E\u6CD5\uFF08\u9700\u8981 PromptTurn[] \u6216\u7701\u7565\uFF09"], warnings: [] };
         }
-        const mapping = promptTurnsToCoreMessages(rawTurns);
+        const mapping = mapTurnsWithIdentity(rawTurns);
         const applied = core.applyCompression({
           ranges: ranges.map((r) => ({
             startRef: r.startRef,
@@ -4782,6 +4800,8 @@ ${lines.join("\n")}${active.length > 3 ? `
             lastProjectionFingerprint: void 0,
             runtimeStats: nextStats,
             ...usageStateForSave ? { usageState: usageStateForSave } : {},
+            // V0.7.9：identity-bridge state 持久化（compress/absorb 工具路径）。
+            identityBridge: identityState,
             blockSources: {
               ...loaded.hostMetadata.blockSources ?? {},
               ...newBlockIds.length > 0 ? Object.fromEntries(newBlockIds.map((id) => [id, "model"])) : {}
@@ -4832,8 +4852,11 @@ ${lines.join("\n")}${active.length > 3 ? `
       try {
         const config = resolveKernelConfig(settings);
         const loaded = await persistence.load(sessionKey);
+        if (loaded.hostMetadata.identityBridge) {
+          identityState = loadIdentityBridgeState(loaded.hostMetadata.identityBridge);
+        }
         const rawTurns = rawTurnsCache.get(sessionKey) ?? loaded.lastRawTurns ?? await persistence.loadRawTurns(sessionKey);
-        const mapping = promptTurnsToCoreMessages(rawTurns);
+        const mapping = mapTurnsWithIdentity(rawTurns);
         const result = applyAbsorb({
           ref,
           summary,

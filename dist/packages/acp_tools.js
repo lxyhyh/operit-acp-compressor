@@ -3959,6 +3959,10 @@ function createOperitHostUsageAdapter(opts) {
   const maxCacheAgeMs = opts?.maxCacheAgeMs ?? 3e4;
   const cache2 = /* @__PURE__ */ new Map();
   let sqliteOk;
+  let retryAfterMs = 0;
+  let failCount = 0;
+  const INITIAL_RETRY_MS = 1e4;
+  const MAX_RETRY_MS = 12e4;
   const dbPath = "/data/user/0/com.ai.assistance.operit/databases/app_database";
   const buildCmd = (chatId) => `python3 -c "import sqlite3;" && python3 -c "import sqlite3,json,sys;c=sqlite3.connect('file:${dbPath}?mode=ro',uri=True);r=c.execute('SELECT currentWindowSize FROM chats WHERE id=?',('${chatId}',)).fetchone();print(int(r[0]) if r and r[0] is not None else '')" 2>/dev/null || python3 -c "import sqlite3;c=sqlite3.connect('${dbPath}');r=c.execute('SELECT currentWindowSize FROM chats WHERE id=?',('${chatId}',)).fetchone();print(int(r[0]) if r and r[0] is not None else '')" 2>/dev/null`;
   return {
@@ -3969,7 +3973,7 @@ function createOperitHostUsageAdapter(opts) {
       if (hit && now - hit.at < Math.min(throttleMs, maxCacheAgeMs)) {
         return hit.fail ? void 0 : hit.value;
       }
-      if (sqliteOk === false) return void 0;
+      if (sqliteOk === false && now < retryAfterMs) return void 0;
       const start = Date.now();
       const got = await Promise.race([
         execFn(buildCmd(chatId)).catch(() => void 0),
@@ -3981,13 +3985,34 @@ function createOperitHostUsageAdapter(opts) {
         const n = Number(got.trim());
         if (Number.isFinite(n) && n > 0) value = n;
       }
-      if (typeof got === "string" && got.trim().length > 0 && value === void 0) {
-      }
       cache2.set(chatId, { value, at: now, fail: value === void 0 });
-      if (value === void 0) sqliteOk = sqliteOk === void 0 ? false : sqliteOk;
+      if (value === void 0) {
+        failCount++;
+        sqliteOk = false;
+        retryAfterMs = now + Math.min(INITIAL_RETRY_MS * Math.pow(2, failCount - 1), MAX_RETRY_MS);
+      } else {
+        failCount = 0;
+        sqliteOk = true;
+        retryAfterMs = 0;
+      }
       return value;
     }
   };
+}
+
+// src/acp/nudge-delivery.ts
+function buildNudgeCarrier(nudgeText, level) {
+  return {
+    kind: "SYSTEM",
+    content: nudgeText,
+    metadata: { acpNudge: true, acpNudgeLevel: level }
+  };
+}
+function createNudgeDelivery(stage) {
+  return { armed: false, deliveredToPreparedHistory: false, stage };
+}
+function markDelivered(d, nudgeText, carrier, level) {
+  return { ...d, armed: true, carrierSelected: carrier.kind, deliveredToPreparedHistory: true, nudgeText, level };
 }
 
 // src/acp/adapter.ts
@@ -4367,9 +4392,13 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
             }
           }
           let stage2NudgeText;
+          let stage2Delivery;
           if (stage2Pressure.pressure.allowInject && settings.nudgeEnabled) {
+            stage2Delivery = createNudgeDelivery(hookStage);
             stage2NudgeText = buildNudgeTextFromReason(stage2Pressure.pressure.decisionReason, stage2Level);
-            finalPrepared.push({ kind: "SYSTEM", content: stage2NudgeText, metadata: { acpNudge: true, acpNudgeLevel: stage2Level } });
+            const stage2Carrier = buildNudgeCarrier(stage2NudgeText, stage2Level);
+            finalPrepared.push({ kind: stage2Carrier.kind, content: stage2Carrier.content, metadata: stage2Carrier.metadata });
+            stage2Delivery = markDelivered(stage2Delivery, stage2NudgeText, stage2Carrier, stage2Level);
             stage2Pressure.nextStats.nudgeIssued = (stage2Pressure.nextStats.nudgeIssued ?? 0) + 1;
             if (stage2Level === "gentle") stage2Pressure.nextStats.gentleNudges = (stage2Pressure.nextStats.gentleNudges ?? 0) + 1;
             else if (stage2Level === "strong") stage2Pressure.nextStats.strongNudges = (stage2Pressure.nextStats.strongNudges ?? 0) + 1;
@@ -4418,7 +4447,7 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
             await persistence.save(sessionKey, stage2NextState);
           } catch {
           }
-          return { preparedHistory: finalPrepared, fingerprint: fp, state: cached2.kernelState, nudgeText: stage2NudgeText };
+          return { preparedHistory: finalPrepared, fingerprint: fp, state: cached2.kernelState, nudgeText: stage2NudgeText, delivery: stage2Delivery };
         }
         const config = resolveKernelConfig(settings);
         const fingerprint = computeFingerprint(sessionKey, turns, config);
@@ -4493,9 +4522,13 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
             }
           }
           let cacheNudgeText;
+          let cacheDelivery;
           if (cachePressure.pressure.allowInject && settings.nudgeEnabled) {
+            cacheDelivery = createNudgeDelivery(hookStage);
             cacheNudgeText = buildNudgeTextFromReason(cachePressure.pressure.decisionReason, cacheLevel);
-            cacheFinal.push({ kind: "SYSTEM", content: cacheNudgeText, metadata: { acpNudge: true, acpNudgeLevel: cacheLevel } });
+            const cacheCarrier = buildNudgeCarrier(cacheNudgeText, cacheLevel);
+            cacheFinal.push({ kind: cacheCarrier.kind, content: cacheCarrier.content, metadata: cacheCarrier.metadata });
+            cacheDelivery = markDelivered(cacheDelivery, cacheNudgeText, cacheCarrier, cacheLevel);
             cachePressure.nextStats.nudgeIssued = (cachePressure.nextStats.nudgeIssued ?? 0) + 1;
             if (cacheLevel === "gentle") cachePressure.nextStats.gentleNudges = (cachePressure.nextStats.gentleNudges ?? 0) + 1;
             else if (cacheLevel === "strong") cachePressure.nextStats.strongNudges = (cachePressure.nextStats.strongNudges ?? 0) + 1;
@@ -4541,7 +4574,7 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
             console.log(`[acp] project CACHE-HIT stage=${hookStage} fp=${fingerprint.slice(0, 12)} nudge=${cachePressure.pressure.allowInject ? 1 : 0} eff=${Math.round(cachePressure.pressurePct * 100)}% reason=${cachePressure.pressure.decisionReason}`);
           } catch {
           }
-          return { preparedHistory: cacheFinal, fingerprint, state: cached.kernelState, nudgeText: cacheNudgeText };
+          return { preparedHistory: cacheFinal, fingerprint, state: cached.kernelState, nudgeText: cacheNudgeText, delivery: cacheDelivery };
         }
         if (!(cached.hostMetadata.lastProjectionFingerprint === fingerprint)) {
           const memPrev = projectionCache.get(sessionKey);
@@ -4627,9 +4660,13 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
                 }
               }
               let incNudgeText;
+              let incDelivery;
               if (incPressure.pressure.allowInject && settings.nudgeEnabled) {
+                incDelivery = createNudgeDelivery(hookStage);
                 incNudgeText = buildNudgeTextFromReason(incPressure.pressure.decisionReason, incLevel);
-                incFinal.push({ kind: "SYSTEM", content: incNudgeText, metadata: { acpNudge: true, acpNudgeLevel: incLevel } });
+                const incCarrier = buildNudgeCarrier(incNudgeText, incLevel);
+                incFinal.push({ kind: incCarrier.kind, content: incCarrier.content, metadata: incCarrier.metadata });
+                incDelivery = markDelivered(incDelivery, incNudgeText, incCarrier, incLevel);
                 incPressure.nextStats.nudgeIssued = (incPressure.nextStats.nudgeIssued ?? 0) + 1;
                 if (incLevel === "gentle") incPressure.nextStats.gentleNudges = (incPressure.nextStats.gentleNudges ?? 0) + 1;
                 else if (incLevel === "strong") incPressure.nextStats.strongNudges = (incPressure.nextStats.strongNudges ?? 0) + 1;
@@ -4677,7 +4714,7 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
                 console.log(`[acp] project INCREMENTAL stage=${hookStage} +${delta.length} raw=${turns.length} proj=${incFinal.length} nudge=${incPressure.pressure.allowInject ? 1 : 0} eff=${Math.round(incPressure.pressurePct * 100)}% reason=${incPressure.pressure.decisionReason} (skipped full processTurn)`);
               } catch {
               }
-              return { preparedHistory: incFinal, fingerprint, state: cached.kernelState, nudgeText: incNudgeText };
+              return { preparedHistory: incFinal, fingerprint, state: cached.kernelState, nudgeText: incNudgeText, delivery: incDelivery };
             }
           }
         }
@@ -4824,7 +4861,9 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
         };
         const level = pressure.level ?? (preflightTriggered && preflightStillOver ? "emergency" : pressurePct >= settings.strongThresholdPct ? "strong" : pressurePct >= settings.gentleThresholdPct ? "gentle" : "gentle");
         let nudgeText;
+        let delivery;
         if (pressure.allowInject && settings.nudgeEnabled) {
+          delivery = createNudgeDelivery(hookStage);
           nudgeText = buildNudgeText(turn.nudge, level);
           const active = getActiveAbsorbCandidates(nextAbsorbCandidates);
           if (active.length > 0) {
@@ -4835,7 +4874,9 @@ ${lines.join("\n")}${active.length > 3 ? `
 - \u53CA\u53E6\u5916 ${active.length - 3} \u6761` : ""}
 \u5982\u679C\u8FD9\u4E9B\u5185\u5BB9\u5DF2\u88AB\u6D88\u8D39\u4E14\u540E\u7EED\u4E0D\u9700\u8981\u539F\u6587\uFF0C\u8BF7\u8C03\u7528 absorb(ref="...", summary="...") \u91CA\u653E\u4E0A\u4E0B\u6587\u7A7A\u95F4\u3002`;
           }
-          projectedTurns.push({ kind: "SYSTEM", content: nudgeText, metadata: { acpNudge: true, acpNudgeLevel: level } });
+          const carrier = buildNudgeCarrier(nudgeText, level);
+          projectedTurns.push({ kind: carrier.kind, content: carrier.content, metadata: carrier.metadata });
+          delivery = markDelivered(delivery, nudgeText, carrier, level);
           nextStats.nudgeIssued += 1;
           if (level === "gentle") nextStats.gentleNudges += 1;
           else if (level === "strong") nextStats.strongNudges += 1;
@@ -4922,7 +4963,7 @@ ${lines.join("\n")}${active.length > 3 ? `
           console.log(`[acp] project-return stage=${hookStage} firstKind=${p0?.kind ?? "-"} sysLen=${pLen} sysHasAcp=${pHasAcp} projLen=${cappedTurns.length}`);
         } catch {
         }
-        return { preparedHistory: cappedTurns, fingerprint, nudgeText, state: turn.state };
+        return { preparedHistory: cappedTurns, fingerprint, nudgeText, state: turn.state, delivery };
       } finally {
         release();
       }

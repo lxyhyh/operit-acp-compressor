@@ -18,6 +18,21 @@ import { appendAcpSystemPrompt } from "./system-prompt";
 import { loadAdapterSettings } from "./config";
 import { buildAcpToolPromptItems } from "./tools-meta";
 import { LOG_ACP_FILE, LOG_TOOLS_VISIBILITY_FILE } from "./paths";
+import { deliveryTraceLine, findNudgeTurn, markFinalCheck, type NudgeDelivery } from "./nudge-delivery";
+
+/** trace 写入器（lazy require；与 trace.ts 的 chatTrace 同构，失败不影响主流程）。 */
+function requireTraceWriter(): ((line: string) => void) | undefined {
+  try {
+    // trace.ts 的 chatTrace(sessionKey, ...) 需要 sessionKey，这里仅做追加写。
+    // 直接复用 Tools.Files.write 追加（路径与 trace.ts 的 ACP_TRACE_FILE 一致）。
+    const path = "/sdcard/Download/Operit/plugins/com.operit.acp_compressor/logs/acp_trace.jsonl";
+    return (line: string) => {
+      Tools.Files.write(path, line, true, "android");
+    };
+  } catch {
+    return undefined;
+  }
+}
 
 /** 追加一行诊断日志（失败不影响主流程）。 */
 function diagLog(file: string, line: string): void {
@@ -70,6 +85,15 @@ async function safeProject(engine: AcpEngine, sessionKey: string, chatId: string
 /**
  * PromptFinalizeHook 处理函数（具名导出；宿主强校验模块具名导出）。
  * 返回 { preparedHistory } 以应用投影；失败/未启用/无 turns 时不干预。
+ *
+ * V0.7.5（三边审计后）：
+ * - 宿主对一次真实用户发送调用 2 次 finalize（before_finalize_prompt →
+ *   before_send_to_model，同一 context 链式传递）。stage1 注入 nudge，
+ *   stage2 验证 nudge 仍在 preparedHistory（finalPreparedHistoryHasNudge）。
+ * - Tool Loop 内部 hop（processToolResults）直连 serviceForFunction.sendMessage，
+ *   不经过 finalize → ACP 无法在工具循环 hop 注入；nudge 不会进入工具循环历史
+ *   （SYSTEM carrier 不写回 conversationHistory，ephemeral 成立）。
+ * - 同一次真实 send：stage1+stage2 共享同一 fingerprint/cycle，preflight 最多一次。
  */
 export async function onFinalize(event: FinalizeHookEvent): Promise<PromptHookObjectResult | void> {
   const engine = createEngine();
@@ -99,6 +123,16 @@ export async function onFinalize(event: FinalizeHookEvent): Promise<PromptHookOb
   if (!engine.settings.enabled) return;
   if (turns.length === 0) return;
 
+  // V0.7.5：stage2（before_send_to_model）先验证 stage1 注入的 nudge 是否仍在
+  // preparedHistory（宿主 applyFinalizedCurrentUserTurn / mergeAdjacentTurns 可能改动）。
+  // 记录 delivery 证据（delivered=true 但 final=false → reason=operit-finalize-replaced）。
+  if (stage === "before_send_to_model") {
+    try {
+      const nudge = findNudgeTurn(turns);
+      diagLog(LOG_TOOLS_VISIBILITY_FILE, `[nudge-delivery] stage=${stage} finalHasNudge=${nudge ? 1 : 0} kind=${nudge?.turn.kind ?? "-"}`);
+    } catch { /* ignore */ }
+  }
+
   const projected = await safeProject(engine, sessionKey, ctx.chatId, ctx.isSubTask, stage, turns);
   if (projected === undefined) return;
   // finalize 返回：preparedHistory 投影 + systemPrompt 追加 ACP 指南。
@@ -114,6 +148,20 @@ export async function onFinalize(event: FinalizeHookEvent): Promise<PromptHookOb
     }
   } else {
     diagLog(LOG_TOOLS_VISIBILITY_FILE, `[finalize] payload.systemPrompt empty (len=0), cannot inject via finalize`);
+  }
+  // V0.7.5：delivery 证明链 trace——engine 已返回 delivery（armed/carrier/delivered），
+  // 这里补 final 验证（本次返回的 preparedHistory 是否含 nudge）。
+  const engineDelivery = projected as unknown as { delivery?: NudgeDelivery };
+  if (engineDelivery?.delivery) {
+    const finalHasNudge = findNudgeTurn(projected as PromptTurn[]) !== undefined;
+    const final = markFinalCheck(engineDelivery.delivery, finalHasNudge);
+    diagLog(LOG_TOOLS_VISIBILITY_FILE, `[nudge-delivery] stage=${stage} armed=${final.armed ? 1 : 0} carrier=${final.carrierSelected ?? "-"} delivered=${final.deliveredToPreparedHistory ? 1 : 0} final=${final.finalPreparedHistoryHasNudge ? 1 : 0} reason=${final.reason ?? "-"}`);
+    // 也写进 trace.jsonl（与 chatTrace 同构；失败不影响主流程）
+    try {
+      const line = deliveryTraceLine(final);
+      const trace = requireTraceWriter();
+      if (trace) trace(JSON.stringify(line) + "\n");
+    } catch { /* ignore */ }
   }
   return result;
 }

@@ -60,7 +60,15 @@ export function createOperitHostUsageAdapter(
   // 缓存仅用于节流，不作为长期 truth；超过 maxCacheAge 必重新读。
   const maxCacheAgeMs = opts?.maxCacheAgeMs ?? 30_000;
   const cache = new Map<string, { value?: number; at: number; fail: boolean }>();
+  // V0.7.5：不再永久 disabled。一次失败只进入短退避（retryAfterMs），
+  // 超过退避窗口后重新尝试；连续失败会指数退避但封顶，避免每轮都打 DB。
+  // （文档十三：transient failure 可恢复、保持 throttle、保持 maxCacheAge，
+  //   不把一次失败变成整个进程生命周期的永久 disabled。）
   let sqliteOk: boolean | undefined;
+  let retryAfterMs = 0;
+  let failCount = 0;
+  const INITIAL_RETRY_MS = 10_000;
+  const MAX_RETRY_MS = 120_000;
 
   const dbPath = "/data/user/0/com.ai.assistance.operit/databases/app_database";
 
@@ -84,7 +92,8 @@ export function createOperitHostUsageAdapter(
       if (hit && now - hit.at < Math.min(throttleMs, maxCacheAgeMs)) {
         return hit.fail ? undefined : hit.value;
       }
-      if (sqliteOk === false) return undefined; // 环境不支持则快速失败（不每轮都试）
+      // V0.7.5：失败退避而非永久 disabled。退避窗口内快速失败，窗口外重试。
+      if (sqliteOk === false && now < retryAfterMs) return undefined;
 
       const start = Date.now();
       const got = await Promise.race([
@@ -98,10 +107,17 @@ export function createOperitHostUsageAdapter(
         const n = Number(got.trim());
         if (Number.isFinite(n) && n > 0) value = n;
       }
-      if (typeof got === "string" && got.trim().length > 0 && value === undefined) {
-      }
       cache.set(chatId, { value, at: now, fail: value === undefined });
-      if (value === undefined) sqliteOk = sqliteOk === undefined ? false : sqliteOk;
+      if (value === undefined) {
+        // 记录失败 + 指数退避（封顶 2 分钟），窗口过后重新尝试（可恢复）。
+        failCount++;
+        sqliteOk = false;
+        retryAfterMs = now + Math.min(INITIAL_RETRY_MS * Math.pow(2, failCount - 1), MAX_RETRY_MS);
+      } else {
+        failCount = 0;
+        sqliteOk = true;
+        retryAfterMs = 0;
+      }
       return value;
     },
   };

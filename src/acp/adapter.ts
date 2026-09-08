@@ -55,6 +55,14 @@ import { createUsageManager, type UsageManager, type UsageManagerState } from ".
 import type { TokenSnapshot } from "./token-source";
 import { createOperitHostUsageAdapter, type HostUsageAdapter } from "./host-usage-adapter";
 import { detectProtocol, normalizeUsage, type ProviderUsage } from "./token-source";
+import {
+  buildNudgeCarrier,
+  createNudgeDelivery,
+  findNudgeTurn,
+  markDelivered,
+  markFinalCheck,
+  type NudgeDelivery,
+} from "./nudge-delivery";
 
 // —— V0.7.1 HostUsageAdapter 单例（module 级、只读 DB、失败返回 undefined，绝不拖垮请求）。
 let _hostUsageAdapter: HostUsageAdapter | undefined;
@@ -155,6 +163,8 @@ export interface ProjectionResult {
   fingerprint: string;
   nudgeText?: string;
   state: CompressionState;
+  /** V0.7.5：nudge delivery 证明链（armed → carrier → delivered → final） */
+  delivery?: NudgeDelivery;
 }
 
 /** 计算 projection fingerprint（轻量；stableKey 全量拼接）。 */
@@ -664,9 +674,13 @@ export function createEngine(dataDir?: string): AcpEngine {
           // nudge 必须最终进入实际发送的 preparedHistory（文档第八节：nudge 是 ephemeral，
           // 不能因为 stage2 复用缓存而丢失前一个 Hop 的 nudge——本 Hop 重新决策注入）。
           let stage2NudgeText: string | undefined;
+          let stage2Delivery: NudgeDelivery | undefined;
           if (stage2Pressure.pressure.allowInject && settings.nudgeEnabled) {
+            stage2Delivery = createNudgeDelivery(hookStage);
             stage2NudgeText = buildNudgeTextFromReason(stage2Pressure.pressure.decisionReason, stage2Level);
-            finalPrepared.push({ kind: "SYSTEM", content: stage2NudgeText, metadata: { acpNudge: true, acpNudgeLevel: stage2Level } });
+            const stage2Carrier = buildNudgeCarrier(stage2NudgeText, stage2Level);
+            finalPrepared.push({ kind: stage2Carrier.kind, content: stage2Carrier.content, metadata: stage2Carrier.metadata });
+            stage2Delivery = markDelivered(stage2Delivery, stage2NudgeText, stage2Carrier, stage2Level);
             stage2Pressure.nextStats.nudgeIssued = (stage2Pressure.nextStats.nudgeIssued ?? 0) + 1;
             if (stage2Level === "gentle") stage2Pressure.nextStats.gentleNudges = (stage2Pressure.nextStats.gentleNudges ?? 0) + 1;
             else if (stage2Level === "strong") stage2Pressure.nextStats.strongNudges = (stage2Pressure.nextStats.strongNudges ?? 0) + 1;
@@ -714,7 +728,7 @@ export function createEngine(dataDir?: string): AcpEngine {
             },
           };
           try { await persistence.save(sessionKey, stage2NextState); } catch { /* stage2 保存失败不影响返回 */ }
-          return { preparedHistory: finalPrepared as PromptTurnLike[], fingerprint: fp, state: cached.kernelState, nudgeText: stage2NudgeText };
+          return { preparedHistory: finalPrepared as PromptTurnLike[], fingerprint: fp, state: cached.kernelState, nudgeText: stage2NudgeText, delivery: stage2Delivery };
         }
         const config = resolveKernelConfig(settings);
         const fingerprint = computeFingerprint(sessionKey, turns, config);
@@ -800,9 +814,13 @@ export function createEngine(dataDir?: string): AcpEngine {
             }
           }
           let cacheNudgeText: string | undefined;
+          let cacheDelivery: NudgeDelivery | undefined;
           if (cachePressure.pressure.allowInject && settings.nudgeEnabled) {
+            cacheDelivery = createNudgeDelivery(hookStage);
             cacheNudgeText = buildNudgeTextFromReason(cachePressure.pressure.decisionReason, cacheLevel);
-            cacheFinal.push({ kind: "SYSTEM", content: cacheNudgeText, metadata: { acpNudge: true, acpNudgeLevel: cacheLevel } });
+            const cacheCarrier = buildNudgeCarrier(cacheNudgeText, cacheLevel);
+            cacheFinal.push({ kind: cacheCarrier.kind, content: cacheCarrier.content, metadata: cacheCarrier.metadata });
+            cacheDelivery = markDelivered(cacheDelivery, cacheNudgeText, cacheCarrier, cacheLevel);
             cachePressure.nextStats.nudgeIssued = (cachePressure.nextStats.nudgeIssued ?? 0) + 1;
             if (cacheLevel === "gentle") cachePressure.nextStats.gentleNudges = (cachePressure.nextStats.gentleNudges ?? 0) + 1;
             else if (cacheLevel === "strong") cachePressure.nextStats.strongNudges = (cachePressure.nextStats.strongNudges ?? 0) + 1;
@@ -846,7 +864,7 @@ export function createEngine(dataDir?: string): AcpEngine {
           try {
             console.log(`[acp] project CACHE-HIT stage=${hookStage} fp=${fingerprint.slice(0, 12)} nudge=${cachePressure.pressure.allowInject ? 1 : 0} eff=${Math.round(cachePressure.pressurePct * 100)}% reason=${cachePressure.pressure.decisionReason}`);
           } catch { /* noop */ }
-          return { preparedHistory: cacheFinal as PromptTurnLike[], fingerprint, state: cached.kernelState, nudgeText: cacheNudgeText };
+          return { preparedHistory: cacheFinal as PromptTurnLike[], fingerprint, state: cached.kernelState, nudgeText: cacheNudgeText, delivery: cacheDelivery };
         }
 
         // —— V0.6 Phase7 增量快速路径：stateVersion 未变 + 本次 turns 是上次的
@@ -948,9 +966,13 @@ export function createEngine(dataDir?: string): AcpEngine {
                 }
               }
               let incNudgeText: string | undefined;
+              let incDelivery: NudgeDelivery | undefined;
               if (incPressure.pressure.allowInject && settings.nudgeEnabled) {
+                incDelivery = createNudgeDelivery(hookStage);
                 incNudgeText = buildNudgeTextFromReason(incPressure.pressure.decisionReason, incLevel);
-                incFinal.push({ kind: "SYSTEM", content: incNudgeText, metadata: { acpNudge: true, acpNudgeLevel: incLevel } });
+                const incCarrier = buildNudgeCarrier(incNudgeText, incLevel);
+                incFinal.push({ kind: incCarrier.kind, content: incCarrier.content, metadata: incCarrier.metadata });
+                incDelivery = markDelivered(incDelivery, incNudgeText, incCarrier, incLevel);
                 incPressure.nextStats.nudgeIssued = (incPressure.nextStats.nudgeIssued ?? 0) + 1;
                 if (incLevel === "gentle") incPressure.nextStats.gentleNudges = (incPressure.nextStats.gentleNudges ?? 0) + 1;
                 else if (incLevel === "strong") incPressure.nextStats.strongNudges = (incPressure.nextStats.strongNudges ?? 0) + 1;
@@ -996,7 +1018,7 @@ export function createEngine(dataDir?: string): AcpEngine {
               try {
                 console.log(`[acp] project INCREMENTAL stage=${hookStage} +${delta.length} raw=${turns.length} proj=${incFinal.length} nudge=${incPressure.pressure.allowInject ? 1 : 0} eff=${Math.round(incPressure.pressurePct * 100)}% reason=${incPressure.pressure.decisionReason} (skipped full processTurn)`);
               } catch { /* noop */ }
-              return { preparedHistory: incFinal as PromptTurnLike[], fingerprint, state: cached.kernelState, nudgeText: incNudgeText };
+              return { preparedHistory: incFinal as PromptTurnLike[], fingerprint, state: cached.kernelState, nudgeText: incNudgeText, delivery: incDelivery };
             }
           }
         }
@@ -1207,8 +1229,11 @@ export function createEngine(dataDir?: string): AcpEngine {
             : "gentle");
 
         // nudge 仅当 controller 允许时注入（SYSTEM 消息追加；UI 不渲染成新用户消息）。
+        // V0.7.5：delivery 证明链——armed → carrierSelected → deliveredToPreparedHistory。
         let nudgeText: string | undefined;
+        let delivery: NudgeDelivery | undefined;
         if (pressure.allowInject && settings.nudgeEnabled) {
+          delivery = createNudgeDelivery(hookStage);
           nudgeText = buildNudgeText(turn.nudge!, level);
           // V0.6 Phase3.1：从持久化候选读取（检测已在 project 内与 nudge 解耦恒执行）。
           //    只消费候选，不在此处重新检测。文案提供可操作 ref（与 absorb 工具兼容）。
@@ -1217,7 +1242,9 @@ export function createEngine(dataDir?: string): AcpEngine {
             const lines = active.slice(0, 3).map((c) => `- ref=${c.ref} tool=${c.tool} size=${c.chars}`);
             nudgeText += `\n检测到可释放的大型工具输出。可吸收候选：\n${lines.join("\n")}${active.length > 3 ? `\n- 及另外 ${active.length - 3} 条` : ""}\n如果这些内容已被消费且后续不需要原文，请调用 absorb(ref="...", summary="...") 释放上下文空间。`;
           }
-          projectedTurns.push({ kind: "SYSTEM", content: nudgeText, metadata: { acpNudge: true, acpNudgeLevel: level } });
+          const carrier = buildNudgeCarrier(nudgeText, level);
+          projectedTurns.push({ kind: carrier.kind, content: carrier.content, metadata: carrier.metadata });
+          delivery = markDelivered(delivery, nudgeText, carrier, level);
           nextStats.nudgeIssued += 1;
           if (level === "gentle") nextStats.gentleNudges += 1;
           else if (level === "strong") nextStats.strongNudges += 1;
@@ -1307,7 +1334,7 @@ export function createEngine(dataDir?: string): AcpEngine {
           const pHasAcp = p0 && typeof (p0 as PromptTurnLike).content === "string" ? String((p0 as PromptTurnLike).content).includes("[ACP 上下文管理]") : false;
           console.log(`[acp] project-return stage=${hookStage} firstKind=${p0?.kind ?? "-"} sysLen=${pLen} sysHasAcp=${pHasAcp} projLen=${cappedTurns.length}`);
         } catch { /* noop */ }
-        return { preparedHistory: cappedTurns, fingerprint, nudgeText, state: turn.state };
+        return { preparedHistory: cappedTurns, fingerprint, nudgeText, state: turn.state, delivery };
       } finally {
         release();
       }

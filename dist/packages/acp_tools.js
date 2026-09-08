@@ -3785,26 +3785,66 @@ function computeEffectiveTokens(input) {
 }
 
 // src/acp/usage.ts
+var MAX_LEDGER = 40;
 function createUsageManager(initialState) {
   const s = {
     lastActualTokens: initialState?.lastActualTokens,
     lastActualAt: initialState?.lastActualAt,
     lastHostTokens: initialState?.lastHostTokens,
     lastHostAt: initialState?.lastHostAt,
+    lastEstimateTokens: initialState?.lastEstimateTokens,
     compressionCreditTokens: initialState?.compressionCreditTokens ?? 0,
-    lastHop: initialState?.lastHop ?? 0
+    lastHop: initialState?.lastHop ?? 0,
+    hopLedger: Array.isArray(initialState?.hopLedger) ? initialState.hopLedger : []
   };
+  function pushLedger(entry) {
+    const ledger = s.hopLedger ?? [];
+    const hop = entry.hop ?? s.lastHop + 1;
+    ledger.push({
+      hop,
+      estimateTokens: entry.estimateTokens,
+      actualTokens: entry.actualTokens,
+      hostTokens: entry.hostTokens,
+      compressionCredit: entry.compressionCredit,
+      effectiveTokens: entry.effectiveTokens,
+      source: entry.source,
+      confidence: entry.confidence,
+      at: Date.now()
+    });
+    s.hopLedger = ledger.slice(-MAX_LEDGER);
+    s.lastHop = Math.max(s.lastHop, hop);
+  }
   return {
     recordUpstreamUsage(sample) {
       if (typeof sample.contextTokens === "number" && Number.isFinite(sample.contextTokens) && sample.contextTokens > 0) {
         s.lastActualTokens = sample.contextTokens;
         s.lastActualAt = Date.now();
-        s.lastHop = sample.hop ?? s.lastHop;
-        if (s.compressionCreditTokens > 0 && sample.contextTokens < s.compressionCreditTokens) {
-          s.compressionCreditTokens = 0;
-        } else if (s.compressionCreditTokens > 0) {
-          s.compressionCreditTokens = 0;
+        if (sample.hop !== void 0) s.lastHop = Math.max(s.lastHop, sample.hop);
+        const foldedWindow = s.lastEstimateTokens;
+        if (s.compressionCreditTokens > 0) {
+          if (typeof foldedWindow === "number" && foldedWindow > 0) {
+            const excess = Math.max(0, sample.contextTokens - foldedWindow);
+            s.compressionCreditTokens = Math.max(0, s.compressionCreditTokens - excess);
+          } else {
+            s.compressionCreditTokens = 0;
+          }
         }
+        const snap = computeEffectiveTokens({
+          estimatedTokens: s.lastEstimateTokens ?? 0,
+          actualTokens: s.lastActualTokens,
+          hostTokens: s.lastHostTokens,
+          compressionCredit: s.compressionCreditTokens
+        });
+        pushLedger({
+          hop: sample.hop,
+          estimateTokens: s.lastEstimateTokens,
+          actualTokens: sample.contextTokens,
+          hostTokens: s.lastHostTokens,
+          compressionCredit: s.compressionCreditTokens,
+          effectiveTokens: snap.effectiveTokens,
+          source: snap.source,
+          confidence: snap.confidence
+        });
       }
     },
     recordHostUsage(tokens, hop) {
@@ -3816,20 +3856,29 @@ function createUsageManager(initialState) {
     },
     recordEstimate(tokens, hop) {
       if (typeof tokens === "number" && Number.isFinite(tokens) && tokens > 0) {
+        s.lastEstimateTokens = tokens;
         if (hop !== void 0) s.lastHop = Math.max(s.lastHop, hop);
       }
     },
     getLatestActual: () => s.lastActualTokens,
     getLatestHost: () => s.lastHostTokens,
+    getLatestEstimate: () => s.lastEstimateTokens,
     getCompressionCredit: () => s.compressionCreditTokens,
     applyCompressionCredit(tokens) {
       if (typeof tokens === "number" && Number.isFinite(tokens) && tokens > 0) {
         s.compressionCreditTokens += tokens;
       }
     },
-    consumeCompressionCredit() {
-      const left = s.compressionCreditTokens;
-      return left;
+    consumeCompressionCredit(actualTokens, foldedWindowTokens) {
+      if (s.compressionCreditTokens <= 0) return 0;
+      if (typeof actualTokens !== "number" || !Number.isFinite(actualTokens) || actualTokens <= 0) {
+        return s.compressionCreditTokens;
+      }
+      const window = typeof foldedWindowTokens === "number" && foldedWindowTokens > 0 ? foldedWindowTokens : s.lastEstimateTokens ?? 0;
+      const excess = Math.max(0, actualTokens - window);
+      const consume = Math.min(s.compressionCreditTokens, excess);
+      s.compressionCreditTokens -= consume;
+      return s.compressionCreditTokens;
     },
     clearCompressionCredit() {
       s.compressionCreditTokens = 0;
@@ -3843,11 +3892,26 @@ function createUsageManager(initialState) {
       });
     },
     getLastHop: () => s.lastHop,
+    recordHopEntry(entry) {
+      pushLedger({
+        hop: entry.hop,
+        estimateTokens: entry.estimateTokens,
+        actualTokens: entry.actualTokens,
+        hostTokens: entry.hostTokens,
+        compressionCredit: entry.compressionCredit,
+        effectiveTokens: entry.effectiveTokens,
+        source: entry.source,
+        confidence: entry.confidence
+      });
+    },
+    getHopLedger: () => [...s.hopLedger ?? []],
     snapshot: () => ({
       lastActualTokens: s.lastActualTokens,
       lastHostTokens: s.lastHostTokens,
+      lastEstimateTokens: s.lastEstimateTokens,
       compressionCreditTokens: s.compressionCreditTokens,
-      lastHop: s.lastHop
+      lastHop: s.lastHop,
+      hopLedger: [...s.hopLedger ?? []]
     })
   };
 }
@@ -4231,6 +4295,7 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           }
         }
         const usageManager = createUsageManager(cached.hostMetadata.usageState);
+        const hopNo = (usageManager.getLastHop() ?? 0) + 1;
         const nextStats = { ...prevStats };
         const newBlockIds = turn.state.blocks.filter((b) => !cached.kernelState.blocks.some((pb) => pb.blockId === b.blockId)).map((b) => b.blockId);
         if (autoFolded && newBlockIds.length > 0) {
@@ -4253,8 +4318,8 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
         const curBlocks = turn.state.blocks.length;
         const prevTokenCount = cached.hostMetadata.lastTokenEstimate ?? 0;
         const hostTokens = chatId ? await getHostUsageAdapter().getCurrentContextTokens(String(chatId)) : void 0;
-        if (hostTokens !== void 0) usageManager.recordHostUsage(hostTokens);
-        usageManager.recordEstimate(tokenEstimate);
+        if (hostTokens !== void 0) usageManager.recordHostUsage(hostTokens, hopNo);
+        usageManager.recordEstimate(tokenEstimate, hopNo);
         const eff = usageManager.getEffectiveSnapshot(tokenEstimate);
         const pressurePct = config.modelContextLimit > 0 ? (eff.effectiveTokens || tokenEstimate) / config.modelContextLimit : (eff.effectiveTokens || tokenEstimate) / 2e5;
         const prevEpoch = prevNudgeState.acpEpoch;
@@ -4287,6 +4352,19 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           // 持久化 epoch 到 acpNudge（跨轮/跨 VM 恢复压力档位）
           ...pressure.nextEpoch ? { acpEpoch: pressure.nextEpoch } : {}
         };
+        try {
+          usageManager.recordHopEntry({
+            hop: hopNo,
+            estimateTokens: tokenEstimate,
+            actualTokens: eff.actualTokens,
+            hostTokens: eff.hostTokens,
+            compressionCredit: eff.compressionCredit ?? 0,
+            effectiveTokens: eff.effectiveTokens,
+            source: eff.source,
+            confidence: eff.confidence
+          });
+        } catch {
+        }
         const level = pressure.level ?? (emergency ? "emergency" : pressurePct >= settings.strongThresholdPct ? "strong" : pressurePct >= settings.gentleThresholdPct ? "gentle" : "gentle");
         let nudgeText;
         if (pressure.allowInject && settings.nudgeEnabled) {
@@ -4316,6 +4394,8 @@ ${lines.join("\n")}${active.length > 3 ? `
             toolLoopCoverage: "main-request-only",
             lastUpdatedAt: Date.now(),
             lastTokenEstimate: tokenEstimate,
+            // V0.7.2：记录真实 chatId（供 applyCompression 显式查询 host DB，禁止 split 推导）。
+            ...chatId ? { lastChatId: String(chatId) } : {},
             acpNudge: nextNudgeState,
             runtimeStats: nextStats,
             // V0.7.1：usage 事实持久化（estimate/actual/host/compressionCredit，per-session）
@@ -4343,6 +4423,7 @@ ${lines.join("\n")}${active.length > 3 ? `
             type: "project",
             stage: hookStage,
             detail: {
+              hop: hopNo,
               raw: turns.length,
               proj: cappedTurns.length,
               blocks: turn.state.blocks.length,
@@ -4374,7 +4455,7 @@ ${lines.join("\n")}${active.length > 3 ? `
         release();
       }
     },
-    async applyCompression(sessionKey, ranges, messages) {
+    async applyCompression(sessionKey, ranges, messages, chatId) {
       const release = await acquireLock(sessionKey);
       let usageStateForSave;
       try {
@@ -4424,7 +4505,8 @@ ${lines.join("\n")}${active.length > 3 ? `
           }
           const mgr = createUsageManager(loaded.hostMetadata.usageState);
           mgr.applyCompressionCredit(applied.result.tokensCompressed);
-          const hostNow = await getHostUsageAdapter().getCurrentContextTokens(String(sessionKey).split("_")[0] ?? sessionKey).catch(() => void 0);
+          const effectiveChatId = chatId || loaded.hostMetadata.lastChatId || "";
+          const hostNow = effectiveChatId ? await getHostUsageAdapter().getCurrentContextTokens(effectiveChatId).catch(() => void 0) : void 0;
           if (hostNow !== void 0) mgr.recordHostUsage(hostNow);
           usageStateForSave = mgr.snapshot();
         } else if (applied.result.blocksCreated === 0) {
@@ -4609,6 +4691,10 @@ function sessionKeyFromParams(params) {
   if (typeof chatId === "string" && chatId.length > 0) return buildSessionKey({ chatId });
   return "no-chat";
 }
+function injectedChatId(params) {
+  const c = params.__operit_package_chat_id;
+  return typeof c === "string" ? c : "";
+}
 function probeParams(tool, params) {
   try {
     const keys = Object.keys(params || {});
@@ -4644,7 +4730,8 @@ async function compress(params) {
       return { success: false, message: "content \u4E3A\u7A7A\uFF1A\u81F3\u5C11\u9700\u8981\u4E00\u4E2A { startId, endId, summary } \u8303\u56F4\u3002" };
     }
     const turns = Array.isArray(params.messages) ? params.messages : [];
-    const result = await e.applyCompression(sessionKey, ranges, turns);
+    const chatId = injectedChatId(params) || params.chatId || "";
+    const result = await e.applyCompression(sessionKey, ranges, turns, chatId || void 0);
     const savedTokens = result.tokensCompressed || 0;
     const blocks = result.blocksCreated || 0;
     return {

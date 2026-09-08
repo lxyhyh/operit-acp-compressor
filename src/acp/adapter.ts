@@ -185,6 +185,7 @@ export interface AcpEngine {
     sessionKey: string,
     ranges: { startRef: string; endRef: string; summary: string; topic?: string; summaryMaxChars?: number; compressCallId?: string }[],
     messages: PromptTurnLike[],
+    chatId?: string,
   ): Promise<{ state: CompressionState; blocksCreated: number; tokensCompressed: number; errors: string[]; warnings: string[] }>;
   deactivateBlock(sessionKey: string, blockId: string): Promise<{ ok: boolean; error?: string }>;
   absorb(sessionKey: string, ref: string, summary: string): Promise<{ ok: boolean; resultText: string; absorbedTokens?: number }>;
@@ -491,6 +492,7 @@ export function createEngine(dataDir?: string): AcpEngine {
         //    applyCompression 单独计数（source=model）。
         // —— V0.7.1：UsageManager 前置创建（emergency credit 与 effective pressure 共用）。
         const usageManager = createUsageManager((cached.hostMetadata.usageState as UsageManagerState | undefined));
+        const hopNo = (usageManager.getLastHop() ?? 0) + 1; // V0.7.2 per-hop 计数
         const nextStats = { ...prevStats };
         const newBlockIds = turn.state.blocks.filter((b) => !cached.kernelState.blocks.some((pb) => pb.blockId === b.blockId)).map((b) => b.blockId);
         if (autoFolded && newBlockIds.length > 0) {
@@ -530,8 +532,8 @@ export function createEngine(dataDir?: string): AcpEngine {
         // 删除 fake actualUsage（此前把 tokenEstimate/limit 冒充 actualUsage）。
         // 宿主侧测量（尽力而为；DB 不可读返回 undefined，绝不拖垮请求）。
         const hostTokens = chatId ? await getHostUsageAdapter().getCurrentContextTokens(String(chatId)) : undefined;
-        if (hostTokens !== undefined) usageManager.recordHostUsage(hostTokens);
-        usageManager.recordEstimate(tokenEstimate);
+        if (hostTokens !== undefined) usageManager.recordHostUsage(hostTokens, hopNo);
+        usageManager.recordEstimate(tokenEstimate, hopNo);
         // 若插件曾通过工具链路记录过上游 usage，则注入（见 recordUpstreamUsage 调用点）。
         const eff = usageManager.getEffectiveSnapshot(tokenEstimate);
         const pressurePct = config.modelContextLimit > 0
@@ -568,6 +570,19 @@ export function createEngine(dataDir?: string): AcpEngine {
           // 持久化 epoch 到 acpNudge（跨轮/跨 VM 恢复压力档位）
           ...(pressure.nextEpoch ? { acpEpoch: pressure.nextEpoch } : {}),
         };
+        // —— V0.7.2：per-hop ledger（发送前决策视图；与 trace 同源，持久化在 usageState）。
+        try {
+          usageManager.recordHopEntry({
+            hop: hopNo,
+            estimateTokens: tokenEstimate,
+            actualTokens: eff.actualTokens,
+            hostTokens: eff.hostTokens,
+            compressionCredit: eff.compressionCredit ?? 0,
+            effectiveTokens: eff.effectiveTokens,
+            source: eff.source,
+            confidence: eff.confidence,
+          });
+        } catch { /* ledger 失败不影响主流程 */ }
 
         // nudge 档位：pressure controller 输出（无注入时按 usage 兜底算档位供 stats）
         const level: NudgeLevel = pressure.level ??
@@ -606,6 +621,8 @@ export function createEngine(dataDir?: string): AcpEngine {
             toolLoopCoverage: "main-request-only",
             lastUpdatedAt: Date.now(),
             lastTokenEstimate: tokenEstimate,
+            // V0.7.2：记录真实 chatId（供 applyCompression 显式查询 host DB，禁止 split 推导）。
+            ...(chatId ? { lastChatId: String(chatId) } : {}),
             acpNudge: nextNudgeState,
             runtimeStats: nextStats,
             // V0.7.1：usage 事实持久化（estimate/actual/host/compressionCredit，per-session）
@@ -638,6 +655,7 @@ export function createEngine(dataDir?: string): AcpEngine {
           chatTrace(chatId, {
             type: "project", stage: hookStage,
             detail: {
+              hop: hopNo,
               raw: turns.length, proj: cappedTurns.length, blocks: turn.state.blocks.length,
               tok: tokenEstimate,
               actual: eff.actualTokens,
@@ -665,7 +683,7 @@ export function createEngine(dataDir?: string): AcpEngine {
       }
     },
 
-    async applyCompression(sessionKey, ranges, messages) {
+    async applyCompression(sessionKey, ranges, messages, chatId?: string) {
       const release = await acquireLock(sessionKey);
       let usageStateForSave: UsageManagerState | undefined;
       try {
@@ -726,7 +744,12 @@ export function createEngine(dataDir?: string): AcpEngine {
           const mgr = createUsageManager((loaded.hostMetadata.usageState as UsageManagerState | undefined));
           mgr.applyCompressionCredit(applied.result.tokensCompressed);
           // 记录 host 测量（若已缓存）+ 持久化 usageState。
-          const hostNow = await getHostUsageAdapter().getCurrentContextTokens(String(sessionKey).split("_")[0] ?? sessionKey).catch(() => undefined);
+          // V0.7.2：chatId 必须显式（applyCompression 的 chatId 参数 > lastChatId 持久值），
+          //   禁止 sessionKey.split 推导（主对话 sessionKey=chatId 本身，split 无意义且子任务错误）。
+          const effectiveChatId = chatId || loaded.hostMetadata.lastChatId || "";
+          const hostNow = effectiveChatId
+            ? await getHostUsageAdapter().getCurrentContextTokens(effectiveChatId).catch(() => undefined)
+            : undefined;
           if (hostNow !== undefined) mgr.recordHostUsage(hostNow);
           usageStateForSave = mgr.snapshot();
         } else if (applied.result.blocksCreated === 0) {

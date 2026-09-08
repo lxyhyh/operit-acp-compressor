@@ -163,7 +163,9 @@ export async function compress(params: {
       return { success: false, message: "content 为空：至少需要一个 { startId, endId, summary } 范围。" };
     }
     const turns = Array.isArray(params.messages) ? params.messages : [];
-    const result = await e.applyCompression(sessionKey, ranges, turns as never);
+    // V0.7.2：显式传递 chatId（禁止在 engine 内用 sessionKey.split 推导）。
+    const chatId = injectedChatId(params as Record<string, unknown>) || params.chatId || "";
+    const result = await e.applyCompression(sessionKey, ranges, turns as never, chatId || undefined);
     const savedTokens = result.tokensCompressed || 0;
     const blocks = result.blocksCreated || 0;
     return {

@@ -76,9 +76,24 @@ export interface OperitAcpSessionState {
       lastActualAt?: number;
       lastHostTokens?: number;
       lastHostAt?: number;
+      lastEstimateTokens?: number;
       compressionCreditTokens: number;
       lastHop: number;
+      /** V0.7.2：hop ledger（最近 N 条 per-hop token 事实，审计用）。 */
+      hopLedger?: Array<{
+        hop: number;
+        estimateTokens?: number;
+        actualTokens?: number;
+        hostTokens?: number;
+        compressionCredit: number;
+        effectiveTokens: number;
+        source: string;
+        confidence: string;
+        at: number;
+      }>;
     };
+    /** V0.7.2：最近一次真实 chatId（hook 链路记录；供 applyCompression 按真实 chatId 查 host DB）。 */
+    lastChatId?: string;
     /** V0.4：block 来源映射 blockId → model | emergency（搜索/统计用）。 */
     blockSources?: Record<string, "model" | "emergency">;
     /** V0.6 Phase3.1：巨型工具输出 absorb 候选（持久化，跨 Hop 幂等）。 */

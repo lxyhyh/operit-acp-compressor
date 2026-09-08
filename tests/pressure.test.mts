@@ -271,7 +271,7 @@ test("T2: compression credit 修正 actual（compression 后 provider 仍回旧 
   assert.equal(neg.effectiveTokens, 50_000, "correctedActual=0，estimate 兜底 50k");
 });
 
-test("T3: UsageManager 生命周期（per-session、credit 累加/消费/清零）", () => {
+test("T3: UsageManager 生命周期（per-session、credit 累加/net 消费/清零）", () => {
   const m1 = createUsageManager();
   const m2 = createUsageManager(); // 隔离验证
   m1.recordHostUsage(100_000);
@@ -281,14 +281,17 @@ test("T3: UsageManager 生命周期（per-session、credit 累加/消费/清零�
 
   m1.applyCompressionCredit(120_000);
   assert.equal(m1.getCompressionCredit(), 120_000);
-  // 真实 usage 到达（context=80k < credit=120k）→ credit 清零（已被真实 fold 反映）
+  // V0.7.2 net accounting：真实 usage 80k ≤ 折叠窗口(estimate 80k) → 无超额，credit 保留。
   m1.recordUpstreamUsage({ contextTokens: 80_000 });
-  assert.equal(m1.getCompressionCredit(), 0);
+  assert.equal(m1.getCompressionCredit(), 120_000, "窗口内不消费 credit（net accounting）");
   assert.equal(m1.getLatestActual(), 80_000);
-  // host(100k) + actual(80k) 都存在 → source=hybrid，effective=两者最大值
+  // 真实 usage 180k：超额 100k → credit 消费到 20k（只按超额部分）。
+  m1.recordUpstreamUsage({ contextTokens: 180_000 });
+  assert.equal(m1.getCompressionCredit(), 20_000, "只按超额部分消费");
+  // host(100k) + actual(180k, corrected 160k) 都存在 → source=hybrid，effective=max
   const snap = m1.getEffectiveSnapshot(80_000);
   assert.equal(snap.source, "hybrid");
-  assert.equal(snap.effectiveTokens, 100_000);
+  assert.equal(snap.effectiveTokens, 160_000, "max(correctedActual=160k, host=100k, est=80k)");
 });
 
 test("T4: protocol-aware normalizeUsage（Anthropic / OpenAI / Responses 不 double-count cached）", () => {
@@ -371,3 +374,93 @@ test("S1: 50-Hop synthetic — 至少 3 次压缩 / 3 个 epoch / 无 emergency 
 type PressureDecisionLike = {
   nextEpoch?: PressureEpoch;
 };
+
+// ═══════════════ V0.7.2：Actual Usage Closure ═══════════════
+
+test("V0.7.2-U1: recordUpstreamUsage 是 Actual 唯一入口；拿不到保持 undefined 绝不伪造", () => {
+  const mgr = createUsageManager();
+  // 未记录任何 upstream actual 前：getLatestActual 必须 undefined（estimate 不算）。
+  mgr.recordEstimate(80_000, 1);
+  mgr.recordHostUsage(75_000, 2);
+  assert.equal(mgr.getLatestActual(), undefined, "只有 estimate/host 时 actual 必须 undefined");
+  const snap = mgr.getEffectiveSnapshot(80_000);
+  assert.equal(snap.actualTokens, undefined, "effective snapshot 的 actual 必须 undefined");
+  assert.equal(snap.source, "host", "host 可用时 source=host");
+  assert.equal(snap.confidence, "medium", "host 可用时 confidence=medium");
+
+  // 真实 upstream actual 到达后：actual 有值；host 仍在 → source=hybrid（三源同存）、confidence=high。
+  mgr.recordUpstreamUsage({ contextTokens: 120_000, hop: 3 });
+  assert.equal(mgr.getLatestActual(), 120_000);
+  const snap2 = mgr.getEffectiveSnapshot(80_000);
+  assert.equal(snap2.actualTokens, 120_000);
+  assert.equal(snap2.source, "hybrid", "host+actual 同存 → hybrid");
+  assert.equal(snap2.confidence, "high");
+});
+
+test("V0.7.2-U2: compression credit net accounting（只按超额部分消费，不白送）", () => {
+  const mgr = createUsageManager();
+  // 压缩 30k → credit=30k
+  mgr.applyCompressionCredit(30_000);
+  assert.equal(mgr.getCompressionCredit(), 30_000);
+
+  // 真实 usage 到达，折叠后窗口(estimate)=50k：usage 60k 只超 10k → 消费 10k，剩 20k。
+  mgr.recordEstimate(50_000, 1);
+  const remain1 = mgr.consumeCompressionCredit(60_000, 50_000);
+  assert.equal(remain1, 20_000, "只按超出折叠窗口部分消费");
+
+  // 再次真实 usage：usage 55k 超 5k → 消费 5k，剩 15k。
+  const remain2 = mgr.consumeCompressionCredit(55_000, 50_000);
+  assert.equal(remain2, 15_000, "连续消费按净额递减");
+
+  // usage 仍在折叠窗口内（48k < 50k）→ 不消费。
+  const remain3 = mgr.consumeCompressionCredit(48_000, 50_000);
+  assert.equal(remain3, 15_000, "窗口内不消费 credit");
+});
+
+test("V0.7.2-U3: hop ledger 逐 hop 持久化 estimate/actual/host/credit/source/confidence", () => {
+  const mgr = createUsageManager();
+  // hop 1：只有 estimate + host（actual 拿不到）
+  mgr.recordHostUsage(70_000, 1);
+  mgr.recordEstimate(80_000, 1);
+  const snap1 = mgr.getEffectiveSnapshot(80_000);
+  mgr.recordHopEntry({
+    hop: 1, estimateTokens: 80_000, actualTokens: snap1.actualTokens,
+    hostTokens: snap1.hostTokens, compressionCredit: 0, effectiveTokens: snap1.effectiveTokens,
+    source: snap1.source, confidence: snap1.confidence,
+  });
+  // hop 2：压缩后 credit + actual 到达（recordUpstreamUsage 自动记一条 ledger）
+  mgr.applyCompressionCredit(20_000);
+  mgr.recordUpstreamUsage({ contextTokens: 95_000, hop: 2 });
+  const snap2 = mgr.getEffectiveSnapshot(60_000);
+  mgr.recordHopEntry({
+    hop: 2, estimateTokens: 60_000, actualTokens: snap2.actualTokens,
+    hostTokens: snap2.hostTokens, compressionCredit: snap2.compressionCredit ?? 0,
+    effectiveTokens: snap2.effectiveTokens, source: snap2.source, confidence: snap2.confidence,
+  });
+
+  const ledger = mgr.getHopLedger();
+  // recordUpstreamUsage 自动一条（hop2 actual）+ 手动一条（hop2 决策视图）
+  assert.equal(ledger.length, 3);
+  assert.equal(ledger[0].hop, 1);
+  assert.equal(ledger[0].estimateTokens, 80_000);
+  assert.equal(ledger[0].actualTokens, undefined, "hop1 actual 必须 undefined（未拿到）");
+  assert.equal(ledger[0].source, "host");
+  assert.equal(ledger[0].confidence, "medium");
+  // 自动 ledger（hop2，actual 95k，source=hybrid 因为 host 也在；
+  // credit 已按 net accounting 消费：20k - (95k-80k 超额) = 5k）
+  const autoLedger = ledger[1];
+  assert.equal(autoLedger.hop, 2);
+  assert.equal(autoLedger.actualTokens, 95_000);
+  assert.equal(autoLedger.compressionCredit, 5_000, "recordUpstreamUsage 先 net-consume 再记 ledger");
+  // 手动决策视图 ledger（hop2）
+  const manualLedger = ledger[2];
+  assert.equal(manualLedger.hop, 2);
+  assert.equal(manualLedger.estimateTokens, 60_000);
+  assert.equal(manualLedger.actualTokens, 95_000);
+  assert.ok(["hybrid", "upstream"].includes(manualLedger.source), "manual ledger source 合法");
+
+  // 持久化往返：snapshot 可重建（含 ledger）。
+  const rebuilt = createUsageManager(mgr.snapshot());
+  assert.equal(rebuilt.getHopLedger().length, 3);
+  assert.equal(rebuilt.getLatestActual(), 95_000);
+});

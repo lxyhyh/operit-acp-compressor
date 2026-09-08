@@ -24,6 +24,7 @@ import assert from "node:assert/strict";
 import {
   computePressureLevel,
   evaluatePressure,
+  evaluatePreflight,
   type PressureEpoch,
 } from "../src/acp/pressure.ts";
 import { computeEffectiveTokens, normalizeUsage } from "../src/acp/token-source.ts";
@@ -463,4 +464,79 @@ test("V0.7.2-U3: hop ledger 逐 hop 持久化 estimate/actual/host/credit/source
   const rebuilt = createUsageManager(mgr.snapshot());
   assert.equal(rebuilt.getHopLedger().length, 3);
   assert.equal(rebuilt.getLatestActual(), 95_000);
+});
+
+// ═══════════════ V0.7.4：Preflight Over-Hard（安全自愈触发条件） ═══════════════
+
+test("V0.7.4-P1: 未超 hard limit → 不触发 preflight（正常 pressure 管理）", () => {
+  // 需求 A：context < hard → 新一轮开始 → 不发生 preflight compression。
+  // context = 160k (80%)，hard = 170k (85%) → 不触发。
+  const r = evaluatePreflight({
+    effectiveTokens: 160_000,
+    modelContextLimit: C.limit,
+    hardLimitPct: 0.85,
+    preflightDoneForCycle: false,
+  });
+  assert.equal(r.action.kind, "none", "未超 hard limit 不触发 preflight");
+  assert.equal(r.hardLimitTokens, 170_000);
+});
+
+test("V0.7.4-P2: 超 hard limit 且本周期未 preflight → preflight-over-hard", () => {
+  // 需求 B：context > hard → 新一轮开始 → preflight compression 发生一次 → 成功后发送模型。
+  // context = 175k (> 170k hard) → preflight-over-hard。
+  const r = evaluatePreflight({
+    effectiveTokens: 175_000,
+    modelContextLimit: C.limit,
+    hardLimitPct: 0.85,
+    preflightDoneForCycle: false,
+  });
+  assert.equal(r.action.kind, "preflight-over-hard");
+  if (r.action.kind === "preflight-over-hard") {
+    assert.equal(r.action.effectiveTokens, 175_000);
+    assert.equal(r.action.hardLimitTokens, 170_000);
+  }
+});
+
+test("V0.7.4-P3: 超 hard 且本周期已 preflight → safety-emergency（不无限循环）", () => {
+  // 需求 D：compression 后仍 > hard → 允许 safety fallback → 但不能无限循环。
+  // 第一次 preflight 后仍超 → 第二次判定 preflightDoneForCycle=true → safety-emergency。
+  const r1 = evaluatePreflight({
+    effectiveTokens: 175_000,
+    modelContextLimit: C.limit,
+    hardLimitPct: 0.85,
+    preflightDoneForCycle: false,
+  });
+  assert.equal(r1.action.kind, "preflight-over-hard");
+  // 压缩后仍 172k (>170k)，且本周期已 preflight → safety-emergency（不重复 preflight）。
+  const r2 = evaluatePreflight({
+    effectiveTokens: 172_000,
+    modelContextLimit: C.limit,
+    hardLimitPct: 0.85,
+    preflightDoneForCycle: true,
+  });
+  assert.equal(r2.action.kind, "safety-emergency", "压缩后仍超且已 preflight → safety-emergency");
+  if (r2.action.kind === "safety-emergency") {
+    assert.equal(r2.action.effectiveTokens, 172_000);
+  }
+});
+
+test("V0.7.4-P4: 压缩后回到安全区 → 不再触发（需求 C）", () => {
+  // 需求 C：context > hard → preflight 后重新降到安全区 → 不重复 compression。
+  // 压缩后 90k (<170k) → 不触发。
+  const r = evaluatePreflight({
+    effectiveTokens: 90_000,
+    modelContextLimit: C.limit,
+    hardLimitPct: 0.85,
+    preflightDoneForCycle: true, // 即便本周期已 preflight，回到安全区也不触发
+  });
+  assert.equal(r.action.kind, "none", "压缩后回到安全区不再触发");
+});
+
+test("V0.7.4-P5: 正常 70%/80% pressure 不触发 emergency（需求 H）", () => {
+  // 需求 H：正常 70%/80% pressure → 不因为跨普通阈值就立即 emergency。
+  // 70% (140k) 和 80% (160k) 都 < hard (170k) → 都 none。
+  const r70 = evaluatePreflight({ effectiveTokens: tokensAt(0.70), modelContextLimit: C.limit, hardLimitPct: 0.85 });
+  assert.equal(r70.action.kind, "none", "70% 不触发 preflight");
+  const r80 = evaluatePreflight({ effectiveTokens: tokensAt(0.80), modelContextLimit: C.limit, hardLimitPct: 0.85 });
+  assert.equal(r80.action.kind, "none", "80% 不触发 preflight（低于 hard 85%）");
 });

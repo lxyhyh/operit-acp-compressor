@@ -256,3 +256,54 @@ export function evaluatePressure(input: PressureInput): PressureDecision {
     source: input.source,
   };
 }
+
+// ═══════════════ V0.7.4：Preflight Over-Hard 决策 ═══════════════
+
+/**
+ * 压缩动作分类（V0.7.4 语义，明确区分）：
+ * - pressure-gentle / pressure-strong：正常持续上下文管理（nudge，模型主动 compress）
+ * - preflight-over-hard：新一轮发送前发现 effective 已超 hard limit → 主动自愈压缩
+ * - safety-emergency：preflight 压缩失败 / 压缩后仍严重超窗 / 本周期已压仍超 → 最终兜底
+ * 注意：preflight 不通过本类型返回——它由 evaluatePreflight 判定后由 Adapter 执行折叠；
+ *       pressure-gentle/strong 仍由 evaluatePressure 产出（NudgeLevel）。
+ */
+export type CompressionAction =
+  | { kind: "none" }
+  | { kind: "preflight-over-hard"; hardLimitTokens: number; effectiveTokens: number }
+  | { kind: "safety-emergency"; hardLimitTokens: number; effectiveTokens: number };
+
+/**
+ * V0.7.4：evaluatePreflight —— 新一轮发送前的安全自愈触发条件。
+ *
+ * 语义（用户需求 4/5/6/12）：
+ * - Hard Limit = 新一轮发送前的安全自愈触发条件，不是普通 Hop 的即时强制折叠阈值。
+ * - effectiveTokens <= hardLimitTokens：不触发（正常 gentle/strong pressure 管理）。
+ * - effectiveTokens >  hardLimitTokens 且本 send 周期未 preflight → preflight-over-hard
+ *   （主动压缩一次，压缩后重新评估）。
+ * - effectiveTokens >  hardLimitTokens 且本 send 周期已 preflight（压缩后仍超）→
+ *   safety-emergency（最终兜底，不再无限循环压缩）。
+ *
+ * 纯函数：可单测；不触碰 UsageManager / HostUsageAdapter（由调用方采样后传入）。
+ */
+export function evaluatePreflight(input: {
+  effectiveTokens: number;
+  modelContextLimit: number;
+  hardLimitPct: number;
+  /** 本 send 周期是否已执行过一次 preflight compression（防同轮内无限压缩）。 */
+  preflightDoneForCycle?: boolean;
+}): { action: CompressionAction; hardLimitTokens: number } {
+  const hardLimitTokens = Math.round(input.modelContextLimit * input.hardLimitPct);
+  if (input.effectiveTokens > hardLimitTokens) {
+    if (input.preflightDoneForCycle) {
+      return {
+        action: { kind: "safety-emergency", hardLimitTokens, effectiveTokens: input.effectiveTokens },
+        hardLimitTokens,
+      };
+    }
+    return {
+      action: { kind: "preflight-over-hard", hardLimitTokens, effectiveTokens: input.effectiveTokens },
+      hardLimitTokens,
+    };
+  }
+  return { action: { kind: "none" }, hardLimitTokens };
+}

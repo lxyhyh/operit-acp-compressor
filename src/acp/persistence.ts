@@ -70,6 +70,15 @@ export interface OperitAcpSessionState {
     acpNudge?: Record<string, unknown>;
     /** V0.4：运行时统计（nudge/compress/emergency 全链路）。 */
     runtimeStats?: AcpRuntimeStats;
+    /** V0.7.1：usage 事实（estimate/actual/host + compressionCredit，per-session）。 */
+    usageState?: {
+      lastActualTokens?: number;
+      lastActualAt?: number;
+      lastHostTokens?: number;
+      lastHostAt?: number;
+      compressionCreditTokens: number;
+      lastHop: number;
+    };
     /** V0.4：block 来源映射 blockId → model | emergency（搜索/统计用）。 */
     blockSources?: Record<string, "model" | "emergency">;
     /** V0.6 Phase3.1：巨型工具输出 absorb 候选（持久化，跨 Hop 幂等）。 */

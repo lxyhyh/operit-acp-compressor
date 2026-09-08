@@ -3636,14 +3636,6 @@ function markAbsorbed(candidates, ref) {
 }
 
 // src/acp/pressure.ts
-function computeEffectivePressure(input) {
-  const { tokenEstimate, modelContextLimit } = input;
-  const measured = typeof input.actualUsage === "number" && Number.isFinite(input.actualUsage) && input.actualUsage > 0 ? input.actualUsage : 0;
-  const estimated = modelContextLimit > 0 ? tokenEstimate / modelContextLimit : 0;
-  const usagePct = Math.max(measured, estimated);
-  const source = measured <= 0 ? "estimated" : estimated > 0 ? "hybrid" : "measured";
-  return { effectiveTokens: Math.max(tokenEstimate, measured * modelContextLimit), usagePct, source };
-}
 function computePressureLevel(input) {
   const base = input.usagePct >= input.emergencyThresholdPct ? "emergency" : input.usagePct >= input.strongThresholdPct ? "strong" : input.usagePct >= input.gentleThresholdPct ? "gentle" : "none";
   if (base === "none") return "none";
@@ -3656,7 +3648,7 @@ function computePressureLevel(input) {
 function shouldEscalate(usagePct, strongThresholdPct) {
   return usagePct >= strongThresholdPct;
 }
-function evaluatePressure(input) {
+function evaluatePressureInner(input) {
   const prev = {
     lastInjectedAt: input.lastInjectedAt,
     nudgeCount: input.nudgeCount,
@@ -3717,9 +3709,11 @@ function evaluatePressure(input) {
     };
   }
   const level = levelRaw === "none" ? "gentle" : levelRaw;
-  const creditLeft = input.usageCreditTokens > 0 && typeof input.creditBaseToken === "number" ? input.creditBaseToken + input.usageCreditTokens - input.tokenEstimate : 0;
+  const creditEnabled = input.usageCreditTokens > 0 && typeof input.creditBaseToken === "number";
+  const creditBroken = creditEnabled && input.tokenEstimate < input.creditBaseToken && input.usagePct >= input.gentleThresholdPct;
+  const creditLeft = !creditEnabled || creditBroken ? 0 : input.creditBaseToken + input.usageCreditTokens - input.tokenEstimate;
   if (creditLeft > 0) {
-    return { allowInject: false, nextEpoch, nextNudgeState: prev, decisionReason: "gentle-suppressed-by-credit" };
+    return { allowInject: false, nextEpoch, nextNudgeState: prev, decisionReason: creditBroken ? "credit-broken-baseline-force-release" : "gentle-suppressed-by-credit" };
   }
   const deltaSinceNudge = input.lastTokensAtInject > 0 ? input.tokenEstimate - input.lastTokensAtInject : 0;
   const deltaSinceCompression = typeof input.lastCompressToken === "number" ? input.tokenEstimate - input.lastCompressToken : 0;
@@ -3751,8 +3745,180 @@ function evaluatePressure(input) {
     decisionReason: "gentle-inject"
   };
 }
+function evaluatePressure(input) {
+  const r = evaluatePressureInner(input);
+  return {
+    ...r,
+    pressurePct: input.usagePct,
+    effectiveTokens: input.effectiveTokens,
+    source: input.source
+  };
+}
+
+// src/acp/token-source.ts
+function computeEffectiveTokens(input) {
+  const { estimatedTokens } = input;
+  const actual = typeof input.actualTokens === "number" && Number.isFinite(input.actualTokens) && input.actualTokens > 0 ? input.actualTokens : void 0;
+  const host = typeof input.hostTokens === "number" && Number.isFinite(input.hostTokens) && input.hostTokens > 0 ? input.hostTokens : void 0;
+  const credit = typeof input.compressionCredit === "number" && Number.isFinite(input.compressionCredit) && input.compressionCredit > 0 ? input.compressionCredit : 0;
+  const correctedActual = actual !== void 0 ? Math.max(0, actual - credit) : void 0;
+  const candidates = [];
+  if (correctedActual !== void 0) candidates.push(correctedActual);
+  if (host !== void 0) candidates.push(host);
+  const est = Number.isFinite(estimatedTokens) && estimatedTokens > 0 ? estimatedTokens : 0;
+  if (est > 0) candidates.push(est);
+  const effectiveTokens = candidates.length > 0 ? Math.max(...candidates) : 0;
+  let source = "estimate";
+  if (actual !== void 0 && host !== void 0) source = "hybrid";
+  else if (actual !== void 0) source = "upstream";
+  else if (host !== void 0) source = "host";
+  const confidence = actual !== void 0 ? "high" : host !== void 0 ? "medium" : "low";
+  return {
+    estimatedTokens: est,
+    actualTokens: correctedActual !== void 0 && actual !== void 0 ? actual : void 0,
+    hostTokens: host,
+    compressionCredit: credit > 0 ? credit : void 0,
+    effectiveTokens,
+    source,
+    confidence
+  };
+}
+
+// src/acp/usage.ts
+function createUsageManager(initialState) {
+  const s = {
+    lastActualTokens: initialState?.lastActualTokens,
+    lastActualAt: initialState?.lastActualAt,
+    lastHostTokens: initialState?.lastHostTokens,
+    lastHostAt: initialState?.lastHostAt,
+    compressionCreditTokens: initialState?.compressionCreditTokens ?? 0,
+    lastHop: initialState?.lastHop ?? 0
+  };
+  return {
+    recordUpstreamUsage(sample) {
+      if (typeof sample.contextTokens === "number" && Number.isFinite(sample.contextTokens) && sample.contextTokens > 0) {
+        s.lastActualTokens = sample.contextTokens;
+        s.lastActualAt = Date.now();
+        s.lastHop = sample.hop ?? s.lastHop;
+        if (s.compressionCreditTokens > 0 && sample.contextTokens < s.compressionCreditTokens) {
+          s.compressionCreditTokens = 0;
+        } else if (s.compressionCreditTokens > 0) {
+          s.compressionCreditTokens = 0;
+        }
+      }
+    },
+    recordHostUsage(tokens, hop) {
+      if (typeof tokens === "number" && Number.isFinite(tokens) && tokens > 0) {
+        s.lastHostTokens = tokens;
+        s.lastHostAt = Date.now();
+        if (hop !== void 0) s.lastHop = Math.max(s.lastHop, hop);
+      }
+    },
+    recordEstimate(tokens, hop) {
+      if (typeof tokens === "number" && Number.isFinite(tokens) && tokens > 0) {
+        if (hop !== void 0) s.lastHop = Math.max(s.lastHop, hop);
+      }
+    },
+    getLatestActual: () => s.lastActualTokens,
+    getLatestHost: () => s.lastHostTokens,
+    getCompressionCredit: () => s.compressionCreditTokens,
+    applyCompressionCredit(tokens) {
+      if (typeof tokens === "number" && Number.isFinite(tokens) && tokens > 0) {
+        s.compressionCreditTokens += tokens;
+      }
+    },
+    consumeCompressionCredit() {
+      const left = s.compressionCreditTokens;
+      return left;
+    },
+    clearCompressionCredit() {
+      s.compressionCreditTokens = 0;
+    },
+    getEffectiveSnapshot(estimatedTokens) {
+      return computeEffectiveTokens({
+        estimatedTokens,
+        actualTokens: s.lastActualTokens,
+        hostTokens: s.lastHostTokens,
+        compressionCredit: s.compressionCreditTokens
+      });
+    },
+    getLastHop: () => s.lastHop,
+    snapshot: () => ({
+      lastActualTokens: s.lastActualTokens,
+      lastHostTokens: s.lastHostTokens,
+      compressionCreditTokens: s.compressionCreditTokens,
+      lastHop: s.lastHop
+    })
+  };
+}
+
+// src/acp/host-usage-adapter.ts
+function createOperitHostUsageAdapter(opts) {
+  const execFn = opts?.exec ?? (async (command) => {
+    const g = globalThis;
+    const tools = g.Tools;
+    const system = tools?.system;
+    const run = system?.shell ?? g.executeShell;
+    if (typeof run !== "function") return void 0;
+    try {
+      const r = await run(command);
+      if (r && typeof r === "object" && "output" in r) {
+        return String(r.output ?? "");
+      }
+      return typeof r === "string" ? r : r === void 0 ? void 0 : String(r);
+    } catch {
+      return void 0;
+    }
+  });
+  const throttleMs = opts?.throttleMs ?? 5e3;
+  const maxCacheAgeMs = opts?.maxCacheAgeMs ?? 3e4;
+  const cache2 = /* @__PURE__ */ new Map();
+  let sqliteOk;
+  const dbPath = "/data/user/0/com.ai.assistance.operit/databases/app_database";
+  const buildCmd = (chatId) => `python3 -c "import sqlite3;" && python3 -c "import sqlite3,json,sys;c=sqlite3.connect('file:${dbPath}?mode=ro',uri=True);r=c.execute('SELECT currentWindowSize FROM chats WHERE id=?',('${chatId}',)).fetchone();print(int(r[0]) if r and r[0] is not None else '')" 2>/dev/null || python3 -c "import sqlite3;c=sqlite3.connect('${dbPath}');r=c.execute('SELECT currentWindowSize FROM chats WHERE id=?',('${chatId}',)).fetchone();print(int(r[0]) if r and r[0] is not None else '')" 2>/dev/null`;
+  return {
+    async getCurrentContextTokens(chatId) {
+      if (!chatId) return void 0;
+      const now = Date.now();
+      const hit = cache2.get(chatId);
+      if (hit && now - hit.at < Math.min(throttleMs, maxCacheAgeMs)) {
+        return hit.fail ? void 0 : hit.value;
+      }
+      if (sqliteOk === false) return void 0;
+      const start = Date.now();
+      const got = await Promise.race([
+        execFn(buildCmd(chatId)).catch(() => void 0),
+        new Promise((res) => setTimeout(() => res(void 0), 1500))
+      ]);
+      const took = Date.now() - start;
+      let value;
+      if (typeof got === "string" && got.trim().length > 0) {
+        const n = Number(got.trim());
+        if (Number.isFinite(n) && n > 0) value = n;
+      }
+      if (typeof got === "string" && got.trim().length > 0 && value === void 0) {
+      }
+      cache2.set(chatId, { value, at: now, fail: value === void 0 });
+      if (value === void 0) sqliteOk = sqliteOk === void 0 ? false : sqliteOk;
+      return value;
+    }
+  };
+}
 
 // src/acp/adapter.ts
+var _hostUsageAdapter;
+function getHostUsageAdapter() {
+  if (!_hostUsageAdapter) {
+    try {
+      _hostUsageAdapter = createOperitHostUsageAdapter();
+    } catch {
+      _hostUsageAdapter = { async getCurrentContextTokens() {
+        return void 0;
+      } };
+    }
+  }
+  return _hostUsageAdapter;
+}
 var projectionCache = globalThis.__acpProjectionCacheV2 ?? /* @__PURE__ */ new Map();
 if (!globalThis.__acpProjectionCacheV2) {
   globalThis.__acpProjectionCacheV2 = projectionCache;
@@ -4064,6 +4230,7 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
             });
           }
         }
+        const usageManager = createUsageManager(cached.hostMetadata.usageState);
         const nextStats = { ...prevStats };
         const newBlockIds = turn.state.blocks.filter((b) => !cached.kernelState.blocks.some((pb) => pb.blockId === b.blockId)).map((b) => b.blockId);
         if (autoFolded && newBlockIds.length > 0) {
@@ -4075,23 +4242,26 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
             type: "emergency",
             detail: { blocks: newBlockIds.length, tokens: emergencyFreedTokens }
           });
-          nextStats.creditBaseToken = tokenEstimate;
+          const postCovered = collectCoveredMessageIds(turn.state);
+          const postEstimate = estimateProjectionTokens(projectedMessages, postCovered);
+          nextStats.creditBaseToken = Math.min(tokenEstimate, postEstimate) || tokenEstimate;
           nextStats.creditRemaining = settings.usageCreditTokens;
+          usageManager.applyCompressionCredit(emergencyFreedTokens);
         }
         const prevNudgeState = cached.hostMetadata.acpNudge ?? {};
         const prevBlocks = cached.kernelState.blocks.length;
         const curBlocks = turn.state.blocks.length;
         const prevTokenCount = cached.hostMetadata.lastTokenEstimate ?? 0;
-        const eff = computeEffectivePressure({
-          actualUsage: config.modelContextLimit > 0 ? tokenEstimate / config.modelContextLimit : 0,
-          tokenEstimate,
-          modelContextLimit: config.modelContextLimit
-        });
+        const hostTokens = chatId ? await getHostUsageAdapter().getCurrentContextTokens(String(chatId)) : void 0;
+        if (hostTokens !== void 0) usageManager.recordHostUsage(hostTokens);
+        usageManager.recordEstimate(tokenEstimate);
+        const eff = usageManager.getEffectiveSnapshot(tokenEstimate);
+        const pressurePct = config.modelContextLimit > 0 ? (eff.effectiveTokens || tokenEstimate) / config.modelContextLimit : (eff.effectiveTokens || tokenEstimate) / 2e5;
         const prevEpoch = prevNudgeState.acpEpoch;
         const lastCompressToken = typeof prevStats.creditBaseToken === "number" ? prevStats.creditBaseToken : void 0;
         const pressure = evaluatePressure({
-          usagePct: eff.usagePct,
-          effectiveTokens: eff.effectiveTokens,
+          usagePct: pressurePct,
+          effectiveTokens: eff.effectiveTokens || tokenEstimate,
           tokenEstimate,
           kernelShouldInject: turn.nudge?.shouldInject === true,
           kernelReason: turn.nudge?.reason ?? "",
@@ -4109,14 +4279,15 @@ ${excerpt}` : `[ACP \u81EA\u52A8\u6298\u53E0] \u65E9\u671F ${Math.max(1, hi - lo
           lastInjectedAt: typeof prevNudgeState.lastInjectedAt === "number" ? prevNudgeState.lastInjectedAt : 0,
           nudgeCount: typeof prevNudgeState.nudgeCount === "number" ? prevNudgeState.nudgeCount : 0,
           lastTokensAtInject: typeof prevNudgeState.lastTokensAtInject === "number" ? prevNudgeState.lastTokensAtInject : 0,
-          lastCompressToken
+          lastCompressToken,
+          source: eff.source
         });
         const nextNudgeState = {
           ...pressure.nextNudgeState,
           // 持久化 epoch 到 acpNudge（跨轮/跨 VM 恢复压力档位）
           ...pressure.nextEpoch ? { acpEpoch: pressure.nextEpoch } : {}
         };
-        const level = pressure.level ?? (emergency ? "emergency" : eff.usagePct >= settings.strongThresholdPct ? "strong" : eff.usagePct >= settings.gentleThresholdPct ? "gentle" : "gentle");
+        const level = pressure.level ?? (emergency ? "emergency" : pressurePct >= settings.strongThresholdPct ? "strong" : pressurePct >= settings.gentleThresholdPct ? "gentle" : "gentle");
         let nudgeText;
         if (pressure.allowInject && settings.nudgeEnabled) {
           nudgeText = buildNudgeText(turn.nudge, level);
@@ -4147,6 +4318,8 @@ ${lines.join("\n")}${active.length > 3 ? `
             lastTokenEstimate: tokenEstimate,
             acpNudge: nextNudgeState,
             runtimeStats: nextStats,
+            // V0.7.1：usage 事实持久化（estimate/actual/host/compressionCredit，per-session）
+            usageState: usageManager.snapshot(),
             absorbCandidates: nextAbsorbCandidates,
             blockSources: {
               ...cached.hostMetadata.blockSources ?? {},
@@ -4163,13 +4336,29 @@ ${lines.join("\n")}${active.length > 3 ? `
         try {
           const active = turn.state.blocks.filter((b) => b.active).length;
           const nudgeReason = turn.nudge?.reason ? turn.nudge.reason.slice(0, 120) : "(kernel:no-nudge)";
-          const gateInfo = `allow=${pressure.allowInject ? 1 : 0} kShould=${turn.nudge?.shouldInject ? 1 : 0} reason=${pressure.decisionReason} eff=${Math.round(eff.usagePct * 100)}%`;
+          const gateInfo = `allow=${pressure.allowInject ? 1 : 0} kShould=${turn.nudge?.shouldInject ? 1 : 0} reason=${pressure.decisionReason} eff=${Math.round(pressurePct * 100)}% src=${eff.source}`;
           const st = nextStats;
           console.log(`[acp] project stage=${hookStage} chat=${chatId ? String(chatId).slice(0, 8) : "-"} sub=${isSubTask ? 1 : 0} fp=${fingerprint.slice(0, 12)} raw=${turns.length} proj=${cappedTurns.length} blocks=${active}/${turn.state.blocks.length} tok=${tokenEstimate} saved=${(cached.kernelState.stats?.tokensCompressed ?? 0) - (turn.state.stats?.tokensCompressed ?? 0)} nudge=${gateInfo} stats={n:${st.nudgeIssued},m:${st.compressSucceeded},e:${st.emergencyTriggered}} ${nudgeReason}`);
           chatTrace(chatId, {
             type: "project",
             stage: hookStage,
-            detail: { raw: turns.length, proj: cappedTurns.length, blocks: turn.state.blocks.length, tok: tokenEstimate, effPct: Math.round(eff.usagePct * 100), level, nudgeAllow: pressure.allowInject, reason: pressure.decisionReason, emergency: autoFolded }
+            detail: {
+              raw: turns.length,
+              proj: cappedTurns.length,
+              blocks: turn.state.blocks.length,
+              tok: tokenEstimate,
+              actual: eff.actualTokens,
+              host: eff.hostTokens,
+              credit: eff.compressionCredit,
+              effective: eff.effectiveTokens,
+              effPct: Math.round(pressurePct * 100),
+              level,
+              nudgeAllow: pressure.allowInject,
+              reason: pressure.decisionReason,
+              source: eff.source,
+              confidence: eff.confidence,
+              emergency: autoFolded
+            }
           });
         } catch {
         }
@@ -4187,6 +4376,7 @@ ${lines.join("\n")}${active.length > 3 ? `
     },
     async applyCompression(sessionKey, ranges, messages) {
       const release = await acquireLock(sessionKey);
+      let usageStateForSave;
       try {
         const config = resolveKernelConfig(settings);
         const loaded = await persistence.load(sessionKey);
@@ -4228,10 +4418,15 @@ ${lines.join("\n")}${active.length > 3 ? `
             detail: { blocks: applied.result.blocksCreated, tokens: applied.result.tokensCompressed, ranges: ranges.length }
           });
           const est = loaded.hostMetadata.lastTokenEstimate;
-          if (typeof est === "number") {
-            nextStats.creditBaseToken = est;
+          if (typeof est === "number" && est > 0) {
+            nextStats.creditBaseToken = Math.max(0, est - applied.result.tokensCompressed);
             nextStats.creditRemaining = settings.usageCreditTokens;
           }
+          const mgr = createUsageManager(loaded.hostMetadata.usageState);
+          mgr.applyCompressionCredit(applied.result.tokensCompressed);
+          const hostNow = await getHostUsageAdapter().getCurrentContextTokens(String(sessionKey).split("_")[0] ?? sessionKey).catch(() => void 0);
+          if (hostNow !== void 0) mgr.recordHostUsage(hostNow);
+          usageStateForSave = mgr.snapshot();
         } else if (applied.result.blocksCreated === 0) {
           nextStats.compressFailed += 1;
         }
@@ -4244,6 +4439,7 @@ ${lines.join("\n")}${active.length > 3 ? `
             stateVersion: (loaded.hostMetadata.stateVersion ?? 0) + 1,
             lastProjectionFingerprint: void 0,
             runtimeStats: nextStats,
+            ...usageStateForSave ? { usageState: usageStateForSave } : {},
             blockSources: {
               ...loaded.hostMetadata.blockSources ?? {},
               ...newBlockIds.length > 0 ? Object.fromEntries(newBlockIds.map((id) => [id, "model"])) : {}

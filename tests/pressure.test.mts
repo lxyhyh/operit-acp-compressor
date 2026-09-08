@@ -22,11 +22,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  computeEffectivePressure,
   computePressureLevel,
   evaluatePressure,
   type PressureEpoch,
 } from "../src/acp/pressure.ts";
+import { computeEffectiveTokens, normalizeUsage } from "../src/acp/token-source.ts";
+import { createUsageManager } from "../src/acp/usage.ts";
 
 const C = {
   limit: 200_000,
@@ -51,6 +52,7 @@ function hop(input: {
   lastInjectedAt?: number;
   nudgeCount?: number;
   lastTokensAtInject?: number;
+  source?: "estimate" | "upstream" | "host" | "hybrid";
 }) {
   const r = evaluatePressure({
     usagePct: input.usagePct,
@@ -72,6 +74,7 @@ function hop(input: {
     lastInjectedAt: input.lastInjectedAt ?? 0,
     nudgeCount: input.nudgeCount ?? 0,
     lastTokensAtInject: input.lastTokensAtInject ?? 0,
+    source: input.source ?? "estimate",
   });
   return r;
 }
@@ -80,23 +83,28 @@ function hop(input: {
 const tokensAt = (pct: number) => Math.round(C.limit * pct);
 
 test("P1: usage 缺失/为0 时 effective estimate 仍发现压力 (effective source=estimated)", () => {
-  // 模拟 actualUsage=0（lastInputTokens==0 bug 场景），但 tokenEstimate=150k → 75%
-  const eff = computeEffectivePressure({ actualUsage: 0, tokenEstimate: 150_000, modelContextLimit: C.limit });
-  assert.equal(eff.source, "estimated");
-  assert.equal(eff.usagePct, 0.75);
+  // 模拟 actual/host 缺失，但 tokenEstimate=150k → effective=150k → 75%
+  const eff = computeEffectiveTokens({ estimatedTokens: 150_000 });
+  assert.equal(eff.source, "estimate");
+  assert.equal(eff.effectiveTokens, 150_000);
+  assert.equal(eff.confidence, "low");
   const r = evaluatePressure({
-    usagePct: eff.usagePct, effectiveTokens: eff.effectiveTokens, tokenEstimate: 150_000,
+    usagePct: 0.75, effectiveTokens: eff.effectiveTokens, tokenEstimate: 150_000,
     kernelShouldInject: false, kernelReason: "", prevEpoch: undefined,
     prevBlocks: 0, curBlocks: 0, gentleThresholdPct: C.gentle, strongThresholdPct: C.strong,
     emergencyThresholdPct: C.emergency, hostEscalationFloor: C.hostFloor,
     nudgeCooldownTurns: C.cooldownTurns, nudgeGrowthFloor: C.growthFloor,
     usageCreditTokens: C.credit, creditBaseToken: undefined,
     lastInjectedAt: 0, nudgeCount: 0, lastTokensAtInject: 0,
+    source: "estimate",
   });
   // 75% ≥ 70% host floor 且无 lastInjectedAt/lastCompressToken → 应接管
   assert.equal(r.allowInject, true);
   assert.equal(r.level, "gentle");
   assert.match(r.decisionReason, /host-escalation/);
+  // V0.7.1：导出决策附加 effective 指标
+  assert.equal(r.source, "estimate");
+  assert.equal(r.pressurePct, 0.75);
 });
 
 test("P2: kernelShouldInject=false 时 host pressure 仍触发 gentle（≥hostFloor）", () => {
@@ -233,3 +241,133 @@ test("P11: V0.7.1 回归 — credit 基准错位（base>est）时不得永久压
   assert.equal(ok.allowInject, false, "正常 credit 窗口内 gentle 仍抑制");
   assert.match(ok.decisionReason, /credit/);
 });
+
+// ═════════============== V0.7.1：Token Source / UsageManager / 协议 单元测试 ════════==============
+
+test("T1: computeEffectiveTokens 三源组合（estimate only / actual only / host only / all）", () => {
+  // estimate only
+  const e = computeEffectiveTokens({ estimatedTokens: 60_000 });
+  assert.equal(e.effectiveTokens, 60_000); assert.equal(e.source, "estimate"); assert.equal(e.confidence, "low");
+  // actual only
+  const a = computeEffectiveTokens({ estimatedTokens: 10_000, actualTokens: 90_000 });
+  assert.equal(a.effectiveTokens, 90_000); assert.equal(a.source, "upstream"); assert.equal(a.confidence, "high");
+  // host only
+  const h = computeEffectiveTokens({ estimatedTokens: 10_000, hostTokens: 80_000 });
+  assert.equal(h.effectiveTokens, 80_000); assert.equal(h.source, "host"); assert.equal(h.confidence, "medium");
+  // all three → max
+  const all = computeEffectiveTokens({ estimatedTokens: 50_000, actualTokens: 70_000, hostTokens: 95_000 });
+  assert.equal(all.effectiveTokens, 95_000); assert.equal(all.source, "hybrid"); assert.equal(all.confidence, "high");
+  // actual+host，无 estimate
+  const ah = computeEffectiveTokens({ estimatedTokens: 0, actualTokens: 70_000, hostTokens: 60_000 });
+  assert.equal(ah.effectiveTokens, 70_000);
+});
+
+test("T2: compression credit 修正 actual（compression 后 provider 仍回旧 usage）", () => {
+  // 压缩 200k→80k，压缩 credit 120k；provider 下一次仍报 input=200k
+  const s = computeEffectiveTokens({ estimatedTokens: 80_000, actualTokens: 200_000, compressionCredit: 120_000 });
+  assert.equal(s.effectiveTokens, 80_000, "credit 修正后 actual=80k，且 estimate=80k → effective=80k");
+  // credit > actual → corrected 归 0，不应出现负值
+  const neg = computeEffectiveTokens({ estimatedTokens: 50_000, actualTokens: 30_000, compressionCredit: 100_000 });
+  assert.equal(neg.effectiveTokens, 50_000, "correctedActual=0，estimate 兜底 50k");
+});
+
+test("T3: UsageManager 生命周期（per-session、credit 累加/消费/清零）", () => {
+  const m1 = createUsageManager();
+  const m2 = createUsageManager(); // 隔离验证
+  m1.recordHostUsage(100_000);
+  m1.recordEstimate(80_000);
+  assert.equal(m1.getLatestHost(), 100_000);
+  assert.equal(m2.getLatestHost(), undefined, "per-session 隔离（m2 不吃 m1 的状态）");
+
+  m1.applyCompressionCredit(120_000);
+  assert.equal(m1.getCompressionCredit(), 120_000);
+  // 真实 usage 到达（context=80k < credit=120k）→ credit 清零（已被真实 fold 反映）
+  m1.recordUpstreamUsage({ contextTokens: 80_000 });
+  assert.equal(m1.getCompressionCredit(), 0);
+  assert.equal(m1.getLatestActual(), 80_000);
+  // host(100k) + actual(80k) 都存在 → source=hybrid，effective=两者最大值
+  const snap = m1.getEffectiveSnapshot(80_000);
+  assert.equal(snap.source, "hybrid");
+  assert.equal(snap.effectiveTokens, 100_000);
+});
+
+test("T4: protocol-aware normalizeUsage（Anthropic / OpenAI / Responses 不 double-count cached）", () => {
+  // Anthropic: input + cache_read + cache_creation
+  const an = normalizeUsage("anthropic", { inputTokens: 10_000, cacheReadTokens: 5_000, cacheCreationTokens: 2_000 });
+  assert.equal(an.contextTokens, 17_000);
+  // OpenAI Chat: prompt_tokens 已是 total，cached 不再重复加
+  const oa = normalizeUsage("openai-chat", { inputTokens: 10_000, cachedTokens: 8_000 });
+  assert.equal(oa.contextTokens, 10_000, "OpenAI cached 是子集，不 double count");
+  // Responses: input_tokens 已是 total
+  const rs = normalizeUsage("responses", { inputTokens: 12_000, cachedTokens: 9_000 });
+  assert.equal(rs.contextTokens, 12_000);
+});
+
+test("S1: 50-Hop synthetic — 至少 3 次压缩 / 3 个 epoch / 无 emergency 用作正常路径", () => {
+  // 模拟 50 个 hop：usage 从 50% 起爬升，pressure 阈值内出 nudge；
+  // 每次 allowInject（模型响应）即引发一次 compress：blocks+1、credit 累加、
+  // epoch 关闭并重开、usage 回落。压力持续反复 → 应产生多次压缩、多个 epoch。
+  let prevEpoch: PressureEpoch | undefined;
+  let prevBlocks = 0;
+  let curBlocks = 0;
+  let compressCount = 0;
+  let maxEpSeen = 0; // 50-hop 内见过的最大 epoch 号（跨压缩自然递增）
+  let emergencyCount = 0;
+  let usageNow = 0.50;
+  const mgr = createUsageManager();
+  const closedEpochOf = (r: PressureDecisionLike): PressureEpoch | undefined =>
+    r.nextEpoch ? { ...r.nextEpoch, closed: true, injections: r.nextEpoch.injections } : undefined;
+
+  for (let hopIdx = 1; hopIdx <= 50; hopIdx++) {
+    usageNow = Math.min(usageNow + 0.02, 0.99);
+    const est = Math.round(C.limit * usageNow);
+    mgr.recordHostUsage(est);
+    const snap = mgr.getEffectiveSnapshot(est);
+    const r = evaluatePressure({
+      usagePct: snap.effectiveTokens / C.limit,
+      effectiveTokens: snap.effectiveTokens,
+      tokenEstimate: est,
+      kernelShouldInject: false,
+      kernelReason: "",
+      prevEpoch,
+      prevBlocks,
+      curBlocks,
+      gentleThresholdPct: C.gentle,
+      strongThresholdPct: C.strong,
+      emergencyThresholdPct: C.emergency,
+      hostEscalationFloor: C.hostFloor,
+      nudgeCooldownTurns: C.cooldownTurns,
+      nudgeGrowthFloor: C.growthFloor,
+      usageCreditTokens: C.credit,
+      creditBaseToken: undefined,
+      lastInjectedAt: 0,
+      nudgeCount: 0,
+      lastTokensAtInject: 0,
+      lastCompressToken: undefined,
+      source: snap.source,
+    });
+
+    if (r.level === "emergency") emergencyCount++;
+    if (r.nextEpoch) maxEpSeen = Math.max(maxEpSeen, r.nextEpoch.epoch);
+
+    // 模型响应：注入即压缩（模拟强提示下的主动 compress）。
+    if (r.allowInject) {
+      curBlocks = curBlocks + 1;
+      prevBlocks = curBlocks; // 同步：避免下一 hop 误判 compressed-close-epoch
+      compressCount++;
+      mgr.applyCompressionCredit(Math.round(C.limit * 0.25));
+      usageNow = Math.max(0.30, usageNow - 0.30);
+      prevEpoch = closedEpochOf(r);
+      continue;
+    }
+    prevEpoch = r.nextEpoch ?? prevEpoch;
+  }
+
+  assert.ok(compressCount >= 3, `至少 3 次压缩（实际 ${compressCount}）`);
+  assert.ok(maxEpSeen >= 3, `至少 3 个 epoch（实际 maxEp=${maxEpSeen}）`);
+  assert.ok(emergencyCount <= 3, `emergency 不应作为正常工作路径（实际 ${emergencyCount}）`);
+});
+
+type PressureDecisionLike = {
+  nextEpoch?: PressureEpoch;
+};

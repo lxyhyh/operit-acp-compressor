@@ -44,11 +44,26 @@ import {
   type AbsorbCandidate,
 } from "./absorb-candidates";
 import {
-  computeEffectivePressure,
   evaluatePressure,
   type NudgeLevel as PressureNudgeLevel,
   type PressureEpoch,
 } from "./pressure";
+import { createUsageManager, type UsageManager, type UsageManagerState } from "./usage";
+import { createOperitHostUsageAdapter, type HostUsageAdapter } from "./host-usage-adapter";
+import { detectProtocol, normalizeUsage, type ProviderUsage } from "./token-source";
+
+// —— V0.7.1 HostUsageAdapter 单例（module 级、只读 DB、失败返回 undefined，绝不拖垮请求）。
+let _hostUsageAdapter: HostUsageAdapter | undefined;
+function getHostUsageAdapter(): HostUsageAdapter {
+  if (!_hostUsageAdapter) {
+    try {
+      _hostUsageAdapter = createOperitHostUsageAdapter();
+    } catch {
+      _hostUsageAdapter = { async getCurrentContextTokens() { return undefined; } };
+    }
+  }
+  return _hostUsageAdapter;
+}
 
 /** 投影缓存（globalThis 共享；compress 等 state mutation 后失效）。
  *  V0.4：send（project）与 estimate 分离——两者投影内容可能不同
@@ -474,6 +489,8 @@ export function createEngine(dataDir?: string): AcpEngine {
         // —— V0.4：运行时统计累计（nudge/compress/emergency 全链路）。
         //    autoFolded = emergency 兜底折叠（来源 emergency）；模型 compress 走
         //    applyCompression 单独计数（source=model）。
+        // —— V0.7.1：UsageManager 前置创建（emergency credit 与 effective pressure 共用）。
+        const usageManager = createUsageManager((cached.hostMetadata.usageState as UsageManagerState | undefined));
         const nextStats = { ...prevStats };
         const newBlockIds = turn.state.blocks.filter((b) => !cached.kernelState.blocks.some((pb) => pb.blockId === b.blockId)).map((b) => b.blockId);
         if (autoFolded && newBlockIds.length > 0) {
@@ -496,6 +513,8 @@ export function createEngine(dataDir?: string): AcpEngine {
           const postEstimate = estimateProjectionTokens(projectedMessages, postCovered);
           nextStats.creditBaseToken = Math.min(tokenEstimate, postEstimate) || tokenEstimate;
           nextStats.creditRemaining = settings.usageCreditTokens;
+          // —— V0.7.1：compression credit 独立字段（不再兼任 creditBaseToken；折叠量入 credit）。
+          usageManager.applyCompressionCredit(emergencyFreedTokens);
         }
         // nudge 状态机（Adapter 层 Continuous Pressure Controller）：V0.7
         //  - 取消 kernelShouldInject 作为硬总门，只作辅助 signal
@@ -507,18 +526,23 @@ export function createEngine(dataDir?: string): AcpEngine {
         const prevBlocks = cached.kernelState.blocks.length;
         const curBlocks = turn.state.blocks.length;
         const prevTokenCount = (cached.hostMetadata.lastTokenEstimate as number) ?? 0;
-        // effective pressure（usage 缺失/为0 时不视为 0 压力）
-        const eff = computeEffectivePressure({
-          actualUsage: config.modelContextLimit > 0 ? tokenEstimate / config.modelContextLimit : 0,
-          tokenEstimate,
-          modelContextLimit: config.modelContextLimit,
-        });
+        // —— V0.7.1：effective pressure 由 UsageManager 计算（estimate/actual/host 明确区分）。
+        // 删除 fake actualUsage（此前把 tokenEstimate/limit 冒充 actualUsage）。
+        // 宿主侧测量（尽力而为；DB 不可读返回 undefined，绝不拖垮请求）。
+        const hostTokens = chatId ? await getHostUsageAdapter().getCurrentContextTokens(String(chatId)) : undefined;
+        if (hostTokens !== undefined) usageManager.recordHostUsage(hostTokens);
+        usageManager.recordEstimate(tokenEstimate);
+        // 若插件曾通过工具链路记录过上游 usage，则注入（见 recordUpstreamUsage 调用点）。
+        const eff = usageManager.getEffectiveSnapshot(tokenEstimate);
+        const pressurePct = config.modelContextLimit > 0
+          ? (eff.effectiveTokens || tokenEstimate) / config.modelContextLimit
+          : ((eff.effectiveTokens || tokenEstimate) / 200000);
         const prevEpoch = (prevNudgeState as { acpEpoch?: PressureEpoch }).acpEpoch;
         // compression baseline：最近一次压缩成功后的 token 基准（供增长判断）。
         const lastCompressToken = typeof prevStats.creditBaseToken === "number" ? prevStats.creditBaseToken : undefined;
         const pressure = evaluatePressure({
-          usagePct: eff.usagePct,
-          effectiveTokens: eff.effectiveTokens,
+          usagePct: pressurePct,
+          effectiveTokens: eff.effectiveTokens || tokenEstimate,
           tokenEstimate,
           kernelShouldInject: turn.nudge?.shouldInject === true,
           kernelReason: turn.nudge?.reason ?? "",
@@ -537,6 +561,7 @@ export function createEngine(dataDir?: string): AcpEngine {
           nudgeCount: typeof prevNudgeState.nudgeCount === "number" ? prevNudgeState.nudgeCount : 0,
           lastTokensAtInject: typeof prevNudgeState.lastTokensAtInject === "number" ? prevNudgeState.lastTokensAtInject : 0,
           lastCompressToken,
+          source: eff.source,
         });
         const nextNudgeState: Record<string, unknown> = {
           ...pressure.nextNudgeState,
@@ -547,8 +572,8 @@ export function createEngine(dataDir?: string): AcpEngine {
         // nudge 档位：pressure controller 输出（无注入时按 usage 兜底算档位供 stats）
         const level: NudgeLevel = pressure.level ??
           (emergency ? "emergency"
-            : eff.usagePct >= settings.strongThresholdPct ? "strong"
-            : eff.usagePct >= settings.gentleThresholdPct ? "gentle"
+            : pressurePct >= settings.strongThresholdPct ? "strong"
+            : pressurePct >= settings.gentleThresholdPct ? "gentle"
             : "gentle");
 
         // nudge 仅当 controller 允许时注入（SYSTEM 消息追加；UI 不渲染成新用户消息）。
@@ -583,6 +608,8 @@ export function createEngine(dataDir?: string): AcpEngine {
             lastTokenEstimate: tokenEstimate,
             acpNudge: nextNudgeState,
             runtimeStats: nextStats,
+            // V0.7.1：usage 事实持久化（estimate/actual/host/compressionCredit，per-session）
+            usageState: usageManager.snapshot(),
             absorbCandidates: nextAbsorbCandidates,
             blockSources: {
               ...(cached.hostMetadata.blockSources ?? {}),
@@ -604,13 +631,24 @@ export function createEngine(dataDir?: string): AcpEngine {
         try {
           const active = turn.state.blocks.filter((b) => b.active).length;
           const nudgeReason = turn.nudge?.reason ? turn.nudge.reason.slice(0, 120) : "(kernel:no-nudge)";
-          const gateInfo = `allow=${pressure.allowInject ? 1 : 0} kShould=${turn.nudge?.shouldInject ? 1 : 0} reason=${pressure.decisionReason} eff=${Math.round(eff.usagePct * 100)}%`;
+          const gateInfo = `allow=${pressure.allowInject ? 1 : 0} kShould=${turn.nudge?.shouldInject ? 1 : 0} reason=${pressure.decisionReason} eff=${Math.round(pressurePct * 100)}% src=${eff.source}`;
           const st = nextStats;
           console.log(`[acp] project stage=${hookStage} chat=${chatId ? String(chatId).slice(0, 8) : "-"} sub=${isSubTask ? 1 : 0} fp=${fingerprint.slice(0, 12)} raw=${turns.length} proj=${cappedTurns.length} blocks=${active}/${turn.state.blocks.length} tok=${tokenEstimate} saved=${(cached.kernelState.stats?.tokensCompressed ?? 0) - (turn.state.stats?.tokensCompressed ?? 0)} nudge=${gateInfo} stats={n:${st.nudgeIssued},m:${st.compressSucceeded},e:${st.emergencyTriggered}} ${nudgeReason}`);
-          // ACP Trace：投影事件（含 pressure 决策原因）
+          // ACP Trace：投影事件（含 pressure 决策原因 + V0.7.1 多源 token 指标）
           chatTrace(chatId, {
             type: "project", stage: hookStage,
-            detail: { raw: turns.length, proj: cappedTurns.length, blocks: turn.state.blocks.length, tok: tokenEstimate, effPct: Math.round(eff.usagePct * 100), level, nudgeAllow: pressure.allowInject, reason: pressure.decisionReason, emergency: autoFolded },
+            detail: {
+              raw: turns.length, proj: cappedTurns.length, blocks: turn.state.blocks.length,
+              tok: tokenEstimate,
+              actual: eff.actualTokens,
+              host: eff.hostTokens,
+              credit: eff.compressionCredit,
+              effective: eff.effectiveTokens,
+              effPct: Math.round(pressurePct * 100),
+              level, nudgeAllow: pressure.allowInject, reason: pressure.decisionReason,
+              source: eff.source, confidence: eff.confidence,
+              emergency: autoFolded,
+            },
           });
         } catch { /* noop */ }
 
@@ -629,6 +667,7 @@ export function createEngine(dataDir?: string): AcpEngine {
 
     async applyCompression(sessionKey, ranges, messages) {
       const release = await acquireLock(sessionKey);
+      let usageStateForSave: UsageManagerState | undefined;
       try {
         const config = resolveKernelConfig(settings);
         const loaded = await persistence.load(sessionKey);
@@ -683,6 +722,13 @@ export function createEngine(dataDir?: string): AcpEngine {
             nextStats.creditBaseToken = Math.max(0, est - applied.result.tokensCompressed);
             nextStats.creditRemaining = settings.usageCreditTokens;
           }
+          // —— V0.7.1：模型压缩同样累加压缩量到 compression credit 独立字段。
+          const mgr = createUsageManager((loaded.hostMetadata.usageState as UsageManagerState | undefined));
+          mgr.applyCompressionCredit(applied.result.tokensCompressed);
+          // 记录 host 测量（若已缓存）+ 持久化 usageState。
+          const hostNow = await getHostUsageAdapter().getCurrentContextTokens(String(sessionKey).split("_")[0] ?? sessionKey).catch(() => undefined);
+          if (hostNow !== undefined) mgr.recordHostUsage(hostNow);
+          usageStateForSave = mgr.snapshot();
         } else if (applied.result.blocksCreated === 0) {
           nextStats.compressFailed += 1;
         }
@@ -696,6 +742,7 @@ export function createEngine(dataDir?: string): AcpEngine {
             stateVersion: (loaded.hostMetadata.stateVersion ?? 0) + 1,
             lastProjectionFingerprint: undefined as string | undefined,
             runtimeStats: nextStats,
+            ...(usageStateForSave ? { usageState: usageStateForSave } : {}),
             blockSources: {
               ...(loaded.hostMetadata.blockSources ?? {}),
               ...(newBlockIds.length > 0

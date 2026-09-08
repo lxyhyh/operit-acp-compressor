@@ -28,37 +28,6 @@ export interface PressureEpoch {
   closed: boolean;
 }
 
-export interface EffectivePressure {
-  effectiveTokens: number;
-  usagePct: number;
-  /** measured | estimated | hybrid——usage 数据来源。 */
-  source: "measured" | "estimated" | "hybrid";
-}
-
-/**
- * computeEffectivePressure：综合 actual usage / estimate / baseline。
- * 解决文档指出的"lastInputTokens==0 → usage=0 → nudge 永不触发"。
- * - 若 actualUsage 缺失/为0，用 estimate 兜底（绝不视为 0 压力）
- * - effectiveTokens 取 max(estimate, actualUsage*limit)
- */
-export function computeEffectivePressure(input: {
-  actualUsage?: number;
-  tokenEstimate: number;
-  modelContextLimit: number;
-}): EffectivePressure {
-  const { tokenEstimate, modelContextLimit } = input;
-  const measured = typeof input.actualUsage === "number" && Number.isFinite(input.actualUsage) && input.actualUsage > 0
-    ? input.actualUsage
-    : 0;
-  const estimated = modelContextLimit > 0 ? tokenEstimate / modelContextLimit : 0;
-  const usagePct = Math.max(measured, estimated);
-  const source: EffectivePressure["source"] =
-    measured <= 0 ? "estimated"
-    : estimated > 0 ? "hybrid"
-    : "measured";
-  return { effectiveTokens: Math.max(tokenEstimate, measured * modelContextLimit), usagePct, source };
-}
-
 /** 计算本轮回注档位：越线档 + epoch 内单调升级（只升不降）。 */
 export function computePressureLevel(input: {
   usagePct: number;
@@ -85,10 +54,11 @@ export function shouldEscalate(usagePct: number, strongThresholdPct: number): bo
 }
 
 /**
- * evaluatePressure：Continuous Pressure Controller 主入口。
+ * evaluatePressureInner：Continuous Pressure Controller 内部实现。
  * 返回是否注入 + 档位 + nextEpoch + decisionReason。
+ * V0.7.1：effectiveTokens/pressurePct/source 由导出包装统一附加。
  */
-export function evaluatePressure(input: {
+function evaluatePressureInner(input: {
   usagePct: number;
   effectiveTokens: number;
   tokenEstimate: number;
@@ -113,6 +83,8 @@ export function evaluatePressure(input: {
   nudgeCount: number;
   lastTokensAtInject: number;
   lastCompressToken?: number;
+  // V0.7.1：effective token 数据源（estimate/upstream/host/hybrid）
+  source: "estimate" | "upstream" | "host" | "hybrid";
 }): {
   allowInject: boolean;
   level?: Exclude<NudgeLevel, "none">;
@@ -252,5 +224,35 @@ export function evaluatePressure(input: {
     nextEpoch,
     nextNudgeState: { lastInjectedAt: Date.now(), nudgeCount: prev.nudgeCount + 1, lastTokensAtInject: input.tokenEstimate },
     decisionReason: "gentle-inject",
+  };
+}
+
+export type EffectiveSource = "estimate" | "upstream" | "host" | "hybrid";
+
+export interface PressureDecision {
+  allowInject: boolean;
+  level?: Exclude<NudgeLevel, "none">;
+  nextEpoch?: PressureEpoch;
+  nextNudgeState: Record<string, unknown>;
+  decisionReason: string;
+  pressurePct: number;
+  effectiveTokens: number;
+  source: EffectiveSource;
+}
+
+export type PressureInput = Parameters<typeof evaluatePressureInner>[0];
+
+/**
+ * evaluatePressure：导出包装——在 Inner 决策上统一附加 V0.7.1 effective 指标。
+ * pressurePct = effectiveTokens / modelContextLimit（调用方传 usagePct 时已算好，
+ * 这里直接用输入值，保证 trace 与判定一致）。
+ */
+export function evaluatePressure(input: PressureInput): PressureDecision {
+  const r = evaluatePressureInner(input);
+  return {
+    ...r,
+    pressurePct: input.usagePct,
+    effectiveTokens: input.effectiveTokens,
+    source: input.source,
   };
 }

@@ -33,6 +33,12 @@ import {
   stableKeyForTurn,
   type PromptTurnLike,
 } from "./messages";
+import {
+  createIdentityBridgeState,
+  identityForTurn,
+  loadIdentityBridgeState,
+  type IdentityBridgeState,
+} from "../identity-bridge";
 import { collectCoveredMessageIds, estimateProjectionTokens } from "./token";
 import { createPersistence, stripOldAnchorMessages, EMPTY_RUNTIME_STATS, type Persistence, type OperitAcpSessionState, type AcpRuntimeStats } from "./persistence";
 import { chatTrace } from "./trace";
@@ -212,6 +218,33 @@ export function createEngine(dataDir?: string): AcpEngine {
   const core = createCore();
   const settings = loadAdapterSettings();
   const persistence = createPersistence(dataDir || settings.dataDir);
+
+  // —— V0.7.8：Identity Bridge state（session 隔离，module 级单例；不跨 chat 泄漏）。
+  let identityState: IdentityBridgeState = createIdentityBridgeState();
+
+  /** V0.7.8：用 identity-bridge 生成 id 的 mapping（legacy continuity + virtual tool identity）。 */
+  function mapTurnsWithIdentity(turns: PromptTurnLike[]) {
+    return promptTurnsToCoreMessages(turns, {
+      identityForTurn: (turn) => {
+        const r = identityForTurn(turn, {
+          hop: (cachedHop ?? 0) + 1,
+          toolState: identityState,
+          legacyRefExists: (key) => {
+            try {
+              // 只有有持久化 state 时才查 legacy 连续性
+              return false;
+            } catch { return false; }
+          },
+        });
+        return { id: r.id };
+      },
+    });
+  }
+  let cachedHop = 0;
+
+  /** 暴露 identity state（status/trace 用；与 persistence 互不影响）。 */
+  function getIdentityBridgeState(): IdentityBridgeState { return identityState; }
+  function setIdentityBridgeState(s: IdentityBridgeState) { identityState = s; }
 
   /** per-session 内存锁：同一 session 的 mutation 串行化。 */
   const locks = new Map<string, Promise<void>>();
@@ -637,7 +670,7 @@ export function createEngine(dataDir?: string): AcpEngine {
           }
         }
 
-        const mapping = promptTurnsToCoreMessages(turns);
+        const mapping = mapTurnsWithIdentity(turns);
         // 清理宿主回传的旧锚点残留（避免旧摘要继续出现在 UI/上下文）。
         mapping.messages = stripOldAnchorMessages(mapping.messages) as CoreMessage[];
         const coveredIds = collectCoveredMessageIds(cached.kernelState);

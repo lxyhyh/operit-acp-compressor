@@ -108,21 +108,31 @@ export interface CoreMapping {
 
 /**
  * 将 PromptTurn[] 转换为 CoreMessage[]。
- * - stableKey 作为 id（重复内容追加 #2、#3…）。
+ * - V0.7.8：id 由 identity-bridge 生成（namespace-aware + legacy continuity），
+ *   重复 id 追加 #2、#3…。
  * - TOOL_CALL/TOOL_RESULT：从 XML 解析工具名；toolCallId 用 FIFO 配对
  *   （call 生成 id 入队，下一条 result 出队继承），无法配对时用 orphan_ 前缀。
  */
-export function promptTurnsToCoreMessages(turns: PromptTurnLike[]): CoreMapping {
+export function promptTurnsToCoreMessages(
+  turns: PromptTurnLike[],
+  identity?: {
+    identityForTurn?: (turn: PromptTurnLike) => { id: string };
+    getLegacyExists?: () => (key: string) => boolean;
+  },
+): CoreMapping {
   const messages: CoreMessage[] = [];
   const byKey = new Map<string, PromptTurnLike>();
   const seen = new Map<string, number>();
   const pendingCallIds: string[] = [];
+  const identityFn = identity?.identityForTurn
+    ? identity.identityForTurn
+    : (turn: PromptTurnLike) => ({ id: stableKeyForTurn(turn) });
 
   for (const turn of turns) {
-    const base = stableKeyForTurn(turn);
-    const occurrence = (seen.get(base) || 0) + 1;
-    seen.set(base, occurrence);
-    const key = occurrence === 1 ? base : `${base}#${occurrence}`;
+    const idBase = identityFn(turn).id;
+    const occurrence = (seen.get(idBase) || 0) + 1;
+    seen.set(idBase, occurrence);
+    const key = occurrence === 1 ? idBase : `${idBase}#${occurrence}`;
 
     const role = KIND_TO_ROLE[turn.kind] || "user";
     const contentType = KIND_TO_CONTENT_TYPE[turn.kind] || "text";

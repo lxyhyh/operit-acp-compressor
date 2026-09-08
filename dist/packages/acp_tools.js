@@ -3235,16 +3235,17 @@ function stableKeyForTurn(turn) {
   const meta = Object.keys(stableMeta).length > 0 ? stableStringify(stableMeta) : "";
   return `${kind}|${toolName}|${hashString(JSON.stringify([content, meta]))}`;
 }
-function promptTurnsToCoreMessages(turns) {
+function promptTurnsToCoreMessages(turns, identity) {
   const messages = [];
   const byKey = /* @__PURE__ */ new Map();
   const seen = /* @__PURE__ */ new Map();
   const pendingCallIds = [];
+  const identityFn = identity?.identityForTurn ? identity.identityForTurn : (turn) => ({ id: stableKeyForTurn(turn) });
   for (const turn of turns) {
-    const base = stableKeyForTurn(turn);
-    const occurrence = (seen.get(base) || 0) + 1;
-    seen.set(base, occurrence);
-    const key = occurrence === 1 ? base : `${base}#${occurrence}`;
+    const idBase = identityFn(turn).id;
+    const occurrence = (seen.get(idBase) || 0) + 1;
+    seen.set(idBase, occurrence);
+    const key = occurrence === 1 ? idBase : `${idBase}#${occurrence}`;
     const role = KIND_TO_ROLE[turn.kind] || "user";
     const contentType = KIND_TO_CONTENT_TYPE[turn.kind] || "text";
     const text = typeof turn.content === "string" ? turn.content : "";
@@ -3376,6 +3377,155 @@ function coreMessagesToPromptTurns(coreMessages, byKey) {
     });
   }
   return out;
+}
+
+// src/identity-bridge.ts
+function classifyTurn(turn) {
+  const kind = turn.kind || "UNKNOWN";
+  const md = turn.metadata && typeof turn.metadata === "object" ? turn.metadata : void 0;
+  const isAcp = md?.acp === true || md?.acpNudge === true;
+  switch (kind) {
+    case "SYSTEM":
+      return isAcp ? "ACP_NUDGE" : "HOST_SYSTEM";
+    case "USER":
+      return "HOST_USER";
+    case "ASSISTANT":
+      return "HOST_ASSISTANT";
+    case "TOOL_CALL":
+      return "HOST_TOOL_CALL";
+    case "TOOL_RESULT":
+      return "HOST_TOOL_RESULT";
+    case "SUMMARY":
+      return isAcp ? "ACP_SUMMARY" : "HOST_ASSISTANT";
+    default:
+      return "UNKNOWN";
+  }
+}
+function createIdentityBridgeState() {
+  return { toolAlignments: {}, toolSeqCounter: 0 };
+}
+function normalizeToolCallSignature(content) {
+  return content.replace(/<tool_[a-zA-Z0-9_]+/g, "<tool").replace(/<\/tool_[a-zA-Z0-9_]+>/g, "</tool>").trim();
+}
+function normalizeToolResultSignature(content) {
+  return content.replace(/<tool_result_[a-zA-Z0-9_]+/g, "<tool_result").replace(/<\/tool_result_[a-zA-Z0-9_]+>/g, "</tool_result>").trim();
+}
+function toolNameFromContent(content) {
+  const m = /<tool(?:_result)?_[a-zA-Z0-9_]+ name="([^"]*)"/.exec(content || "");
+  return m ? m[1] : "";
+}
+function explicitToolCallId(turn) {
+  const md = turn.metadata && typeof turn.metadata === "object" ? turn.metadata : void 0;
+  if (md) {
+    if (typeof md.toolCallId === "string" && md.toolCallId) return md.toolCallId;
+    const v = md.tool_call_id;
+    if (typeof v === "string" && v) return v;
+  }
+  const c = typeof turn.content === "string" ? turn.content : "";
+  const m = /tool_call_id["']?\s*[:=]\s*["']([^"']+)["']/.exec(c);
+  return m ? m[1] : void 0;
+}
+function legacyStableKey(turn) {
+  const kind = turn.kind || "UNKNOWN";
+  const content = typeof turn.content === "string" ? turn.content : "";
+  let toolName = turn.toolName || "";
+  if (toolName === "null" || toolName === "undefined") toolName = "";
+  const stableMeta = {};
+  if (turn.metadata && typeof turn.metadata === "object") {
+    for (const [k, v] of Object.entries(turn.metadata)) {
+      if (k === "toolCallId" || k === "tool_call_id") continue;
+      stableMeta[k] = v;
+    }
+  }
+  const meta = Object.keys(stableMeta).length > 0 ? stableStringify(stableMeta) : "";
+  return `${kind}|${toolName}|${hashString(JSON.stringify([content, meta]))}`;
+}
+function hostAnchor(turn) {
+  const md = turn.metadata && typeof turn.metadata === "object" ? turn.metadata : void 0;
+  if (md) {
+    if (typeof md.messageId === "string" && md.messageId) return md.messageId;
+    if (typeof md.hostMessageId === "string" && md.hostMessageId) return md.hostMessageId;
+  }
+  return void 0;
+}
+function identityForTurn(turn, ctx) {
+  const cls = classifyTurn(turn);
+  const legacyKey = legacyStableKey(turn);
+  if (ctx?.legacyRefExists) {
+    try {
+      if (ctx.legacyRefExists(legacyKey)) {
+        return { id: legacyKey, strategy: "legacy-continuity", cls, legacyKey };
+      }
+    } catch {
+    }
+  }
+  switch (cls) {
+    case "HOST_USER": {
+      const a = hostAnchor(turn);
+      if (a) return { id: `host:user:${a}`, strategy: "host-anchor", cls, legacyKey };
+      return { id: `host:user:content:${hashString(JSON.stringify([turn.content]))}`, strategy: "content-fallback", cls, legacyKey };
+    }
+    case "HOST_ASSISTANT": {
+      const a = hostAnchor(turn);
+      if (a) return { id: `host:assistant:${a}`, strategy: "host-anchor", cls, legacyKey };
+      return { id: `host:assistant:content:${hashString(JSON.stringify([turn.content]))}`, strategy: "content-fallback", cls, legacyKey };
+    }
+    case "HOST_TOOL_CALL": {
+      const real = explicitToolCallId(turn);
+      if (real) return { id: `host:toolcall:${real}`, strategy: "tool-call-id", cls, legacyKey };
+      return virtualToolIdentity(turn, "toolcall", ctx);
+    }
+    case "HOST_TOOL_RESULT": {
+      const real = explicitToolCallId(turn);
+      if (real) return { id: `host:toolresult:${real}`, strategy: "tool-call-id", cls, legacyKey };
+      return virtualToolIdentity(turn, "toolresult", ctx);
+    }
+    case "ACP_SUMMARY": {
+      const md = turn.metadata && typeof turn.metadata === "object" ? turn.metadata : void 0;
+      const blockId = typeof md?.blockId === "string" && md.blockId ? md.blockId : hashString(String(turn.content)).slice(0, 10);
+      return { id: `acp:summary:${blockId}`, strategy: "acp-summary", cls, legacyKey };
+    }
+    case "ACP_NUDGE": {
+      const md = turn.metadata && typeof turn.metadata === "object" ? turn.metadata : void 0;
+      const nudgeId = typeof md?.nudgeId === "string" && md.nudgeId ? md.nudgeId : hashString(String(turn.content)).slice(0, 10);
+      return { id: `acp:nudge:${nudgeId}`, strategy: "acp-nudge", cls, legacyKey };
+    }
+    case "HOST_SYSTEM":
+      return { id: `host:system:content:${hashString(String(turn.content))}`, strategy: "content-fallback", cls, legacyKey };
+    default:
+      return { id: `host:unknown:content:${hashString(JSON.stringify([turn.kind, turn.content]))}`, strategy: "content-fallback", cls, legacyKey };
+  }
+}
+function virtualToolIdentity(turn, role, ctx) {
+  const content = typeof turn.content === "string" ? turn.content : "";
+  const toolName = toolNameFromContent(content) || turn.toolName || "";
+  const sig = role === "toolcall" ? normalizeToolCallSignature(content) : normalizeToolResultSignature(content);
+  const sigHash = hashString(sig).slice(0, 12);
+  const state = ctx?.toolState ?? createIdentityBridgeState();
+  const list = state.toolAlignments[toolName] ?? [];
+  const existing = list.find((e) => e.callSig === sigHash || e.resultSig === sigHash);
+  let seq;
+  if (existing) {
+    seq = existing.seq;
+    if (role === "toolcall") existing.callSig = sigHash;
+    else existing.resultSig = sigHash;
+    existing.lastHop = ctx?.hop ?? 0;
+  } else {
+    seq = ++state.toolSeqCounter;
+    state.toolAlignments[toolName] = [...list, {
+      seq,
+      toolName,
+      callSig: role === "toolcall" ? sigHash : "",
+      resultSig: role === "toolresult" ? sigHash : "",
+      lastHop: ctx?.hop ?? 0
+    }];
+  }
+  return {
+    id: `host:${role}:V${seq}_${toolName || "unknown"}_${sigHash}`,
+    strategy: "tool-virtual",
+    cls: classifyTurn(turn),
+    legacyKey: legacyStableKey(turn)
+  };
 }
 
 // src/acp/token.ts
@@ -4042,6 +4192,32 @@ function createEngine(dataDir) {
   const core = createCore();
   const settings = loadAdapterSettings();
   const persistence = createPersistence(dataDir || settings.dataDir);
+  let identityState = createIdentityBridgeState();
+  function mapTurnsWithIdentity(turns) {
+    return promptTurnsToCoreMessages(turns, {
+      identityForTurn: (turn) => {
+        const r = identityForTurn(turn, {
+          hop: (cachedHop ?? 0) + 1,
+          toolState: identityState,
+          legacyRefExists: (key) => {
+            try {
+              return false;
+            } catch {
+              return false;
+            }
+          }
+        });
+        return { id: r.id };
+      }
+    });
+  }
+  let cachedHop = 0;
+  function getIdentityBridgeState() {
+    return identityState;
+  }
+  function setIdentityBridgeState(s) {
+    identityState = s;
+  }
   const locks = /* @__PURE__ */ new Map();
   async function acquireLock(sid) {
     const prev = locks.get(sid) ?? Promise.resolve();
@@ -4386,7 +4562,7 @@ function createEngine(dataDir) {
             }
           }
         }
-        const mapping = promptTurnsToCoreMessages(turns);
+        const mapping = mapTurnsWithIdentity(turns);
         mapping.messages = stripOldAnchorMessages(mapping.messages);
         const coveredIds = collectCoveredMessageIds(cached.kernelState);
         const tokenEstimate = estimateProjectionTokens(mapping.messages, coveredIds);

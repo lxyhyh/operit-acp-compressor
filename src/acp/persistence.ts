@@ -294,6 +294,13 @@ export function createPersistence(dataDir?: string): Persistence {
       try {
         await Tools.Files.write(tmpPath, content, false, "android");
         await Tools.Files.move(tmpPath, path, "android");
+        // —— V0.7.13-P3-D.1：save 成功后必须同步内存 cache。
+        //   否则同一 engine 实例内后续 load() 会命中旧缓存（mtime 未变）
+        //   返回 stale state（compress 建块后 acp_status 仍报 0 blocks）。
+        try {
+          const newInfo = Tools.Files.info(path) as unknown as { mtimeMs?: number } | undefined;
+          cache.set(path, { mtime: newInfo?.mtimeMs ?? 0, state });
+        } catch { /* 缓存更新失败不影响主流程 */ }
       } catch {
         try {
           await Tools.Files.deleteFile(tmpPath, false, "android");

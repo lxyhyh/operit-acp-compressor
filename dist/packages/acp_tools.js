@@ -3719,6 +3719,11 @@ function createPersistence(dataDir) {
       try {
         await Tools.Files.write(tmpPath, content, false, "android");
         await Tools.Files.move(tmpPath, path, "android");
+        try {
+          const newInfo = Tools.Files.info(path);
+          cache2.set(path, { mtime: newInfo?.mtimeMs ?? 0, state });
+        } catch {
+        }
       } catch {
         try {
           await Tools.Files.deleteFile(tmpPath, false, "android");

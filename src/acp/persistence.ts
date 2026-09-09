@@ -63,6 +63,8 @@ export interface OperitAcpSessionState {
   kernelState: CompressionState;
   hostMetadata: {
     lastProjectionFingerprint?: string;
+    /** V0.7.13-P3-I.6：发送时最终投影（跨 runtime 供 estimate 前缀复用，静态计数对齐）。 */
+    lastProjection?: Array<{ kind: string; content: string; toolName?: string; metadata?: Record<string, unknown> | null }>;
     toolLoopCoverage: "full" | "main-request-only" | "unknown";
     lastUpdatedAt: number;
     lastTokenEstimate?: number;

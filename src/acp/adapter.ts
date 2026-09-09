@@ -388,9 +388,18 @@ export function createEngine(dataDir?: string): AcpEngine {
         //   尾部=少量新增"时，直接复用发送链路已算好的投影（含 emergency
         //   折叠与 cap），仅对尾部新增做轻量投影并 cap，静态≈任务中。
         //   估算侧仍只读：只读缓存、不落盘、不建块。
+        // —— V0.7.13-P3-I.6：前缀复用数据源改为持久化 state（真根因修复）。
+        //   P3-I.5 失败根因：hook 在宿主独立 runtime 被调用（lifecycle.ts 注释），
+        //   发送链路 project() 写的内存缓存（发送 runtime 的 globalThis）对 estimate()
+        //   所在 runtime 不可见 → memPrev/rawPrev 恒 undefined → 前缀匹配必然 miss。
+        //   数据源改持久化：rawTurnsFile（saveRawTurns 落盘的发送时 turns）+
+        //   hostMetadata.lastProjection（发送时最终投影，本提交新增落盘）——跨 runtime 可见。
         {
-          const memPrev = projectionCache.get(sessionKey);
-          const rawPrev = rawTurnsCache.get(sessionKey);
+          let rawPrev: PromptTurnLike[] | undefined;
+          try { rawPrev = (await persistence.loadRawTurns(sessionKey)) as PromptTurnLike[] | undefined; } catch { rawPrev = undefined; }
+          const memPrev = (loaded.hostMetadata.lastProjection
+            ? { projection: loaded.hostMetadata.lastProjection as PromptTurnLike[] }
+            : undefined);
           // V0.7.13-P3-I.5b：估算场景放宽新增阈值。回合结束重算时，发送当轮的
           //   工具循环已产生大量新 turn（实测一轮 +19 条，超过发送链路增量阈值 8），
           //   用 8 会必然 miss → 退回全量重算（折叠浅 → 静态 31 万）。
@@ -926,6 +935,8 @@ export function createEngine(dataDir?: string): AcpEngine {
         cacheSetLimited(projectionCache, sessionKey, { fingerprint, stateVersion, projection: cappedTurns });
         cacheSetLimited(rawTurnsCache, sessionKey, turns);
         nextState.lastRawTurns = turns;
+        // —— V0.7.13-P3-I.6：发送时最终投影持久化（estimate 跨 runtime 前缀复用数据源）。
+        nextState.hostMetadata.lastProjection = cappedTurns;
         await persistence.save(sessionKey, nextState);
         // 持久化最近一轮 raw turns（跨 VM 供 compress/absorb 锚定 refs；不裁剪）。
         await persistence.saveRawTurns(sessionKey, turns);

@@ -4372,8 +4372,13 @@ function createEngine(dataDir) {
           return cachedProj.projection;
         }
         {
-          const memPrev = projectionCache.get(sessionKey);
-          const rawPrev = rawTurnsCache.get(sessionKey);
+          let rawPrev;
+          try {
+            rawPrev = await persistence.loadRawTurns(sessionKey);
+          } catch {
+            rawPrev = void 0;
+          }
+          const memPrev = loaded.hostMetadata.lastProjection ? { projection: loaded.hostMetadata.lastProjection } : void 0;
           const estimateMaxNewTurns = Math.max(
             settings.estimateMaxNewTurns ?? 64,
             settings.incrementalMaxNewTurns
@@ -4796,6 +4801,7 @@ ${lines.join("\n")}${active.length > 3 ? `
         cacheSetLimited(projectionCache, sessionKey, { fingerprint, stateVersion, projection: cappedTurns });
         cacheSetLimited(rawTurnsCache, sessionKey, turns);
         nextState.lastRawTurns = turns;
+        nextState.hostMetadata.lastProjection = cappedTurns;
         await persistence.save(sessionKey, nextState);
         await persistence.saveRawTurns(sessionKey, turns);
         try {

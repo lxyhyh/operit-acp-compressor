@@ -3983,12 +3983,15 @@ function computeEffectiveTokens(input) {
   const host = typeof input.hostTokens === "number" && Number.isFinite(input.hostTokens) && input.hostTokens > 0 ? input.hostTokens : void 0;
   const credit = typeof input.compressionCredit === "number" && Number.isFinite(input.compressionCredit) && input.compressionCredit > 0 ? input.compressionCredit : 0;
   const correctedActual = actual !== void 0 ? Math.max(0, actual - credit) : void 0;
-  const candidates = [];
-  if (correctedActual !== void 0) candidates.push(correctedActual);
-  if (host !== void 0) candidates.push(host);
   const est = Number.isFinite(estimatedTokens) && estimatedTokens > 0 ? estimatedTokens : 0;
-  if (est > 0) candidates.push(est);
-  const effectiveTokens = candidates.length > 0 ? Math.max(...candidates) : 0;
+  let effectiveTokens;
+  if (correctedActual !== void 0 && correctedActual > 0) {
+    effectiveTokens = correctedActual;
+  } else if (host !== void 0) {
+    effectiveTokens = host;
+  } else {
+    effectiveTokens = est;
+  }
   let source = "estimate";
   if (actual !== void 0 && host !== void 0) source = "hybrid";
   else if (actual !== void 0) source = "upstream";

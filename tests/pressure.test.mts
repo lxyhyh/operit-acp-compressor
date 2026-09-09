@@ -249,16 +249,16 @@ test("T1: computeEffectiveTokens 三源组合（estimate only / actual only / ho
   // estimate only
   const e = computeEffectiveTokens({ estimatedTokens: 60_000 });
   assert.equal(e.effectiveTokens, 60_000); assert.equal(e.source, "estimate"); assert.equal(e.confidence, "low");
-  // actual only
+  // actual only → actual 优先（真实 usage），confidence=high
   const a = computeEffectiveTokens({ estimatedTokens: 10_000, actualTokens: 90_000 });
   assert.equal(a.effectiveTokens, 90_000); assert.equal(a.source, "upstream"); assert.equal(a.confidence, "high");
-  // host only
+  // host only → host 真实，confidence=medium
   const h = computeEffectiveTokens({ estimatedTokens: 10_000, hostTokens: 80_000 });
   assert.equal(h.effectiveTokens, 80_000); assert.equal(h.source, "host"); assert.equal(h.confidence, "medium");
-  // all three → max
-  const all = computeEffectiveTokens({ estimatedTokens: 50_000, actualTokens: 70_000, hostTokens: 95_000 });
-  assert.equal(all.effectiveTokens, 95_000); assert.equal(all.source, "hybrid"); assert.equal(all.confidence, "high");
-  // actual+host，无 estimate
+  // all three → actual 优先（V0.7.13-P3-I.1：不再 max，estimate 高估不顶掉真实值）
+  const all = computeEffectiveTokens({ estimatedTokens: 500_000, actualTokens: 70_000, hostTokens: 95_000 });
+  assert.equal(all.effectiveTokens, 70_000); assert.equal(all.source, "hybrid"); assert.equal(all.confidence, "high");
+  // actual+host，无 estimate → actual 优先（V0.7.13-P3-I.1 变更）
   const ah = computeEffectiveTokens({ estimatedTokens: 0, actualTokens: 70_000, hostTokens: 60_000 });
   assert.equal(ah.effectiveTokens, 70_000);
 });

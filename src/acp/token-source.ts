@@ -41,11 +41,13 @@ export interface TokenSnapshot {
 }
 
 /**
- * computeEffectiveTokens：候选取最大值，但先对 actual 应用 compression credit 修正。
- * 依据建议文档第 8 阶段：
+ * computeEffectiveTokens：宿主真实测量优先，estimate 仅作 fallback。
+ * V0.7.13-P3-I.1：effective 不再取 max（estimate 高估时会顶掉宿主真实值）。
+ * 依据建议文档第 8 阶段 + P3-E 取证（ACP estimate 594K vs 宿主真实 191K）：
  *   correctedActual = max(0, actualTokens - compressionCredit)
- *   effectiveTokens  = max(correctedActual, hostTokens, estimatedTokens)
- * 说明：credit 只用于修正"压缩后仍代表旧未折叠历史的 usage"，不是从一切里减。
+ *   effectiveTokens = host ?? correctedActual ?? estimate
+ * 说明：host（宿主侧 currentWindowSize 真实 tokenizer 计数）为最高优先；
+ *       无 host 时退回 correctedActual；都无才用 estimate。
  */
 export function computeEffectiveTokens(input: {
   estimatedTokens: number;
@@ -66,13 +68,22 @@ export function computeEffectiveTokens(input: {
 
   const correctedActual = actual !== undefined ? Math.max(0, actual - credit) : undefined;
 
-  const candidates: number[] = [];
-  if (correctedActual !== undefined) candidates.push(correctedActual);
-  if (host !== undefined) candidates.push(host);
+  // —— V0.7.13-P3-I.1：真实测量优先，estimate 仅作 fallback。
+  //   优先级：correctedActual（provider 真实 usage，压缩 credit 修正后）>
+  //           host（宿主 currentWindowSize 真实 tokenizer 计数）>
+  //           estimate（CJK 估算，仅兜底）。
+  //   原因：estimate 是 CJK 加权估算（对中文高估 ~3 倍），max 会让 estimate 顶掉
+  //   真实值（594K vs 真实 191K）、nudge 过早触发。而 actual 是 provider 返回的
+  //   精确 usage，可信度最高，host 次之。
   const est = Number.isFinite(estimatedTokens) && estimatedTokens > 0 ? estimatedTokens : 0;
-  if (est > 0) candidates.push(est);
-
-  const effectiveTokens = candidates.length > 0 ? Math.max(...candidates) : 0;
+  let effectiveTokens: number;
+  if (correctedActual !== undefined && correctedActual > 0) {
+    effectiveTokens = correctedActual;
+  } else if (host !== undefined) {
+    effectiveTokens = host;
+  } else {
+    effectiveTokens = est;
+  }
 
   let source: TokenSource = "estimate";
   if (actual !== undefined && host !== undefined) source = "hybrid";

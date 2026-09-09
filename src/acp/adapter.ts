@@ -380,6 +380,40 @@ export function createEngine(dataDir?: string): AcpEngine {
         if (cachedProj && cachedProj.fingerprint === fingerprint) {
           return cachedProj.projection;
         }
+        // —— V0.7.13-P3-I.5：前缀匹配快速路径（静态计数对齐任务中的关键）。
+        //   回合结束重算的 turns = 发送时 turns + 尾部新增（AI 回复等），
+        //   fingerprint 必然 miss → 全量重算折叠浅（proj=1437 vs 发送时 920，
+        //   因为 emergency 折叠/cap 深度只在发送链路做）→ 静态计数比任务中
+        //   多 10 几万（31万 vs 19万）。修复：识别"前缀=发送时原始 turns、
+        //   尾部=少量新增"时，直接复用发送链路已算好的投影（含 emergency
+        //   折叠与 cap），仅对尾部新增做轻量投影并 cap，静态≈任务中。
+        //   估算侧仍只读：只读缓存、不落盘、不建块。
+        {
+          const memPrev = projectionCache.get(sessionKey);
+          const rawPrev = rawTurnsCache.get(sessionKey);
+          const newCount = rawPrev ? turns.length - rawPrev.length : -1;
+          if (memPrev && memPrev.projection && memPrev.projection.length > 0 && rawPrev
+            && newCount > 0 && newCount <= settings.incrementalMaxNewTurns
+            && turns.length >= rawPrev.length) {
+            // 校验前缀稳定：前 rawPrev.length 条 stableKey 完全一致。
+            let prefixOk = true;
+            for (let i = 0; i < rawPrev.length; i++) {
+              if (stableKeyForTurn(turns[i]) !== stableKeyForTurn(rawPrev[i])) { prefixOk = false; break; }
+            }
+            if (prefixOk) {
+              const delta = turns.slice(rawPrev.length);
+              const deltaMap = promptTurnsToCoreMessages(delta);
+              const deltaTurns = coreMessagesToPromptTurns(deltaMap.messages, deltaMap.byKey);
+              const merged = [...(memPrev.projection as PromptTurnLike[]), ...deltaTurns];
+              const capped = capProjectionSize(merged, { keepChars: 2000, maxRecent: 3, totalBudgetChars: 200_000 });
+              cacheSetLimited(estimateCache, sessionKey, { fingerprint, stateVersion, projection: capped });
+              try {
+                console.log(`[acp] estimate prefix-hit raw=${turns.length} proj=${capped.length} delta=${delta.length} ${Date.now() % 100000}`);
+              } catch { /* noop */ }
+              return capped;
+            }
+          }
+        }
         // 克隆状态：绝不动持久化状态（估算侧只读）。kernelState 为纯 JSON，JSON 深拷贝安全。
         const workState = JSON.parse(JSON.stringify(loaded.kernelState)) as CompressionState;
         // —— V0.7.13-P3-I.4 根因修复：估算路径必须与发送路径同源 identity。

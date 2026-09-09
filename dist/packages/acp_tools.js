@@ -4371,6 +4371,33 @@ function createEngine(dataDir) {
         if (cachedProj && cachedProj.fingerprint === fingerprint) {
           return cachedProj.projection;
         }
+        {
+          const memPrev = projectionCache.get(sessionKey);
+          const rawPrev = rawTurnsCache.get(sessionKey);
+          const newCount = rawPrev ? turns.length - rawPrev.length : -1;
+          if (memPrev && memPrev.projection && memPrev.projection.length > 0 && rawPrev && newCount > 0 && newCount <= settings.incrementalMaxNewTurns && turns.length >= rawPrev.length) {
+            let prefixOk = true;
+            for (let i = 0; i < rawPrev.length; i++) {
+              if (stableKeyForTurn(turns[i]) !== stableKeyForTurn(rawPrev[i])) {
+                prefixOk = false;
+                break;
+              }
+            }
+            if (prefixOk) {
+              const delta = turns.slice(rawPrev.length);
+              const deltaMap = promptTurnsToCoreMessages(delta);
+              const deltaTurns = coreMessagesToPromptTurns(deltaMap.messages, deltaMap.byKey);
+              const merged = [...memPrev.projection, ...deltaTurns];
+              const capped2 = capProjectionSize(merged, { keepChars: 2e3, maxRecent: 3, totalBudgetChars: 2e5 });
+              cacheSetLimited(estimateCache, sessionKey, { fingerprint, stateVersion, projection: capped2 });
+              try {
+                console.log(`[acp] estimate prefix-hit raw=${turns.length} proj=${capped2.length} delta=${delta.length} ${Date.now() % 1e5}`);
+              } catch {
+              }
+              return capped2;
+            }
+          }
+        }
         const workState = JSON.parse(JSON.stringify(loaded.kernelState));
         const mapping = mapTurnsWithIdentity(turns);
         mapping.messages = stripOldAnchorMessages(mapping.messages);

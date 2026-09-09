@@ -378,12 +378,18 @@ export function createEngine(dataDir?: string): AcpEngine {
         const mapping = promptTurnsToCoreMessages(turns);
         mapping.messages = stripOldAnchorMessages(mapping.messages) as CoreMessage[];
         const coveredIds = collectCoveredMessageIds(workState);
+        // —— V0.7.13-P3-I：tokenCount 优先宿主真实值（hostTokens），无则 fallback estimate。
+        //   对齐原版 billion-context（tokenCount = 上游真实 input_tokens，非 estimate）。
+        const hostTokens = chatId
+          ? await getHostUsageAdapter().getCurrentContextTokens(String(chatId))
+          : undefined;
+        const estimateTokens = estimateProjectionTokens(mapping.messages, coveredIds);
         // 复用发送链路同款 Config / 同款 kernel 折叠：已形成 block 会被识别并投影为摘要占位。
         const turn = core.processTurn({
           messages: mapping.messages,
           state: workState,
           config,
-          tokenCount: estimateProjectionTokens(mapping.messages, coveredIds),
+          tokenCount: hostTokens ?? estimateTokens,
           renderTags: "none",
         });
         let projected = coreMessagesToPromptTurns(turn.messages, mapping.byKey);
@@ -686,12 +692,18 @@ export function createEngine(dataDir?: string): AcpEngine {
         mapping.messages = stripOldAnchorMessages(mapping.messages) as CoreMessage[];
         const coveredIds = collectCoveredMessageIds(cached.kernelState);
         const tokenEstimate = estimateProjectionTokens(mapping.messages, coveredIds);
+        // —— V0.7.13-P3-I：tokenCount 优先宿主真实值（hostTokens），无则 fallback estimate。
+        //   对齐原版 billion-context（tokenCount = 上游真实 input_tokens，非 estimate）。
+        const hostTokens = chatId
+          ? await getHostUsageAdapter().getCurrentContextTokens(String(chatId))
+          : undefined;
+        const kernelTokenCount = hostTokens ?? tokenEstimate;
 
         const turn = core.processTurn({
           messages: mapping.messages,
           state: cached.kernelState,
           config,
-          tokenCount: tokenEstimate,
+          tokenCount: kernelTokenCount,
           renderTags: "none",
         });
 

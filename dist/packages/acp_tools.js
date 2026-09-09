@@ -4372,11 +4372,13 @@ function createEngine(dataDir) {
         const mapping = promptTurnsToCoreMessages(turns);
         mapping.messages = stripOldAnchorMessages(mapping.messages);
         const coveredIds = collectCoveredMessageIds(workState);
+        const hostTokens = chatId ? await getHostUsageAdapter().getCurrentContextTokens(String(chatId)) : void 0;
+        const estimateTokens = estimateProjectionTokens(mapping.messages, coveredIds);
         const turn = core.processTurn({
           messages: mapping.messages,
           state: workState,
           config,
-          tokenCount: estimateProjectionTokens(mapping.messages, coveredIds),
+          tokenCount: hostTokens ?? estimateTokens,
           renderTags: "none"
         });
         let projected = coreMessagesToPromptTurns(turn.messages, mapping.byKey);
@@ -4640,11 +4642,13 @@ function createEngine(dataDir) {
         mapping.messages = stripOldAnchorMessages(mapping.messages);
         const coveredIds = collectCoveredMessageIds(cached.kernelState);
         const tokenEstimate = estimateProjectionTokens(mapping.messages, coveredIds);
+        const hostTokens = chatId ? await getHostUsageAdapter().getCurrentContextTokens(String(chatId)) : void 0;
+        const kernelTokenCount = hostTokens ?? tokenEstimate;
         const turn = core.processTurn({
           messages: mapping.messages,
           state: cached.kernelState,
           config,
-          tokenCount: tokenEstimate,
+          tokenCount: kernelTokenCount,
           renderTags: "none"
         });
         let projectedMessages = turn.messages;

@@ -1124,12 +1124,12 @@ function buildNudgeTextFromReason(reason: string, level: NudgeLevel): string {
   const lines: string[] = [];
   if (level === "gentle") {
     lines.push("[ACP] 上下文使用率已接近阈值，请注意近期对话的上下文占用，建议在合适时机压缩已消费的旧内容。");
-    lines.push("可选工具：compress（压缩一段范围）、absorb（吸收单条巨型输出）、decompress（恢复）、search_context（搜索）、acp_status（查状态/范围）。");
+    lines.push("压缩请通过 Operit package_proxy 调用 acp_tools:compress（范围压缩）、acp_tools:absorb（吸收单条巨型输出）、acp_tools:decompress（恢复）、acp_tools:search_context（搜索）、acp_tools:acp_status（查状态/范围）。");
   } else if (level === "strong") {
     lines.push("[ACP] 上下文使用率已较高，请立即压缩已消费的旧内容以释放空间。");
-    lines.push("可选工具：compress（压缩一段范围）、absorb（吸收单条巨型输出）、decompress（恢复）、search_context（搜索）、acp_status（查状态/范围）。");
+    lines.push("压缩请通过 Operit package_proxy 调用 acp_tools:compress（范围压缩）、acp_tools:absorb（吸收单条巨型输出）、acp_tools:decompress（恢复）、acp_tools:search_context（搜索）、acp_tools:acp_status（查状态/范围）。");
   } else {
-    lines.push("[ACP] 上下文已接近硬上限，请立即调用 compress 压缩最旧、已消费的内容。若本提示持续出现，压缩是继续任务的前提，不要忽略。");
+    lines.push("[ACP] 上下文已接近硬上限，请立即通过 package_proxy 调用 acp_tools:compress 压缩最旧、已消费的内容。若本提示持续出现，压缩是继续任务的前提，不要忽略。");
   }
   if (reason) lines.push(`（pressure: ${reason}）`);
   return lines.join("\n");
@@ -1140,16 +1140,16 @@ function buildNudgeText(nudge: { reason: string; compressibleRanges: { startRef:
   // 三档递进文案：gentle = 提醒准备；strong = 要求主动压缩；emergency = 必须压缩。
   const lines: string[] = [];
   if (level === "gentle") {
-    lines.push("[ACP] 上下文使用率已接近阈值。请在合适时机压缩已消费的旧内容：可先调用 acp_status 查看可压缩范围，再调用 compress 处理已完成且不再需要原文的部分。");
+    lines.push("[ACP] 上下文使用率已接近阈值。请在合适时机压缩已消费的旧内容：可先通过 package_proxy 调用 acp_tools:acp_status 查看可压缩范围，再调用 acp_tools:compress 处理已完成且不再需要原文的部分。");
   } else if (level === "strong") {
-    lines.push("[ACP] 上下文使用率已超过阈值。请直接调用 compress 工具压缩已消费的旧内容以降低上下文占用，无需询问用户、无需等待批准、不要中断当前任务。");
+    lines.push("[ACP] 上下文使用率已超过阈值。请通过 package_proxy 调用 acp_tools:compress 压缩已消费的旧内容以降低上下文占用，无需询问用户、无需等待批准、不要中断当前任务。");
   } else {
-    lines.push("[ACP] 上下文已接近硬上限，请立即调用 compress 压缩最旧、已消费的内容。若本提示持续出现，压缩是继续任务的前提，不要忽略。");
+    lines.push("[ACP] 上下文已接近硬上限，请立即通过 package_proxy 调用 acp_tools:compress 压缩最旧、已消费的内容。若本提示持续出现，压缩是继续任务的前提，不要忽略。");
   }
   if (nudge.compressibleRanges.length > 0) {
     const top = [...nudge.compressibleRanges].sort((a, b) => b.tokens - a.tokens)[0];
-    lines.push(`建议压缩范围：${top.startRef}..${top.endRef}（调用 compress）。`);
-    lines.push(`可选工具：acp_status（查状态/范围）、absorb（吸收单条巨型输出）、decompress（恢复）、search_context（搜索）。`);
+    lines.push(`建议压缩范围：${top.startRef}..${top.endRef}（package_proxy → acp_tools:compress）。`);
+    lines.push(`可选工具（经 package_proxy）：acp_tools:acp_status（查状态/范围）、acp_tools:absorb（吸收单条巨型输出）、acp_tools:decompress（恢复）、acp_tools:search_context（搜索）。`);
   }
   return lines.join("\n");
 }

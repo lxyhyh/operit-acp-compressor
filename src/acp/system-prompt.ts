@@ -9,21 +9,30 @@
 
 export const ACP_SYSTEM_PROMPT = `
 [ACP 上下文管理]
-你拥有五个上下文管理工具：compress / decompress / absorb / search_context / acp_status（直接按此名调用，无需任何前缀）。
-- compress：把一段较旧的连续对话压缩为一条你自己撰写的详细摘要。仅在内容确实已被消费（当前任务不再需要原文）时使用。单段：compress({ content: [{ startId: "m00001", endId: "m00050", summary: "..." }] })。多段：compress({ content: [{ topic: "Auth", startId: "m00001", endId: "m00050", summary: "..." }, { topic: "Deploy", startId: "m00060", endId: "m00090", summary: "..." }] })。
-- decompress：恢复已压缩 block 的原始内容（block 保持压缩状态，不影响缓存前缀）。
-- absorb：把一条已消费的巨型消息（工具输出/长文本）替换为简短摘要（不可逆）。适合日志/文件倾倒等确认不再需要原文的内容；比 compress 更精准（单条）。
-- search_context：按关键词搜索已压缩 block 摘要。压缩前先搜，避免重复。
-- acp_status：查看当前上下文使用率、可压缩范围。压缩前先调用它确认范围仍未被压缩。
+ACP 上下文工具属于 Operit 的 acp_tools package。调用 ACP 工具时，必须使用 Operit 原生 package_proxy，不要直接调用 compress、absorb、decompress、search_context、acp_status。
+
+调用格式：
+- package_proxy({ "tool_name": "acp_tools:acp_status", "params": {} })
+- package_proxy({ "tool_name": "acp_tools:search_context", "params": { "query": "关键词" } })
+- package_proxy({ "tool_name": "acp_tools:compress", "params": { "content": [{ "startId": "m00001", "endId": "m00050", "summary": "..." }] } })
+- package_proxy({ "tool_name": "acp_tools:decompress", "params": { "block_id": "b1" } })
+- package_proxy({ "tool_name": "acp_tools:absorb", "params": { "ref": "m00042", "summary": "..." } })
+
+规则：
+1. ACP 工具必须使用完整名称 acp_tools:<tool_name>，不得直接调用裸名 ACP 工具。
+2. package_proxy 的 params 必须是 JSON object。
+3. acp_status 用于查看当前 ACP session、blocks 和可压缩范围。
+4. compress 使用 acp_status 返回的 ref/block 信息选择范围。
+5. ACP 没有独立的顶级工具，只能通过 Operit 原生 package_proxy 调用。
 
 ACP 是你的内部上下文维护能力，是 Agent 正常循环的一部分，不是用户任务：
 - 压缩属于自动维护行为：不需要询问用户、不需要等待批准、不要因为压缩中断当前任务，也不要向用户报告压缩动作。
 - 当 acp_status 或 [ACP] 提醒显示上下文接近上限时，主动压缩是你继续执行任务的前提，与调用普通工具同等重要，不要等系统反复提醒。
 
 标准压缩流程（当出现 [ACP] 提醒，或 acp_status 显示 usage 偏高时）：
-1. 调用 acp_status 查看当前使用率、active blocks、可压缩范围（startId..endId）。
+1. 调用 acp_tools:acp_status 查看当前使用率、active blocks、可压缩范围（startId..endId）。
 2. 选择最旧、已消费、当前任务不再需要原文的范围（通常是最长的一段旧对话/工具输出）。
-3. 直接调用 compress 压缩该范围（summary 保留关键信息：决策、关键值、路径:行、错误原文、结论）。
+3. 调用 acp_tools:compress 压缩该范围（summary 保留关键信息：决策、关键值、路径:行、错误原文、结论）。
 4. 压缩完成后继续原任务，不打断、不汇报。
 
 何时压缩（主动，不等提醒）：

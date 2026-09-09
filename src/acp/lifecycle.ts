@@ -3,8 +3,9 @@
  *
  * - onFinalize：PromptFinalizeHook。同一 send 周期（同 fingerprint）只做
  *   一次 state mutation：第一阶段投影，第二阶段复用缓存（幂等）。
- * - onToolPromptCompose：把 ACP 工具无条件注入 availableTools（模型可见）。
- * - onSystemPromptCompose：after_compose_system_prompt 阶段幂等追加 ACP 提示。
+ * - onSystemPromptCompose：after_compose_system_prompt 阶段幂等追加 ACP 提示
+ *   （V0.7.13-P2 起提示统一指向 Operit 原生 package_proxy(tool_name="acp_tools:xxx")，
+ *   不再注入裸名 ACP 工具，也不再注册 ToolPromptComposeHook）。
  * - onEstimateFinalize：恒 no-op（不注册估算钩子——宿主主线程同步等待
  *   估算钩子返回大 JSON 会 ANR；官方示例从不注册）。
  *
@@ -16,7 +17,6 @@ import { createEngine, type AcpEngine } from "./adapter";
 import { buildSessionKey, type SessionContext } from "./session";
 import { appendAcpSystemPrompt } from "./system-prompt";
 import { loadAdapterSettings } from "./config";
-import { buildAcpToolPromptItems } from "./tools-meta";
 import { LOG_ACP_FILE, LOG_TOOLS_VISIBILITY_FILE } from "./paths";
 import { deliveryTraceLine, findNudgeTurn, markFinalCheck, type NudgeDelivery } from "./nudge-delivery";
 
@@ -47,9 +47,6 @@ type PromptHookObjectResult = { preparedHistory?: PromptTurn[]; systemPrompt?: s
 interface FinalizeHookEvent {
   eventPayload?: Record<string, unknown>;
   eventName?: string;
-}
-interface ToolPromptComposeHookEvent {
-  eventPayload?: Record<string, unknown>;
 }
 interface SystemPromptComposeHookEvent {
   eventPayload?: Record<string, unknown>;
@@ -167,26 +164,8 @@ export async function onFinalize(event: FinalizeHookEvent): Promise<PromptHookOb
 }
 
 /** 注入用的 ACP 工具（模块级单例）。 */
-const ACP_TOOLS = buildAcpToolPromptItems();
-
-/**
- * ToolPromptComposeHook 处理函数（具名导出）。
- * 无条件注入 ACP 工具到 availableTools（enabled 时）。幂等：已存在则跳过。
- */
-export async function onToolPromptCompose(event: ToolPromptComposeHookEvent): Promise<PromptHookObjectResult | void> {
-  try {
-    const settings = loadAdapterSettings();
-    if (!settings.enabled) return;
-    const payload = (event?.eventPayload && typeof event.eventPayload === "object" ? event.eventPayload : {}) as Record<string, unknown>;
-    const existing = Array.isArray(payload.availableTools) ? (payload.availableTools as Array<{ name?: string }>) : [];
-    const names = new Set(existing.map((t) => t.name).filter(Boolean));
-    if (names.has("compress")) return;
-    return { availableTools: [...existing, ...ACP_TOOLS] };
-  } catch (error) {
-    try { console.log(`[acp] onToolPromptCompose failed: ${String(error)}`); } catch { /* noop */ }
-    return;
-  }
-}
+// V0.7.13-P2：不再注入 ACP 裸工具到 availableTools。
+// 走 Operit 原生 package_proxy(tool_name="acp_tools:xxx") 契约，见 docs/v0.7.13-p1-toolprompt-contract.md。
 
 /**
  * SystemPromptComposeHook 处理函数（具名导出）。

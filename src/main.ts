@@ -4,8 +4,8 @@
  * 架构（方向 1，对齐 billion-context）：
  * - 不再注册 AiProvider / 直连上游（退役 provider/upstream/compress-loop 直连路径）。
  * - 注册 PromptFinalizeHook：发送前把历史投影为压缩视图（preparedHistory 整体替换）。
- * - 注册 ToolPromptComposeHook：把 compress/decompress/search_context/acp_status
- *   无条件注入模型可用工具（子包 acp_tools 的 METADATA 声明，模型侧调用走宿主工具通道）。
+ * - ACP 工具不再注入 availableTools：V0.7.13-P2 改为走 Operit 原生
+ *   package_proxy(tool_name="acp_tools:xxx") 契约（见 docs/v0.7.13-p1-toolprompt-contract.md）。
  * - 注册 SystemPromptComposeHook：after 阶段幂等追加 ACP 系统提示（引导模型主动压缩）。
  * - 注册 PromptEstimateFinalizeHook / PromptEstimateHistoryHook：估算链路只读投影，
  *   使宿主"右上角上下文计数 / summary 阈值判断"基于压缩后视图（与真实发送一致）。
@@ -20,7 +20,7 @@ import { installIntlSegmenter } from "./shims/segmenter-shim";
 // 模块加载最先安装 Intl shim（acp-kernel 顶层会 new Intl.Segmenter）。
 installIntlSegmenter();
 
-import { onFinalize, onEstimateFinalize, onEstimateHistory, onSystemPromptCompose, onToolPromptCompose, onToolLifecycle } from "./acp/lifecycle";
+import { onFinalize, onEstimateFinalize, onEstimateHistory, onSystemPromptCompose, onToolLifecycle } from "./acp/lifecycle";
 import { loadConfig, saveConfig, DEFAULT_CONFIG, type AcpConfig } from "./config";
 
 // IPC 通道必须在 main 脚本【模块顶层】注册（guide 3.2.5 示例），
@@ -145,18 +145,10 @@ export function registerAcpHooks(): void {
     } catch (e) {
         try { console.log(`[acp] registerSystemPromptComposeHook error: ${String(e)}`); } catch { /* noop */ }
     }
-    try {
-        ToolPkg.registerToolPromptComposeHook({
-            id: "acp.tools",
-            function: onToolPromptCompose as never,
-        });
-    } catch (e) {
-        try { console.log(`[acp] registerToolPromptComposeHook error: ${String(e)}`); } catch { /* noop */ }
-    }
 }
 
 // 宿主要求注册的 handler 函数本身也是「模块导出」。
-export { onFinalize, onEstimateFinalize, onEstimateHistory, onSystemPromptCompose, onToolPromptCompose, onToolLifecycle };
+export { onFinalize, onEstimateFinalize, onEstimateHistory, onSystemPromptCompose, onToolLifecycle };
 
 // UI 设置页：独立文件随包分发（dist/ui/settings/index.ui.js）。
 export function registerToolboxUi(): void {

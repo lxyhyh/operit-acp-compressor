@@ -1,11 +1,14 @@
 /**
- * tools-meta.ts — ACP 模型侧工具单一事实来源。
+ * tools-meta.ts — ACP 工具元数据单一事实来源。
  *
- * 定义 4 个核心工具的唯一声明（名称/描述/参数 schema），
- * METADATA（packages/acp_tools.ts）、ACP_TOOLS（lifecycle.ts）、
- * 系统提示（system-prompt.ts）、nudge 文本（adapter.ts）统一引用，
- * 杜绝名称/参数契约漂移。
+ * 定义 5 个核心工具的唯一声明（名称/描述/参数 schema），
+ * METADATA（packages/acp_tools.ts）、系统提示（system-prompt.ts）、
+ * nudge 文本（adapter.ts）统一引用，杜绝名称/参数契约漂移。
  * 纯数据 + 零依赖（不 import Tools/环境），便于测试与跨 runtime 复用。
+ *
+ * V0.7.13-P2：不再注入 availableTools（无 ToolPromptComposeHook 注册）。
+ * 模型侧经 Operit 原生 package_proxy(tool_name="acp_tools:xxx") 调用，
+ * 本文件仅作为元数据源保留（测试/审计用）。
  */
 
 export interface AcpToolMeta {

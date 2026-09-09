@@ -819,7 +819,20 @@ export function createEngine(dataDir?: string): AcpEngine {
           kernelState: turn.state,
           hostMetadata: {
             ...cached.hostMetadata,
-            stateVersion: cached.hostMetadata.stateVersion ?? 0,
+            // V0.7.13-P3-D：FULL processTurn 产生新的 authoritative kernel snapshot → stateVersion 必须递增。
+            //   这是 stale-write guard 的前提（V2 > V1），否则 STAGE2/CACHE-HIT 写 V1 不会被拦截。
+            //   仅当 kernel 产生实质变化（refs/blocks 前进）时递增；纯重投影（无变化）保持原版本，
+            //   避免 cache-hit 因版本漂移永久失效。
+            stateVersion: (() => {
+              const prevState = cached.kernelState;
+              const prevRefs = Object.keys(prevState.messageRefs?.byRef ?? {}).length;
+              const curRefs = Object.keys(turn.state.messageRefs?.byRef ?? {}).length;
+              const prevBlocks = prevState.blocks.length;
+              const curBlocks = turn.state.blocks.length;
+              return (prevRefs !== curRefs || prevBlocks !== curBlocks)
+                ? (cached.hostMetadata.stateVersion ?? 0) + 1
+                : (cached.hostMetadata.stateVersion ?? 0);
+            })(),
             lastProjectionFingerprint: fingerprint,
             toolLoopCoverage: "main-request-only",
             lastUpdatedAt: Date.now(),

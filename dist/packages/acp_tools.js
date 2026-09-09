@@ -3604,6 +3604,9 @@ function stripOldAnchorMessages(messages) {
     (m) => !(m.id && isSummaryMessageId(m.id)) && !String(m.text || "").startsWith(ANCHOR_MARKER)
   );
 }
+function freshHostMeta() {
+  return { toolLoopCoverage: "unknown", lastUpdatedAt: Date.now() };
+}
 function createPersistence(dataDir) {
   const stateDir = dataDir ? `${dataDir}/acp-state` : STATE_DIR;
   const logFile = stateDir.replace(/\/state$/, "") + "/logs/acp.log";
@@ -3661,7 +3664,57 @@ function createPersistence(dataDir) {
       await ensureDirs();
       const path = `${stateDir}/${sessionKeyToFile(sessionKey)}`;
       const tmpPath = `${path}.tmp`;
+      const incomingVersion = state.hostMetadata.stateVersion ?? 0;
+      let currentVersion = 0;
+      try {
+        const info = Tools.Files.info(path);
+        const cur = info && cache2.get(path)?.mtime === info.mtimeMs ? cache2.get(path)?.state : void 0;
+        if (!cur) {
+          const res = await Tools.Files.read(path);
+          const content2 = res && res.content;
+          if (content2) {
+            const parsed = JSON.parse(content2);
+            currentVersion = parsed?.hostMetadata?.stateVersion ?? 0;
+          }
+        } else {
+          currentVersion = cur.hostMetadata.stateVersion ?? 0;
+        }
+      } catch {
+      }
       const { lastRawTurns: _omit, ...persistState } = state;
+      if (incomingVersion < currentVersion) {
+        try {
+          const existingRes = await Tools.Files.read(path);
+          const existingContent = existingRes && existingRes.content;
+          const existingParsed = existingContent ? JSON.parse(existingContent) : void 0;
+          const existing = existingParsed && existingParsed.kernelState ? {
+            adapterStateVersion: existingParsed.adapterStateVersion ?? ADAPTER_STATE_VERSION,
+            kernelState: mergeInitialState(existingParsed.kernelState),
+            hostMetadata: { ...freshHostMeta(), ...existingParsed.hostMetadata ?? {} }
+          } : { adapterStateVersion: ADAPTER_STATE_VERSION, kernelState: createInitialState(), hostMetadata: freshHostMeta() };
+          const merged = {
+            adapterStateVersion: existing.adapterStateVersion,
+            kernelState: existing.kernelState,
+            // 保留 authoritative V2
+            hostMetadata: {
+              ...existing.hostMetadata,
+              ...persistState.hostMetadata,
+              stateVersion: existing.hostMetadata.stateVersion ?? currentVersion
+              // 不降级
+            }
+          };
+          const mergedContent = JSON.stringify(merged);
+          await Tools.Files.write(tmpPath, mergedContent, false, "android");
+          await Tools.Files.move(tmpPath, path, "android");
+          cache2.set(path, { mtime: Tools.Files.info(path)?.mtimeMs ?? 0, state: merged });
+          try {
+            console.log(`[acp] [stale-write-blocked] session=${sessionKey} currentVersion=${currentVersion} incomingVersion=${incomingVersion} source=persistence-guard`);
+          } catch {
+          }
+        } catch {
+        }
+        return;
+      }
       const content = JSON.stringify(persistState);
       try {
         await Tools.Files.write(tmpPath, content, false, "android");
@@ -4668,7 +4721,18 @@ ${lines.join("\n")}${active.length > 3 ? `
           kernelState: turn.state,
           hostMetadata: {
             ...cached.hostMetadata,
-            stateVersion: cached.hostMetadata.stateVersion ?? 0,
+            // V0.7.13-P3-D：FULL processTurn 产生新的 authoritative kernel snapshot → stateVersion 必须递增。
+            //   这是 stale-write guard 的前提（V2 > V1），否则 STAGE2/CACHE-HIT 写 V1 不会被拦截。
+            //   仅当 kernel 产生实质变化（refs/blocks 前进）时递增；纯重投影（无变化）保持原版本，
+            //   避免 cache-hit 因版本漂移永久失效。
+            stateVersion: (() => {
+              const prevState = cached.kernelState;
+              const prevRefs = Object.keys(prevState.messageRefs?.byRef ?? {}).length;
+              const curRefs = Object.keys(turn.state.messageRefs?.byRef ?? {}).length;
+              const prevBlocks = prevState.blocks.length;
+              const curBlocks = turn.state.blocks.length;
+              return prevRefs !== curRefs || prevBlocks !== curBlocks ? (cached.hostMetadata.stateVersion ?? 0) + 1 : cached.hostMetadata.stateVersion ?? 0;
+            })(),
             lastProjectionFingerprint: fingerprint,
             toolLoopCoverage: "main-request-only",
             lastUpdatedAt: Date.now(),

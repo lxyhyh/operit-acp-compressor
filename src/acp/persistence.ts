@@ -157,6 +157,11 @@ export function stripOldAnchorMessages(
   );
 }
 
+/** 构造 hostMetadata 默认值（load 缺失时 / stale-merge 时使用）。 */
+function freshHostMeta(): OperitAcpSessionState["hostMetadata"] {
+  return { toolLoopCoverage: "unknown", lastUpdatedAt: Date.now() };
+}
+
 export function createPersistence(dataDir?: string): Persistence {
   const stateDir = dataDir ? `${dataDir}/acp-state` : STATE_DIR;
   const logFile = stateDir.replace(/\/state$/, "") + "/logs/acp.log";
@@ -222,8 +227,69 @@ export function createPersistence(dataDir?: string): Persistence {
       await ensureDirs();
       const path = `${stateDir}/${sessionKeyToFile(sessionKey)}`;
       const tmpPath = `${path}.tmp`;
+
+      // —— V0.7.13-P3-D：stale-write monotonic guard。
+      //   防止旧 kernel snapshot（如 STAGE2/CACHE-HIT/INCREMENTAL 误写的 V1）
+      //   回滚 authoritative snapshot（FULL 的 V2）。
+      //   规则：incoming.stateVersion < current.stateVersion → 禁止 kernelState 回滚，
+      //   但允许 hostMetadata 前向合并（usage/nudge/stats 属于决策元数据，非权威 kernel）。
+      const incomingVersion = state.hostMetadata.stateVersion ?? 0;
+      let currentVersion = 0;
+      try {
+        const info = Tools.Files.info(path) as unknown as { mtimeMs?: number } | undefined;
+        const cur = info && (cache.get(path)?.mtime === info.mtimeMs) ? cache.get(path)?.state : undefined;
+        if (!cur) {
+          const res = await Tools.Files.read(path);
+          const content = (res && res.content) as string | undefined;
+          if (content) {
+            const parsed = JSON.parse(content);
+            currentVersion = (parsed?.hostMetadata?.stateVersion ?? 0);
+          }
+        } else {
+          currentVersion = cur.hostMetadata.stateVersion ?? 0;
+        }
+      } catch {
+        // 读失败不阻断；guard 尽力而为（最坏等于无 guard，但绝不 crash）。
+      }
+
       // 不持久化 lastRawTurns（完整 raw history 副本，占体积且随会话膨胀）。
       const { lastRawTurns: _omit, ...persistState } = state;
+      if (incomingVersion < currentVersion) {
+        // —— stale kernel snapshot：合并 hostMetadata（新 usage/nudge/stats），
+        //   但绝不回滚 kernelState。
+        try {
+          const existingRes = await Tools.Files.read(path);
+          const existingContent = (existingRes && existingRes.content) as string | undefined;
+          const existingParsed = existingContent ? JSON.parse(existingContent) : undefined;
+          const existing: OperitAcpSessionState = existingParsed && existingParsed.kernelState
+            ? {
+                adapterStateVersion: existingParsed.adapterStateVersion ?? ADAPTER_STATE_VERSION,
+                kernelState: mergeInitialState(existingParsed.kernelState),
+                hostMetadata: { ...freshHostMeta(), ...(existingParsed.hostMetadata ?? {}) },
+              }
+            : { adapterStateVersion: ADAPTER_STATE_VERSION, kernelState: createInitialState(), hostMetadata: freshHostMeta() };
+          const merged: OperitAcpSessionState = {
+            adapterStateVersion: existing.adapterStateVersion,
+            kernelState: existing.kernelState, // 保留 authoritative V2
+            hostMetadata: {
+              ...existing.hostMetadata,
+              ...persistState.hostMetadata,
+              stateVersion: existing.hostMetadata.stateVersion ?? currentVersion, // 不降级
+            },
+          };
+          const mergedContent = JSON.stringify(merged);
+          await Tools.Files.write(tmpPath, mergedContent, false, "android");
+          await Tools.Files.move(tmpPath, path, "android");
+          cache.set(path, { mtime: (Tools.Files.info(path) as unknown as { mtimeMs?: number })?.mtimeMs ?? 0, state: merged });
+          try {
+            console.log(`[acp] [stale-write-blocked] session=${sessionKey} currentVersion=${currentVersion} incomingVersion=${incomingVersion} source=persistence-guard`);
+          } catch { /* noop */ }
+        } catch {
+          // 合并失败则完全跳过写入（宁可丢 metadata 更新，也不回滚 kernelState）
+        }
+        return;
+      }
+
       const content = JSON.stringify(persistState);
       try {
         await Tools.Files.write(tmpPath, content, false, "android");

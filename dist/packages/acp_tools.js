@@ -4374,8 +4374,12 @@ function createEngine(dataDir) {
         {
           const memPrev = projectionCache.get(sessionKey);
           const rawPrev = rawTurnsCache.get(sessionKey);
+          const estimateMaxNewTurns = Math.max(
+            settings.estimateMaxNewTurns ?? 64,
+            settings.incrementalMaxNewTurns
+          );
           const newCount = rawPrev ? turns.length - rawPrev.length : -1;
-          if (memPrev && memPrev.projection && memPrev.projection.length > 0 && rawPrev && newCount > 0 && newCount <= settings.incrementalMaxNewTurns && turns.length >= rawPrev.length) {
+          if (memPrev && memPrev.projection && memPrev.projection.length > 0 && rawPrev && newCount > 0 && newCount <= estimateMaxNewTurns && turns.length >= rawPrev.length) {
             let prefixOk = true;
             for (let i = 0; i < rawPrev.length; i++) {
               if (stableKeyForTurn(turns[i]) !== stableKeyForTurn(rawPrev[i])) {

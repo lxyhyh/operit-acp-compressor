@@ -391,9 +391,17 @@ export function createEngine(dataDir?: string): AcpEngine {
         {
           const memPrev = projectionCache.get(sessionKey);
           const rawPrev = rawTurnsCache.get(sessionKey);
+          // V0.7.13-P3-I.5b：估算场景放宽新增阈值。回合结束重算时，发送当轮的
+          //   工具循环已产生大量新 turn（实测一轮 +19 条，超过发送链路增量阈值 8），
+          //   用 8 会必然 miss → 退回全量重算（折叠浅 → 静态 31 万）。
+          //   估算场景新增 ≤ 64 条都走前缀复用（只读、安全）。
+          const estimateMaxNewTurns = Math.max(
+            ((settings as unknown as Record<string, number | undefined>).estimateMaxNewTurns) ?? 64,
+            settings.incrementalMaxNewTurns,
+          );
           const newCount = rawPrev ? turns.length - rawPrev.length : -1;
           if (memPrev && memPrev.projection && memPrev.projection.length > 0 && rawPrev
-            && newCount > 0 && newCount <= settings.incrementalMaxNewTurns
+            && newCount > 0 && newCount <= estimateMaxNewTurns
             && turns.length >= rawPrev.length) {
             // 校验前缀稳定：前 rawPrev.length 条 stableKey 完全一致。
             let prefixOk = true;

@@ -368,9 +368,16 @@ export function createEngine(dataDir?: string): AcpEngine {
         const loaded = await persistence.load(sessionKey);
         const fingerprint = computeFingerprint(sessionKey, turns, config);
         const stateVersion = loaded.hostMetadata.stateVersion ?? 0;
-        // 命中缓存：同 fingerprint + 同 stateVersion → 直接返回缓存投影。
+        // 命中缓存：同 fingerprint → 直接返回缓存投影。
+        // V0.7.13-P3-I.3：不再要求 stateVersion 一致。回合结束重算（estimate 钩子）
+        //   的 turns 与发送时相同，但发送链路 project() 已推进 stateVersion——
+        //   若按 fingerprint+stateVersion 双键匹配必然 miss，导致全量重算
+        //   （实测 276ms/Node + 2.2MB payload 序列化 ≈ 手机上 1s+）→ 超出宿主
+        //   钩子执行预算 → 宿主丢弃钩子结果 → 静态计数回退为原始未投影历史
+        //   （29万/31万回归）。估算侧只读（克隆状态、不落盘），发送后的 stateVersion
+        //   变化只来自发送链路自身的 block 推进，对"同 turns 的只读投影"无影响。
         const cachedProj = estimateCache.get(sessionKey);
-        if (cachedProj && cachedProj.fingerprint === fingerprint && cachedProj.stateVersion === stateVersion) {
+        if (cachedProj && cachedProj.fingerprint === fingerprint) {
           return cachedProj.projection;
         }
         // 克隆状态：绝不动持久化状态（估算侧只读）。kernelState 为纯 JSON，JSON 深拷贝安全。

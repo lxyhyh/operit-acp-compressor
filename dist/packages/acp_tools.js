@@ -4368,7 +4368,7 @@ function createEngine(dataDir) {
         const fingerprint = computeFingerprint(sessionKey, turns, config);
         const stateVersion = loaded.hostMetadata.stateVersion ?? 0;
         const cachedProj = estimateCache.get(sessionKey);
-        if (cachedProj && cachedProj.fingerprint === fingerprint && cachedProj.stateVersion === stateVersion) {
+        if (cachedProj && cachedProj.fingerprint === fingerprint) {
           return cachedProj.projection;
         }
         const workState = JSON.parse(JSON.stringify(loaded.kernelState));

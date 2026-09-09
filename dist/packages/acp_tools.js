@@ -4384,26 +4384,32 @@ function createEngine(dataDir) {
             settings.incrementalMaxNewTurns
           );
           const newCount = rawPrev ? turns.length - rawPrev.length : -1;
-          if (memPrev && memPrev.projection && memPrev.projection.length > 0 && rawPrev && newCount > 0 && newCount <= estimateMaxNewTurns && turns.length >= rawPrev.length) {
-            let prefixOk = true;
-            for (let i = 0; i < rawPrev.length; i++) {
-              if (stableKeyForTurn(turns[i]) !== stableKeyForTurn(rawPrev[i])) {
-                prefixOk = false;
-                break;
+          {
+            const minLen = Math.min(turns.length, rawPrev?.length ?? 0);
+            const need = Math.ceil(minLen * 0.9);
+            if (memPrev && memPrev.projection && memPrev.projection.length > 0 && rawPrev && minLen >= 8 && need >= 8) {
+              let hitLen = 0;
+              for (let i = 0; i < minLen; i++) {
+                if (stableKeyForTurn(turns[i]) === stableKeyForTurn(rawPrev[i])) hitLen++;
+                else break;
               }
-            }
-            if (prefixOk) {
-              const delta = turns.slice(rawPrev.length);
-              const deltaMap = promptTurnsToCoreMessages(delta);
-              const deltaTurns = coreMessagesToPromptTurns(deltaMap.messages, deltaMap.byKey);
-              const merged = [...memPrev.projection, ...deltaTurns];
-              const capped2 = capProjectionSize(merged, { keepChars: 2e3, maxRecent: 3, totalBudgetChars: 2e5 });
-              cacheSetLimited(estimateCache, sessionKey, { fingerprint, stateVersion, projection: capped2 });
-              try {
-                console.log(`[acp] estimate prefix-hit raw=${turns.length} proj=${capped2.length} delta=${delta.length} ${Date.now() % 1e5}`);
-              } catch {
+              if (hitLen >= need) {
+                const projAll = memPrev.projection;
+                const ratio = hitLen / rawPrev.length;
+                const take = Math.max(1, Math.round(projAll.length * ratio));
+                const head = projAll.slice(0, take);
+                const delta = turns.slice(hitLen);
+                const deltaMap = promptTurnsToCoreMessages(delta);
+                const deltaTurns = coreMessagesToPromptTurns(deltaMap.messages, deltaMap.byKey);
+                const merged = [...head, ...deltaTurns];
+                const capped2 = capProjectionSize(merged, { keepChars: 2e3, maxRecent: 3, totalBudgetChars: 2e5 });
+                cacheSetLimited(estimateCache, sessionKey, { fingerprint, stateVersion, projection: capped2 });
+                try {
+                  console.log(`[acp] estimate prefix-hit raw=${turns.length} prev=${rawPrev.length} hit=${hitLen} proj=${capped2.length} delta=${delta.length} ${Date.now() % 1e5}`);
+                } catch {
+                }
+                return capped2;
               }
-              return capped2;
             }
           }
         }

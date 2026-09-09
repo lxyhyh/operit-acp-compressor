@@ -409,25 +409,39 @@ export function createEngine(dataDir?: string): AcpEngine {
             settings.incrementalMaxNewTurns,
           );
           const newCount = rawPrev ? turns.length - rawPrev.length : -1;
-          if (memPrev && memPrev.projection && memPrev.projection.length > 0 && rawPrev
-            && newCount > 0 && newCount <= estimateMaxNewTurns
-            && turns.length >= rawPrev.length) {
-            // 校验前缀稳定：前 rawPrev.length 条 stableKey 完全一致。
-            let prefixOk = true;
-            for (let i = 0; i < rawPrev.length; i++) {
-              if (stableKeyForTurn(turns[i]) !== stableKeyForTurn(rawPrev[i])) { prefixOk = false; break; }
-            }
-            if (prefixOk) {
-              const delta = turns.slice(rawPrev.length);
-              const deltaMap = promptTurnsToCoreMessages(delta);
-              const deltaTurns = coreMessagesToPromptTurns(deltaMap.messages, deltaMap.byKey);
-              const merged = [...(memPrev.projection as PromptTurnLike[]), ...deltaTurns];
-              const capped = capProjectionSize(merged, { keepChars: 2000, maxRecent: 3, totalBudgetChars: 200_000 });
-              cacheSetLimited(estimateCache, sessionKey, { fingerprint, stateVersion, projection: capped });
-              try {
-                console.log(`[acp] estimate prefix-hit raw=${turns.length} proj=${capped.length} delta=${delta.length} ${Date.now() % 100000}`);
-              } catch { /* noop */ }
-              return capped;
+          // V0.7.13-P3-I.7：双向前缀对齐。日志实锤 estimate raw=1797 < raw.json 1798
+          //   ——estimate 收到的 turns 可能比发送时保存的还短（宿主 estimate 链
+          //   做了媒体裁剪/合并），原条件 turns.length >= rawPrev.length 直接跳过
+          //   复用 → 必然全量重算。改为：从头部逐条 stableKey 比对，命中数达到
+          //   两者较小长度的 90% 即视为前缀命中；按命中数从 lastProjection 中
+          //   取出已投影部分，与剩余尾部 turns 合并后 cap。
+          {
+            const minLen = Math.min(turns.length, rawPrev?.length ?? 0);
+            const need = Math.ceil(minLen * 0.9);
+            if (memPrev && memPrev.projection && memPrev.projection.length > 0 && rawPrev && minLen >= 8 && need >= 8) {
+              let hitLen = 0;
+              for (let i = 0; i < minLen; i++) {
+                if (stableKeyForTurn(turns[i]) === stableKeyForTurn(rawPrev[i])) hitLen++;
+                else break;
+              }
+              if (hitLen >= need) {
+                // lastProjection 是「发送时全部 turns」的投影，与 rawPrev 一一对应度未知，
+                // 但投影内容顺序与 rawPrev 相同 → 按比例截取近似：hitLen/rawPrev.length 比例。
+                const projAll = memPrev.projection as PromptTurnLike[];
+                const ratio = hitLen / rawPrev!.length;
+                const take = Math.max(1, Math.round(projAll.length * ratio));
+                const head = projAll.slice(0, take);
+                const delta = turns.slice(hitLen);
+                const deltaMap = promptTurnsToCoreMessages(delta);
+                const deltaTurns = coreMessagesToPromptTurns(deltaMap.messages, deltaMap.byKey);
+                const merged = [...head, ...deltaTurns];
+                const capped = capProjectionSize(merged, { keepChars: 2000, maxRecent: 3, totalBudgetChars: 200_000 });
+                cacheSetLimited(estimateCache, sessionKey, { fingerprint, stateVersion, projection: capped });
+                try {
+                  console.log(`[acp] estimate prefix-hit raw=${turns.length} prev=${rawPrev!.length} hit=${hitLen} proj=${capped.length} delta=${delta.length} ${Date.now() % 100000}`);
+                } catch { /* noop */ }
+                return capped;
+              }
             }
           }
         }

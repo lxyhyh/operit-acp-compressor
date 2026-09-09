@@ -4372,7 +4372,7 @@ function createEngine(dataDir) {
           return cachedProj.projection;
         }
         const workState = JSON.parse(JSON.stringify(loaded.kernelState));
-        const mapping = promptTurnsToCoreMessages(turns);
+        const mapping = mapTurnsWithIdentity(turns);
         mapping.messages = stripOldAnchorMessages(mapping.messages);
         const coveredIds = collectCoveredMessageIds(workState);
         const estimateTokens = estimateProjectionTokens(mapping.messages, coveredIds);

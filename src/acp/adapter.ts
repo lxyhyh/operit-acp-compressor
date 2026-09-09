@@ -382,7 +382,13 @@ export function createEngine(dataDir?: string): AcpEngine {
         }
         // 克隆状态：绝不动持久化状态（估算侧只读）。kernelState 为纯 JSON，JSON 深拷贝安全。
         const workState = JSON.parse(JSON.stringify(loaded.kernelState)) as CompressionState;
-        const mapping = promptTurnsToCoreMessages(turns);
+        // —— V0.7.13-P3-I.4 根因修复：估算路径必须与发送路径同源 identity。
+        //   此前 estimate() 用 promptTurnsToCoreMessages(turns)（stableKey 内容指纹），
+        //   而发送路径 mapTurnsWithIdentity 用 identity-bridge id（host:user:content:hash）。
+        //   block 的 effectiveMessageIds 是 identity-bridge 格式 → 估算路径 coveredIds
+        //   匹配 0 → blocks 全灭（日志 blocks=0/11）→ proj=raw → 静态计数回退 31万+。
+        //   （P3-I.3 的缓存 miss 只是次要因素；主因是 id 体系不一致。）
+        const mapping = mapTurnsWithIdentity(turns);
         mapping.messages = stripOldAnchorMessages(mapping.messages) as CoreMessage[];
         const coveredIds = collectCoveredMessageIds(workState);
         // —— V0.7.13-P3-I.2 回归修复：estimate() 是只读快速路径，禁止任何 await IO（DB 读取）。

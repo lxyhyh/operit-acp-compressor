@@ -4372,12 +4372,11 @@ function createEngine(dataDir) {
         const mapping = promptTurnsToCoreMessages(turns);
         mapping.messages = stripOldAnchorMessages(mapping.messages);
         const coveredIds = collectCoveredMessageIds(workState);
-        const tokenEstimate = estimateProjectionTokens(mapping.messages, coveredIds);
         const turn = core.processTurn({
           messages: mapping.messages,
           state: workState,
           config,
-          tokenCount: tokenEstimate,
+          tokenCount: estimateProjectionTokens(mapping.messages, coveredIds),
           renderTags: "none"
         });
         let projected = coreMessagesToPromptTurns(turn.messages, mapping.byKey);
@@ -4388,6 +4387,10 @@ function createEngine(dataDir) {
           }
         }
         const capped = capProjectionSize(projected, { keepChars: 2e3, maxRecent: 3, totalBudgetChars: 2e5 });
+        const tokenEstimate = estimateProjectionTokens(
+          promptTurnsToCoreMessages(capped).messages,
+          collectCoveredMessageIds(workState)
+        );
         cacheSetLimited(estimateCache, sessionKey, { fingerprint, stateVersion, projection: capped });
         try {
           const active = turn.state.blocks.filter((b) => b.active).length;

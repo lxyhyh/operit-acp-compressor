@@ -378,13 +378,12 @@ export function createEngine(dataDir?: string): AcpEngine {
         const mapping = promptTurnsToCoreMessages(turns);
         mapping.messages = stripOldAnchorMessages(mapping.messages) as CoreMessage[];
         const coveredIds = collectCoveredMessageIds(workState);
-        const tokenEstimate = estimateProjectionTokens(mapping.messages, coveredIds);
         // 复用发送链路同款 Config / 同款 kernel 折叠：已形成 block 会被识别并投影为摘要占位。
         const turn = core.processTurn({
           messages: mapping.messages,
           state: workState,
           config,
-          tokenCount: tokenEstimate,
+          tokenCount: estimateProjectionTokens(mapping.messages, coveredIds),
           renderTags: "none",
         });
         let projected = coreMessagesToPromptTurns(turn.messages, mapping.byKey);
@@ -392,6 +391,13 @@ export function createEngine(dataDir?: string): AcpEngine {
           try { projected = coreMessagesToPromptTurns(kernelHideConsumedCompressCalls(turn.state, turn.messages).messages, mapping.byKey); } catch { /* noop */ }
         }
         const capped = capProjectionSize(projected, { keepChars: 2000, maxRecent: 3, totalBudgetChars: 200_000 });
+        // —— V0.7.13-P3-F：tokenEstimate 基于最终 capped projection（与宿主实际收到的
+        //   同一份输入）计算，不再用 cap 前全量（原 519K/654K vs 宿主 191K 的
+        //   数量级差异根因）。effective 仍走现有 computeEffectiveTokens 逻辑。
+        const tokenEstimate = estimateProjectionTokens(
+          promptTurnsToCoreMessages(capped as PromptTurnLike[]).messages,
+          collectCoveredMessageIds(workState),
+        );
         // 写估算缓存（与发送缓存分离，见 estimateCache 定义注释）。
         cacheSetLimited(estimateCache, sessionKey, { fingerprint, stateVersion, projection: capped });
         try {

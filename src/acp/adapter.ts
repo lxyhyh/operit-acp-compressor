@@ -378,18 +378,19 @@ export function createEngine(dataDir?: string): AcpEngine {
         const mapping = promptTurnsToCoreMessages(turns);
         mapping.messages = stripOldAnchorMessages(mapping.messages) as CoreMessage[];
         const coveredIds = collectCoveredMessageIds(workState);
-        // —— V0.7.13-P3-I：tokenCount 优先宿主真实值（hostTokens），无则 fallback estimate。
-        //   对齐原版 billion-context（tokenCount = 上游真实 input_tokens，非 estimate）。
-        const hostTokens = chatId
-          ? await getHostUsageAdapter().getCurrentContextTokens(String(chatId))
-          : undefined;
+        // —— V0.7.13-P3-I.2 回归修复：estimate() 是只读快速路径，禁止任何 await IO（DB 读取）。
+        //   P3-I 在此加的 getCurrentContextTokens（SQLite 读取，最多 1500ms）会耗尽
+        //   宿主钩子执行预算（ToolPkgHookExecutionBudget）→ 宿主丢弃钩子结果 →
+        //   回合结束重算（calculateStableContextWindow）退回原始未投影历史，
+        //   静态计数从 19 万涨到 29 万（随原始历史增长）。发送链路 project() 不受影响。
+        //   kernel tokenCount 用本地 estimate；hostTokens 优先只在 project() 发送链路做。
         const estimateTokens = estimateProjectionTokens(mapping.messages, coveredIds);
         // 复用发送链路同款 Config / 同款 kernel 折叠：已形成 block 会被识别并投影为摘要占位。
         const turn = core.processTurn({
           messages: mapping.messages,
           state: workState,
           config,
-          tokenCount: hostTokens ?? estimateTokens,
+          tokenCount: estimateTokens,
           renderTags: "none",
         });
         let projected = coreMessagesToPromptTurns(turn.messages, mapping.byKey);

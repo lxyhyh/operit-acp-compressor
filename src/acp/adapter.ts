@@ -1181,7 +1181,8 @@ export function createEngine(dataDir?: string): AcpEngine {
           const pHasAcp = p0 && typeof (p0 as PromptTurnLike).content === "string" ? String((p0 as PromptTurnLike).content).includes("[ACP 上下文管理]") : false;
           console.log(`[acp] project-return stage=${hookStage} firstKind=${p0?.kind ?? "-"} sysLen=${pLen} sysHasAcp=${pHasAcp} projLen=${cappedTurns.length}`);
         } catch { /* noop */ }
-        return { preparedHistory: cappedTurns, fingerprint, nudgeText, state: turn.state, delivery };
+        return { preparedHistory: cappedTurns, fingerprint, nudgeText, state: turn.state, delivery,
+          pressure: { level, usagePct: pressurePct, effectiveTokens: eff.effectiveTokens || sendEstimate, allowInject: pressure.allowInject, decisionReason: pressure.decisionReason } };
       } finally {
         release();
       }

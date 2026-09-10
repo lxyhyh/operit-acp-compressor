@@ -5081,7 +5081,14 @@ ${lines.join("\n")}${active.length > 3 ? `
           console.log(`[acp] project-return stage=${hookStage} firstKind=${p0?.kind ?? "-"} sysLen=${pLen} sysHasAcp=${pHasAcp} projLen=${cappedTurns.length}`);
         } catch {
         }
-        return { preparedHistory: cappedTurns, fingerprint, nudgeText, state: turn.state, delivery };
+        return {
+          preparedHistory: cappedTurns,
+          fingerprint,
+          nudgeText,
+          state: turn.state,
+          delivery,
+          pressure: { level, usagePct: pressurePct, effectiveTokens: eff.effectiveTokens || sendEstimate, allowInject: pressure.allowInject, decisionReason: pressure.decisionReason }
+        };
       } finally {
         release();
       }

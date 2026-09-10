@@ -165,11 +165,12 @@ export async function onFinalize(event: FinalizeHookEvent): Promise<PromptHookOb
     try {
       const g6b = globalThis as Record<string, unknown>;
       const foldState = (g6b.__acpLlmFoldState ??= { running: false, lastAt: 0 }) as { running: boolean; lastAt: number };
-      const delivery6 = projected as unknown as { delivery?: NudgeDelivery; pressure?: { level?: string; effectiveTokens?: number; targetTokens?: number } };
-      const level = delivery6?.pressure?.level;
-      const effTok = delivery6?.pressure?.effectiveTokens ?? 0;
-      const targetTok = delivery6?.pressure?.targetTokens ?? 0;
-      const overTarget = targetTok > 0 && effTok > targetTok;
+      const delivery6 = projected as unknown as { delivery?: { level?: string; effectiveTokens?: number } };
+      const level = delivery6?.delivery?.level;
+      const effTok = delivery6?.delivery?.effectiveTokens ?? 0;
+      // gentle 目标 = 70% × modelContextLimit（与 pressure.ts gentle 档一致）。
+      const targetTok = Math.round((engine.settings.modelContextLimit || 200000) * 0.7);
+      const overTarget = effTok > targetTok;
       // 冷却 120s：防止实验期连环触发（实验期安全网）。
       const cooled = Date.now() - foldState.lastAt > 120_000;
       if (level === "forced" && overTarget && !foldState.running && cooled) {

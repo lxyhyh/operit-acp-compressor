@@ -5024,7 +5024,17 @@ ${lines.join("\n")}${active.length > 3 ? `
             usageState: um2.snapshot(),
             // V0.7.9：identity-bridge state 持久化（跨 VM/工具路径共享）。
             identityBridge: identityState,
-            absorbCandidates: nextAbsorbCandidates
+            absorbCandidates: nextAbsorbCandidates,
+            // V0.8-P3：emergency 折叠新块标记来源（与 model 路径 blockSources 对齐，
+            //   统一 Block 审计要求：两种入口的块必须可区分且同构）。
+            ...emergencyFolded && appliedEmState ? {
+              blockSources: {
+                ...cached.hostMetadata.blockSources ?? {},
+                ...Object.fromEntries(
+                  appliedEmState.blocks.filter((b) => !cached.kernelState.blocks.some((pb) => pb.blockId === b.blockId)).map((b) => [b.blockId, "auto"])
+                )
+              }
+            } : {}
           }
         };
         cacheSetLimited(projectionCache, sessionKey, { fingerprint, stateVersion, projection: cappedTurns });

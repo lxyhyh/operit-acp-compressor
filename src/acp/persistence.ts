@@ -96,8 +96,8 @@ export interface OperitAcpSessionState {
     };
     /** V0.7.2：最近一次真实 chatId（hook 链路记录；供 applyCompression 按真实 chatId 查 host DB）。 */
     lastChatId?: string;
-    /** V0.4：block 来源映射 blockId → model | emergency（搜索/统计用）。 */
-    blockSources?: Record<string, "model" | "emergency">;
+    /** V0.4：block 来源映射 blockId → model | emergency | auto（搜索/统计用；auto=V0.8-P3 统一自动折叠入口）。 */
+    blockSources?: Record<string, "model" | "emergency" | "auto">;
     /** V0.7.9：identity-bridge 持久化状态（toolAlignments + seq；跨 VM 共享）。
      *  结构见 src/identity-bridge.ts IdentityBridgeState。 */
     identityBridge?: { toolAlignments: Record<string, { seq: number; toolName: string; callSig: string; resultSig: string; lastHop: number }[]>; toolSeqCounter: number };

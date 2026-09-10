@@ -57,6 +57,8 @@ export interface AdapterSettings {
   dataDir: string;
   /** V0.7.13-HOOK-EXP：最小实验开关——旁路压缩直接返回最后 6 条。默认 false。 */
   hookExperiment: boolean;
+  /** V0.8-P6.1 实验：LLM emergency fold（隐形 compression turn）。默认 false，不影响默认行为。 */
+  llmEmergencyFold: boolean;
 }
 
 /** acp-config.json 键名（单一事实来源；与 src/config.ts DEFAULT_CONFIG 对齐）。 */
@@ -214,6 +216,7 @@ export function loadAdapterSettings(): AdapterSettings {
     incrementalMaxNewTurns: readNum("incrementalMaxNewTurns", 8),
     // V0.7.13-HOOK-EXP：实验开关（实验已完成；保留开关但恢复文件读取）。
     hookExperiment: readBool("hookExperiment", false),
+    llmEmergencyFold: readBool("llmEmergencyFold", false),
     dataDir: DATA_DIR,
   };
 }

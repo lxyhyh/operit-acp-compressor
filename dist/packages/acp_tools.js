@@ -3200,6 +3200,7 @@ function loadAdapterSettings() {
     incrementalMaxNewTurns: readNum("incrementalMaxNewTurns", 8),
     // V0.7.13-HOOK-EXP：实验开关（实验已完成；保留开关但恢复文件读取）。
     hookExperiment: readBool("hookExperiment", false),
+    llmEmergencyFold: readBool("llmEmergencyFold", false),
     dataDir: DATA_DIR
   };
 }

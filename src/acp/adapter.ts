@@ -982,9 +982,18 @@ export function createEngine(dataDir?: string): AcpEngine {
           else if (level === "strong") nextStats.strongNudges += 1;
           else nextStats.emergencyNudges += 1;
         }
-
         // 裁剪投影输出体量（防宿主主线程解析超大 JSON 卡死——总预算 200K）。
         const cappedTurns = capProjectionSize(projectedTurns, { keepChars: 2000, maxRecent: 3, totalBudgetChars: 200_000 });
+
+        // —— V0.8 九-C：最终发送视图的 token（唯一权威 estimate）。
+        //   cappedTurns 就是 hook 返回给宿主的 preparedHistory（实际发送上下文），
+        //   对它计数的才是"当前上下文 Token"。此前 trace 里的 tok 是 processTurn
+        //   内部口径（cap 前全量），与真实请求体差 10 倍，已废弃该口径。
+        const finalProjEstimate = estimateProjectionTokens(
+          promptTurnsToCoreMessages(cappedTurns as PromptTurnLike[]).messages,
+          collectCoveredMessageIds(turn.state),
+        );
+
 
         const nextState: OperitAcpSessionState = {
           adapterStateVersion: cached.adapterStateVersion,
@@ -1042,7 +1051,8 @@ export function createEngine(dataDir?: string): AcpEngine {
             detail: {
               hop: hopNo,
               raw: turns.length, proj: cappedTurns.length, blocks: turn.state.blocks.length,
-              tok: sendEstimate,
+              tok: finalProjEstimate,
+              preCapTok: sendEstimate,
               actual: eff.actualTokens,
               host: eff.hostTokens,
               credit: eff.compressionCredit,

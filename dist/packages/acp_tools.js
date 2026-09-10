@@ -4879,6 +4879,10 @@ ${lines.join("\n")}${active.length > 3 ? `
           else nextStats.emergencyNudges += 1;
         }
         const cappedTurns = capProjectionSize(projectedTurns, { keepChars: 2e3, maxRecent: 3, totalBudgetChars: 2e5 });
+        const finalProjEstimate = estimateProjectionTokens(
+          promptTurnsToCoreMessages(cappedTurns).messages,
+          collectCoveredMessageIds(turn.state)
+        );
         const nextState = {
           adapterStateVersion: cached.adapterStateVersion,
           kernelState: turn.state,
@@ -4931,7 +4935,8 @@ ${lines.join("\n")}${active.length > 3 ? `
               raw: turns.length,
               proj: cappedTurns.length,
               blocks: turn.state.blocks.length,
-              tok: sendEstimate,
+              tok: finalProjEstimate,
+              preCapTok: sendEstimate,
               actual: eff.actualTokens,
               host: eff.hostTokens,
               credit: eff.compressionCredit,

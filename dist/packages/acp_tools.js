@@ -4305,6 +4305,31 @@ function cacheSetLimited(map, key, value) {
     if (oldest !== void 0) map.delete(oldest);
   }
 }
+function isNoiseText(text) {
+  const t = (text ?? "").trimStart();
+  if (!t) return false;
+  if (t.startsWith("[ACP]") || t.startsWith("[ACP ") || t.startsWith("[Compressed conversation section]")) return true;
+  if (t.startsWith('{"main"')) return true;
+  return false;
+}
+function buildDeterministicSummary(seg, maxLen = 6e3, perMsg = 120) {
+  const lines = [];
+  let total = 0;
+  for (let i = 0; i < seg.length; i++) {
+    const m = seg[i];
+    const text = (m.text ?? "").trim();
+    if (!text || isNoiseText(text)) continue;
+    const who = m.role === "assistant" ? "\u52A9\u624B" : m.role === "user" ? "\u7528\u6237" : m.role ?? "\u6D88\u606F";
+    let excerpt = text.slice(0, perMsg);
+    const cut = excerpt.search(/[。！？!?\n]/);
+    if (cut > 10) excerpt = excerpt.slice(0, cut + 1);
+    const line = `[${i + 1}] ${who}: ${excerpt}`;
+    if (total + line.length > maxLen) break;
+    lines.push(line);
+    total += line.length;
+  }
+  return lines.join("\n");
+}
 function computeFingerprint(sessionKey, turns, config) {
   let h = "";
   for (const t of turns) {
@@ -4827,8 +4852,6 @@ function createEngine(dataDir) {
           } catch {
           }
         }
-        let autoFolded = false;
-        let emergencyFreedTokens = 0;
         const prevStats = { ...cached.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS };
         const hopNo = (cached.hostMetadata.usageState?.lastHop ?? 0) + 1;
         const nextStats = { ...prevStats };
@@ -4878,6 +4901,92 @@ ${lines.join("\n")}${active.length > 3 ? `
           else if (level === "strong") nextStats.strongNudges += 1;
           else nextStats.emergencyNudges += 1;
         }
+        let emergencyFolded = false;
+        let emergencyFreedTokens = 0;
+        let appliedEmState;
+        {
+          const targetTokens = Math.floor(settings.modelContextLimit * (settings.gentleThresholdPct ?? 0.7));
+          const effTokens = eff.effectiveTokens || sendEstimate;
+          if (pressure.level === "forced" && effTokens > targetTokens && mapping.messages.length > 8) {
+            try {
+              const byRef = turn.state.messageRefs?.byRef ?? {};
+              const byRaw = turn.state.messageRefs?.byRaw ?? {};
+              const recentIds = new Set(mapping.messages.slice(-8).map((m) => m.id));
+              const covered = collectCoveredMessageIds(turn.state);
+              let startIdx = -1;
+              for (let i = 0; i < mapping.messages.length - 8; i++) {
+                const m = mapping.messages[i];
+                if (covered.has(m.id) || recentIds.has(m.id)) continue;
+                if (startIdx < 0) startIdx = i;
+              }
+              if (startIdx >= 0) {
+                let endIdx = startIdx;
+                for (let i = startIdx; i < mapping.messages.length - 8; i++) {
+                  const m = mapping.messages[i];
+                  if (!covered.has(m.id) && !recentIds.has(m.id)) endIdx = i;
+                }
+                const seg = mapping.messages.slice(startIdx, endIdx + 1);
+                if (seg.length >= 8) {
+                  const startRef = Object.entries(byRaw).find(([, v]) => v === seg[0].id)?.[0];
+                  const endRef = Object.entries(byRaw).find(([, v]) => v === seg[seg.length - 1].id)?.[0];
+                  if (startRef && endRef) {
+                    const summary = buildDeterministicSummary(seg, 6e3, 120);
+                    const topic = `\u81EA\u52A8\u6298\u53E0\uFF08emergency fold ${seg.length} \u6761\uFF09`;
+                    const appliedEm = core.applyCompression({
+                      ranges: [{ startRef, endRef, summary, topic }],
+                      messages: mapping.messages,
+                      state: turn.state,
+                      config
+                    });
+                    if (appliedEm.result.blocksCreated > 0) {
+                      appliedEmState = appliedEm.state;
+                      const reTurn = core.processTurn({
+                        messages: mapping.messages,
+                        state: appliedEm.state,
+                        config,
+                        tokenCount: Math.max(0, effTokens - appliedEm.result.tokensCompressed),
+                        renderTags: "none"
+                      });
+                      appliedEmState = reTurn.state;
+                      let reProj = reTurn.messages;
+                      if (settings.hideConsumedCompressCalls && reTurn.state.blocks.length > 0) {
+                        try {
+                          reProj = hideConsumedCompressCalls(reTurn.state, reTurn.messages).messages;
+                        } catch {
+                        }
+                      }
+                      const reTurns = coreMessagesToPromptTurns(reProj, mapping.byKey);
+                      projectedTurns.length = 0;
+                      projectedTurns.push(...reTurns);
+                      emergencyFolded = true;
+                      emergencyFreedTokens = appliedEm.result.tokensCompressed;
+                      nextStats.emergencyTriggered = (nextStats.emergencyTriggered ?? 0) + 1;
+                      nextStats.emergencySavedTokens = (nextStats.emergencySavedTokens ?? 0) + appliedEm.result.tokensCompressed;
+                      nextStats.lastCompressSource = "emergency";
+                      nextStats.lastCompressAt = Date.now();
+                      nextStats.creditBaseToken = Math.max(0, effTokens - appliedEm.result.tokensCompressed);
+                      nextStats.creditRemaining = settings.usageCreditTokens;
+                      try {
+                        console.log(`[acp] project EMERGENCY-FOLD stage=${hookStage} seg=${seg.length} refs=${startRef}..${endRef} freed=${appliedEm.result.tokensCompressed} raw=${turns.length} proj=${reTurns.length}`);
+                      } catch {
+                      }
+                      chatTrace(chatId, {
+                        type: "emergency_fold",
+                        stage: hookStage,
+                        detail: { seg: seg.length, freed: appliedEm.result.tokensCompressed, raw: turns.length, proj: reTurns.length, effective: effTokens }
+                      });
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              try {
+                console.log(`[acp] emergency-fold failed (fallthrough to cap): ${String(e)}`);
+              } catch {
+              }
+            }
+          }
+        }
         const cappedTurns = capProjectionSize(projectedTurns, { keepChars: 2e3, maxRecent: 3, totalBudgetChars: 2e5 });
         const finalProjEstimate = estimateProjectionTokens(
           promptTurnsToCoreMessages(cappedTurns).messages,
@@ -4885,19 +4994,22 @@ ${lines.join("\n")}${active.length > 3 ? `
         );
         const nextState = {
           adapterStateVersion: cached.adapterStateVersion,
-          kernelState: turn.state,
+          // V0.8 二阶段：emergency 折叠产生新 block 时，authoritative state 用折叠后快照。
+          kernelState: emergencyFolded && appliedEmState ? appliedEmState : turn.state,
           hostMetadata: {
             ...cached.hostMetadata,
             // V0.7.13-P3-D：FULL processTurn 产生新的 authoritative kernel snapshot → stateVersion 必须递增。
             //   这是 stale-write guard 的前提（V2 > V1），否则 STAGE2/CACHE-HIT 写 V1 不会被拦截。
             //   仅当 kernel 产生实质变化（refs/blocks 前进）时递增；纯重投影（无变化）保持原版本，
             //   避免 cache-hit 因版本漂移永久失效。
+            //   V0.8 二阶段：emergency 建块同样视为实质变化 → 递增。
             stateVersion: (() => {
               const prevState = cached.kernelState;
+              const finalState = emergencyFolded && appliedEmState ? appliedEmState : turn.state;
               const prevRefs = Object.keys(prevState.messageRefs?.byRef ?? {}).length;
-              const curRefs = Object.keys(turn.state.messageRefs?.byRef ?? {}).length;
+              const curRefs = Object.keys(finalState.messageRefs?.byRef ?? {}).length;
               const prevBlocks = prevState.blocks.length;
-              const curBlocks = turn.state.blocks.length;
+              const curBlocks = finalState.blocks.length;
               return prevRefs !== curRefs || prevBlocks !== curBlocks ? (cached.hostMetadata.stateVersion ?? 0) + 1 : cached.hostMetadata.stateVersion ?? 0;
             })(),
             lastProjectionFingerprint: fingerprint,

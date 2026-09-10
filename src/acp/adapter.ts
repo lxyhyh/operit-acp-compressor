@@ -905,8 +905,7 @@ export function createEngine(dataDir?: string): AcpEngine {
         //    - 压缩后仍超 → safety-emergency（最终兜底，不无限循环）。
         //    - preflight 与 pressure-gentle/strong（nudge）分离：preflight 是插件主动折叠，
         //      nudge 是提示模型自行 compress。
-        let autoFolded = false;
-        let emergencyFreedTokens = 0;
+        // V0.8 二阶段：旧 autoFolded/emergencyFreedTokens 声明并入下方 emergency 段。
         const prevStats = { ...(cached.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS) };
 
         // —— V0.7.6：删除 preflight/safety-emergency 自动折叠（对齐 billion-context 原版语义：
@@ -982,6 +981,100 @@ export function createEngine(dataDir?: string): AcpEngine {
           else if (level === "strong") nextStats.strongNudges += 1;
           else nextStats.emergencyNudges += 1;
         }
+        // —— V0.8 二阶段：Emergency 折叠重建（cap 退役为核心改动）。
+        //   取证（docs/v0.7.13-p3e 等）：V0.7.6 删除 preflight/safety-emergency 后，
+        //   超预算时无任何自动建块，只剩 capProjectionSize 硬截断——实测一轮请求
+        //   cap 截断 58 条消息、361K→163K（-55%），cap 成为主要压缩手段，
+        //   违反"cap 仅安全护栏"任务书六。
+        //   修复：pressure=forced（超硬限）时，对最旧未覆盖段自动调
+        //   core.applyCompression 建真 block（确定性摘要，同段跨轮稳定），
+        //   然后重投影；cap 仍保留在最后（此时应只兜底少量残余）。
+        //   与 V0.7.6 语义的差异：不区分"新一轮超窗自愈"与"普通 Hop 超限"，
+        //   凡 forced 一律先建块——因为实测证明"靠模型主动 compress"不可靠
+        //   （模型经常不调，cap 每轮都在截）。
+        let emergencyFolded = false;
+        let emergencyFreedTokens = 0;
+        let appliedEmState: CompressionState | undefined;
+        {
+          const targetTokens = Math.floor(settings.modelContextLimit * (settings.gentleThresholdPct ?? 0.7));
+          const effTokens = eff.effectiveTokens || sendEstimate;
+          if (pressure.level === "forced" && effTokens > targetTokens && mapping.messages.length > 8) {
+            try {
+              // 保护尾部：最近 8 条 + 最近 user 消息之后绝不折叠。
+              const byRef = turn.state.messageRefs?.byRef ?? {};
+              const byRaw = turn.state.messageRefs?.byRaw ?? {};
+              const recentIds = new Set(mapping.messages.slice(-8).map((m) => m.id));
+              // 找最旧未被覆盖、且不在保护区的连续段端点。
+              const covered = collectCoveredMessageIds(turn.state);
+              let startIdx = -1;
+              for (let i = 0; i < mapping.messages.length - 8; i++) {
+                const m = mapping.messages[i];
+                if (covered.has(m.id) || recentIds.has(m.id)) continue;
+                if (startIdx < 0) startIdx = i;
+              }
+              if (startIdx >= 0) {
+                // 段终点：保护区之前最后一条未覆盖消息。
+                let endIdx = startIdx;
+                for (let i = startIdx; i < mapping.messages.length - 8; i++) {
+                  const m = mapping.messages[i];
+                  if (!covered.has(m.id) && !recentIds.has(m.id)) endIdx = i;
+                }
+                const seg = mapping.messages.slice(startIdx, endIdx + 1);
+                if (seg.length >= 8) {
+                  const startRef = Object.entries(byRaw).find(([, v]) => v === seg[0].id)?.[0];
+                  const endRef = Object.entries(byRaw).find(([, v]) => v === seg[seg.length - 1].id)?.[0];
+                  if (startRef && endRef) {
+                    const summary = buildDeterministicSummary(seg, 6000, 120);
+                    const topic = `自动折叠（emergency fold ${seg.length} 条）`;
+                    const appliedEm = core.applyCompression({
+                      ranges: [{ startRef, endRef, summary, topic }],
+                      messages: mapping.messages,
+                      state: turn.state,
+                      config,
+                    });
+                    if (appliedEm.result.blocksCreated > 0) {
+                      // 用新状态重投影（同 FULL path：processTurn 会把 covered 消息折叠为摘要占位）。
+                      appliedEmState = appliedEm.state;
+                      const reTurn = core.processTurn({
+                        messages: mapping.messages,
+                        state: appliedEm.state,
+                        config,
+                        tokenCount: Math.max(0, effTokens - appliedEm.result.tokensCompressed),
+                        renderTags: "none",
+                      });
+                      appliedEmState = reTurn.state;
+                      let reProj = reTurn.messages;
+                      if (settings.hideConsumedCompressCalls && reTurn.state.blocks.length > 0) {
+                        try { reProj = kernelHideConsumedCompressCalls(reTurn.state, reTurn.messages).messages; } catch { /* noop */ }
+                      }
+                      const reTurns = coreMessagesToPromptTurns(reProj, mapping.byKey);
+                      projectedTurns.length = 0;
+                      projectedTurns.push(...reTurns);
+                      emergencyFolded = true;
+                      emergencyFreedTokens = appliedEm.result.tokensCompressed;
+                      nextStats.emergencyTriggered = (nextStats.emergencyTriggered ?? 0) + 1;
+                      nextStats.emergencySavedTokens = (nextStats.emergencySavedTokens ?? 0) + appliedEm.result.tokensCompressed;
+                      nextStats.lastCompressSource = "emergency";
+                      nextStats.lastCompressAt = Date.now();
+                      // credit 基准更新（与 model compress 同款）。
+                      nextStats.creditBaseToken = Math.max(0, effTokens - appliedEm.result.tokensCompressed);
+                      nextStats.creditRemaining = settings.usageCreditTokens;
+                      try {
+                        console.log(`[acp] project EMERGENCY-FOLD stage=${hookStage} seg=${seg.length} refs=${startRef}..${endRef} freed=${appliedEm.result.tokensCompressed} raw=${turns.length} proj=${reTurns.length}`);
+                      } catch { /* noop */ }
+                      chatTrace(chatId, {
+                        type: "emergency_fold", stage: hookStage,
+                        detail: { seg: seg.length, freed: appliedEm.result.tokensCompressed, raw: turns.length, proj: reTurns.length, effective: effTokens },
+                      });
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              try { console.log(`[acp] emergency-fold failed (fallthrough to cap): ${String(e)}`); } catch { /* noop */ }
+            }
+          }
+        }
         // 裁剪投影输出体量（防宿主主线程解析超大 JSON 卡死——总预算 200K）。
         const cappedTurns = capProjectionSize(projectedTurns, { keepChars: 2000, maxRecent: 3, totalBudgetChars: 200_000 });
 
@@ -997,19 +1090,22 @@ export function createEngine(dataDir?: string): AcpEngine {
 
         const nextState: OperitAcpSessionState = {
           adapterStateVersion: cached.adapterStateVersion,
-          kernelState: turn.state,
+          // V0.8 二阶段：emergency 折叠产生新 block 时，authoritative state 用折叠后快照。
+          kernelState: emergencyFolded && appliedEmState ? appliedEmState : turn.state,
           hostMetadata: {
             ...cached.hostMetadata,
             // V0.7.13-P3-D：FULL processTurn 产生新的 authoritative kernel snapshot → stateVersion 必须递增。
             //   这是 stale-write guard 的前提（V2 > V1），否则 STAGE2/CACHE-HIT 写 V1 不会被拦截。
             //   仅当 kernel 产生实质变化（refs/blocks 前进）时递增；纯重投影（无变化）保持原版本，
             //   避免 cache-hit 因版本漂移永久失效。
+            //   V0.8 二阶段：emergency 建块同样视为实质变化 → 递增。
             stateVersion: (() => {
               const prevState = cached.kernelState;
+              const finalState = (emergencyFolded && appliedEmState) ? appliedEmState : turn.state;
               const prevRefs = Object.keys(prevState.messageRefs?.byRef ?? {}).length;
-              const curRefs = Object.keys(turn.state.messageRefs?.byRef ?? {}).length;
+              const curRefs = Object.keys(finalState.messageRefs?.byRef ?? {}).length;
               const prevBlocks = prevState.blocks.length;
-              const curBlocks = turn.state.blocks.length;
+              const curBlocks = finalState.blocks.length;
               return (prevRefs !== curRefs || prevBlocks !== curBlocks)
                 ? (cached.hostMetadata.stateVersion ?? 0) + 1
                 : (cached.hostMetadata.stateVersion ?? 0);

@@ -171,7 +171,14 @@ export interface ProjectionResult {
   delivery?: NudgeDelivery;
 }
 
-/** 计算 projection fingerprint（轻量；stableKey 全量拼接）。 */
+/** 计算 projection fingerprint（轻量；stableKey 全量拼接）。
+ *  V0.7.13-PERF：stableKeyForTurn 对每条 content 做 JSON.stringify+hash，
+ *  2050 层巨型 TOOL_RESULT（单条可达数 MB）时整体 >10s，超出宿主 hook 预算
+ *  （默认 10s，ToolPkgHookExecutionBudget）→ mutation 被丢弃 → 全量发送。
+ *  修复：长度前置 + 采样哈希（头 64KB + 尾 16KB + 长度），碰撞概率对
+ *  "新增一条巨型消息"场景足够低（相同头尾+相同长度且非同一消息几乎不存在），
+ *  而 fingerprint 只用于缓存命中判断（错误命中后果是复用近似投影，可接受，
+ *  比超时全量发送好几个量级）。 */
 export function computeFingerprint(
   sessionKey: string,
   turns: PromptTurnLike[],
@@ -179,7 +186,20 @@ export function computeFingerprint(
 ): string {
   let h = "";
   for (const t of turns) {
-    h += `${stableKeyForTurn(t)}|`;
+    const kind = t.kind || "UNKNOWN";
+    const toolName = t.toolName && t.toolName !== "null" && t.toolName !== "undefined" ? t.toolName : "";
+    const content = typeof t.content === "string" ? t.content : "";
+    const len = content.length;
+    // <128K 全量 hash；≥128K 采样（头 64K + 尾 16K）+ 长度——避免 stringify 巨串。
+    let core: string;
+    if (len < 131072) {
+      core = `${kind}|${toolName}|${hashString(JSON.stringify([content, t.metadata ?? null]))}`;
+    } else {
+      const head = content.slice(0, 65536);
+      const tail = len > 81920 ? content.slice(len - 16384) : "";
+      core = `${kind}|${toolName}|len${len}|${hashString(head + "\u0000" + tail)}`;
+    }
+    h += `${core}|`;
   }
   return hashString(`${sessionKey}|${config.modelContextLimit}|${config.preserveRecentMessages}|${h}`);
 }
@@ -513,6 +533,8 @@ export function createEngine(dataDir?: string): AcpEngine {
           const config = resolveKernelConfig(settings);
           const fp = computeFingerprint(sessionKey, turns, config);
           const memCached = projectionCache.get(sessionKey);
+          // 设计意图保留：stage2 输入是 stage1 的输出（fingerprint 按设计不匹配），
+          // 盲取内存缓存的投影（= stage1 对本次发送周期的投影结果）是正确语义。
           const projected = memCached && memCached.projection && Array.isArray(memCached.projection) && memCached.projection.length > 0
             ? memCached.projection
             : undefined;
@@ -762,6 +784,56 @@ export function createEngine(dataDir?: string): AcpEngine {
                 console.log(`[acp] project INCREMENTAL stage=${hookStage} +${delta.length} raw=${turns.length} proj=${incFinal.length} nudge=${incPressure.pressure.allowInject ? 1 : 0} eff=${Math.round(incPressure.pressurePct * 100)}% reason=${incPressure.pressure.decisionReason} (skipped full processTurn)`);
               } catch { /* noop */ }
               return { preparedHistory: incFinal as PromptTurnLike[], fingerprint, state: cached.kernelState, nudgeText: incNudgeText, delivery: incDelivery };
+            }
+          }
+        }
+
+        // —— V0.7.13-PERF（持久化前缀复用快速路径）：内存增量要求 stateVersion
+        //   与内存缓存一致（跨 runtime/重启必然失配）。而真实瓶颈在"新一轮
+        //   发送"（宿主 budget 10s 内必须完成 stage1 投影，05:29/05:35 两次
+        //   超时实锤：巨型 TOOL_RESULT 序列化+hash 是热点）。修复：与 estimate()
+        //   的 P3-I.6 同源思路——用持久化的 lastRawTurns + lastProjection 做前缀
+        //   匹配复用：本次 turns ⊇ 上次发送的 raw turns 且前缀 stableKey 一致时，
+        //   复用上次投影 + 尾部轻量投影 + cap，跳过全量 processTurn。
+        //   数据源是持久化（跨 runtime 可见），且不要求 stateVersion 一致
+        //   （块推进由 lastProjection 伴随的 kernelState 演进覆盖，投影复用
+        //   只要求"前缀内容未变"，前缀的折叠状态不会因新尾部而失效）。
+        {
+          const rawPrevPersist = cached.lastRawTurns as PromptTurnLike[] | undefined;
+          const projPrevPersist = cached.hostMetadata.lastProjection as PromptTurnLike[] | undefined;
+          if (rawPrevPersist && rawPrevPersist.length > 0 && projPrevPersist && projPrevPersist.length > 0
+            && turns.length >= rawPrevPersist.length) {
+            const deltaLen = turns.length - rawPrevPersist.length;
+            // 前缀校验：逐条 stableKey 比对（新 turn 内容小，成本可忽略；
+            // 旧前缀的 stableKey 已在 cache 计算中付过一次，这里复算可接受）。
+            let prefixOk = true;
+            for (let i = 0; i < rawPrevPersist.length; i++) {
+              if (stableKeyForTurn(turns[i]) !== stableKeyForTurn(rawPrevPersist[i])) { prefixOk = false; break; }
+            }
+            if (prefixOk && deltaLen > 0) {
+              const delta = turns.slice(rawPrevPersist.length);
+              const deltaMap = promptTurnsToCoreMessages(delta);
+              const deltaTurns = coreMessagesToPromptTurns(deltaMap.messages, deltaMap.byKey);
+              const merged = [...(projPrevPersist as PromptTurnLike[]), ...deltaTurns];
+              const capped = capProjectionSize(merged, { keepChars: 2000, maxRecent: 3, totalBudgetChars: 200_000 });
+              cacheSetLimited(projectionCache, sessionKey, { fingerprint, stateVersion, projection: capped });
+              cacheSetLimited(rawTurnsCache, sessionKey, turns);
+              const pfNextState: OperitAcpSessionState = {
+                adapterStateVersion: cached.adapterStateVersion,
+                kernelState: cached.kernelState,
+                hostMetadata: {
+                  ...cached.hostMetadata,
+                  stateVersion: cached.hostMetadata.stateVersion ?? 0,
+                  lastProjectionFingerprint: fingerprint,
+                  lastUpdatedAt: Date.now(),
+                  ...(chatId ? { lastChatId: String(chatId) } : {}),
+                },
+              };
+              try { await persistence.save(sessionKey, pfNextState); } catch { /* 快速路径保存失败不影响返回 */ }
+              try {
+                console.log(`[acp] project PERSIST-PREFIX-REUSE stage=${hookStage} +${deltaLen} raw=${turns.length} proj=${capped.length} blocks=${cached.kernelState.blocks.filter((b) => b.active).length}/${cached.kernelState.blocks.length} (skipped full processTurn)`);
+              } catch { /* noop */ }
+              return { preparedHistory: capped as PromptTurnLike[], fingerprint, state: cached.kernelState, delivery: undefined };
             }
           }
         }

@@ -55,6 +55,8 @@ export interface AdapterSettings {
   incrementalMaxNewTurns: number;
   /** 数据目录。 */
   dataDir: string;
+  /** V0.7.13-HOOK-EXP：最小实验开关——旁路压缩直接返回最后 6 条。默认 false。 */
+  hookExperiment: boolean;
 }
 
 /** acp-config.json 键名（单一事实来源；与 src/config.ts DEFAULT_CONFIG 对齐）。 */
@@ -69,17 +71,75 @@ const KEYS = {
 
 const SETTINGS_FILE = SETTINGS_FILE_PATH;
 
-/** 读 settings JSON（带内容缓存：文件未变则跳过 JSON.parse；跨调用共享）。 */
+/** 读 settings JSON（带内容缓存：文件未变则跳过 JSON.parse；跨调用共享）。
+ *  V0.7.13-CONFIG-FIX：hook-exp-probe 实锤——sandbox 里 Tools.Files.read 读
+ *  /sdcard 路径曾失败/返回空（readBool 全部回退默认值，配置改动"不生效"）。
+ *  加两级兜底：1) Tools.Files.read 失败 → 直接 java.io.File 读取；
+ *  2) 首次失败/成功状态写一次性诊断日志，便于后续排查。 */
+const SETTINGS_DIAG_KEY = "__acp_settings_diag_logged";
+/** 带内容缓存键（文件未变则跳过 JSON.parse）。 */
 const SETTINGS_CACHE_KEY = "__acp_settings_cache_v2";
+type JavaCls<T> = { new (...args: unknown[]): T } | undefined;
+function javaUse<T>(name: string): JavaCls<T> {
+  const J = (globalThis as Record<string, unknown>).Java as
+    | { use?: (n: string) => unknown }
+    | undefined;
+  try {
+    return (J?.use?.(name) ?? undefined) as JavaCls<T>;
+  } catch {
+    return undefined;
+  }
+}
 function readJsonSettings(): Record<string, unknown> {
   const g = globalThis as Record<string, unknown>;
+  let content: string | undefined;
+  let readPath = "Tools.Files.read";
   try {
     const fs = Tools.Files;
     const res = fs.read(SETTINGS_FILE) as unknown as { content?: string } | undefined;
-    const content = (res && res.content) as string | undefined;
-    if (!content) return {};
-    const cached = g[SETTINGS_CACHE_KEY] as { raw: string; data: Record<string, unknown> } | undefined;
-    if (cached && cached.raw === content) return cached.data;
+    content = (res && res.content) as string | undefined;
+  } catch { content = undefined; }
+  if (!content) {
+    // 兜底 1：直接 java.io.File（sandbox java bridge 对 /sdcard 直接读通常可行）。
+    try {
+      const File = javaUse<{ exists(): boolean; canRead(): boolean; length(): number }>("java.io.File");
+      const Scanner = javaUse<{ useDelimiter(d: string): unknown; hasNext(): boolean; next(): string; close(): void }>("java.util.Scanner");
+      if (File && Scanner) {
+        const f = new File(SETTINGS_FILE);
+        if (f.exists() && f.canRead() && f.length() > 0) {
+          const sc = new Scanner(f);
+          sc.useDelimiter("\\A");
+          if (sc.hasNext()) {
+            content = sc.next();
+            readPath = "java.io.File";
+          }
+          sc.close();
+        }
+      }
+    } catch { /* 兜底失败，保持 content=undefined */ }
+  }
+  try {
+    if (!g[SETTINGS_DIAG_KEY]) {
+      g[SETTINGS_DIAG_KEY] = true;
+      const dir = "/sdcard/Download/Operit/plugins/com.operit.acp_compressor/logs";
+      const line = `[settings-diag] path=${SETTINGS_FILE} read=${readPath} ok=${content ? 1 : 0} len=${content?.length ?? 0}\n`;
+      try {
+        const F = javaUse<{ exists(): boolean; mkdirs(): boolean }>("java.io.File");
+        const FW = javaUse<{ write(s: string): void; close(): void }>("java.io.FileWriter");
+        if (F && FW) {
+          const d = new F(dir);
+          if (!d.exists()) d.mkdirs();
+          const w = new FW(new F(`${dir}/tools_visibility.log`), true);
+          w.write(line);
+          w.close();
+        }
+      } catch { /* 诊断失败不影响主流程 */ }
+    }
+  } catch { /* ignore */ }
+  if (!content) return {};
+  const cached = g[SETTINGS_CACHE_KEY] as { raw: string; data: Record<string, unknown> } | undefined;
+  if (cached && cached.raw === content) return cached.data;
+  try {
     const parsed = JSON.parse(content);
     const data = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
     g[SETTINGS_CACHE_KEY] = { raw: content, data };
@@ -152,6 +212,8 @@ export function loadAdapterSettings(): AdapterSettings {
     usageCreditTokens: Math.round(modelContextLimit * 0.15),
     // V0.6 Phase7 增量投影阈值（默认允许新增 8 条内走增量）。
     incrementalMaxNewTurns: readNum("incrementalMaxNewTurns", 8),
+    // V0.7.13-HOOK-EXP：实验开关（实验已完成；保留开关但恢复文件读取）。
+    hookExperiment: readBool("hookExperiment", false),
     dataDir: DATA_DIR,
   };
 }

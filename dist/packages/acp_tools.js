@@ -3068,16 +3068,71 @@ var KEYS = {
   nudgeThresholdPct: "nudgeThresholdPct"
 };
 var SETTINGS_FILE2 = SETTINGS_FILE;
+var SETTINGS_DIAG_KEY = "__acp_settings_diag_logged";
 var SETTINGS_CACHE_KEY = "__acp_settings_cache_v2";
+function javaUse(name) {
+  const J = globalThis.Java;
+  try {
+    return J?.use?.(name) ?? void 0;
+  } catch {
+    return void 0;
+  }
+}
 function readJsonSettings() {
   const g = globalThis;
+  let content;
+  let readPath = "Tools.Files.read";
   try {
     const fs = Tools.Files;
     const res = fs.read(SETTINGS_FILE2);
-    const content = res && res.content;
-    if (!content) return {};
-    const cached = g[SETTINGS_CACHE_KEY];
-    if (cached && cached.raw === content) return cached.data;
+    content = res && res.content;
+  } catch {
+    content = void 0;
+  }
+  if (!content) {
+    try {
+      const File = javaUse("java.io.File");
+      const Scanner = javaUse("java.util.Scanner");
+      if (File && Scanner) {
+        const f = new File(SETTINGS_FILE2);
+        if (f.exists() && f.canRead() && f.length() > 0) {
+          const sc = new Scanner(f);
+          sc.useDelimiter("\\A");
+          if (sc.hasNext()) {
+            content = sc.next();
+            readPath = "java.io.File";
+          }
+          sc.close();
+        }
+      }
+    } catch {
+    }
+  }
+  try {
+    if (!g[SETTINGS_DIAG_KEY]) {
+      g[SETTINGS_DIAG_KEY] = true;
+      const dir = "/sdcard/Download/Operit/plugins/com.operit.acp_compressor/logs";
+      const line = `[settings-diag] path=${SETTINGS_FILE2} read=${readPath} ok=${content ? 1 : 0} len=${content?.length ?? 0}
+`;
+      try {
+        const F = javaUse("java.io.File");
+        const FW = javaUse("java.io.FileWriter");
+        if (F && FW) {
+          const d = new F(dir);
+          if (!d.exists()) d.mkdirs();
+          const w = new FW(new F(`${dir}/tools_visibility.log`), true);
+          w.write(line);
+          w.close();
+        }
+      } catch {
+      }
+    }
+  } catch {
+  }
+  if (!content) return {};
+  const cached = g[SETTINGS_CACHE_KEY];
+  if (cached && cached.raw === content) return cached.data;
+  try {
     const parsed = JSON.parse(content);
     const data = parsed && typeof parsed === "object" ? parsed : {};
     g[SETTINGS_CACHE_KEY] = { raw: content, data };
@@ -3143,6 +3198,8 @@ function loadAdapterSettings() {
     usageCreditTokens: Math.round(modelContextLimit * 0.15),
     // V0.6 Phase7 增量投影阈值（默认允许新增 8 条内走增量）。
     incrementalMaxNewTurns: readNum("incrementalMaxNewTurns", 8),
+    // V0.7.13-HOOK-EXP：实验开关（实验已完成；保留开关但恢复文件读取）。
+    hookExperiment: readBool("hookExperiment", false),
     dataDir: DATA_DIR
   };
 }
@@ -4255,7 +4312,19 @@ function cacheSetLimited(map, key, value) {
 function computeFingerprint(sessionKey, turns, config) {
   let h = "";
   for (const t of turns) {
-    h += `${stableKeyForTurn(t)}|`;
+    const kind = t.kind || "UNKNOWN";
+    const toolName = t.toolName && t.toolName !== "null" && t.toolName !== "undefined" ? t.toolName : "";
+    const content = typeof t.content === "string" ? t.content : "";
+    const len = content.length;
+    let core;
+    if (len < 131072) {
+      core = `${kind}|${toolName}|${hashString(JSON.stringify([content, t.metadata ?? null]))}`;
+    } else {
+      const head = content.slice(0, 65536);
+      const tail = len > 81920 ? content.slice(len - 16384) : "";
+      core = `${kind}|${toolName}|len${len}|${hashString(head + "\0" + tail)}`;
+    }
+    h += `${core}|`;
   }
   return hashString(`${sessionKey}|${config.modelContextLimit}|${config.preserveRecentMessages}|${h}`);
 }
@@ -4679,6 +4748,49 @@ function createEngine(dataDir) {
               } catch {
               }
               return { preparedHistory: incFinal, fingerprint, state: cached.kernelState, nudgeText: incNudgeText, delivery: incDelivery };
+            }
+          }
+        }
+        {
+          const rawPrevPersist = cached.lastRawTurns;
+          const projPrevPersist = cached.hostMetadata.lastProjection;
+          if (rawPrevPersist && rawPrevPersist.length > 0 && projPrevPersist && projPrevPersist.length > 0 && turns.length >= rawPrevPersist.length) {
+            const deltaLen = turns.length - rawPrevPersist.length;
+            let prefixOk = true;
+            for (let i = 0; i < rawPrevPersist.length; i++) {
+              if (stableKeyForTurn(turns[i]) !== stableKeyForTurn(rawPrevPersist[i])) {
+                prefixOk = false;
+                break;
+              }
+            }
+            if (prefixOk && deltaLen > 0) {
+              const delta = turns.slice(rawPrevPersist.length);
+              const deltaMap = promptTurnsToCoreMessages(delta);
+              const deltaTurns = coreMessagesToPromptTurns(deltaMap.messages, deltaMap.byKey);
+              const merged = [...projPrevPersist, ...deltaTurns];
+              const capped = capProjectionSize(merged, { keepChars: 2e3, maxRecent: 3, totalBudgetChars: 2e5 });
+              cacheSetLimited(projectionCache, sessionKey, { fingerprint, stateVersion, projection: capped });
+              cacheSetLimited(rawTurnsCache, sessionKey, turns);
+              const pfNextState = {
+                adapterStateVersion: cached.adapterStateVersion,
+                kernelState: cached.kernelState,
+                hostMetadata: {
+                  ...cached.hostMetadata,
+                  stateVersion: cached.hostMetadata.stateVersion ?? 0,
+                  lastProjectionFingerprint: fingerprint,
+                  lastUpdatedAt: Date.now(),
+                  ...chatId ? { lastChatId: String(chatId) } : {}
+                }
+              };
+              try {
+                await persistence.save(sessionKey, pfNextState);
+              } catch {
+              }
+              try {
+                console.log(`[acp] project PERSIST-PREFIX-REUSE stage=${hookStage} +${deltaLen} raw=${turns.length} proj=${capped.length} blocks=${cached.kernelState.blocks.filter((b) => b.active).length}/${cached.kernelState.blocks.length} (skipped full processTurn)`);
+              } catch {
+              }
+              return { preparedHistory: capped, fingerprint, state: cached.kernelState, delivery: void 0 };
             }
           }
         }

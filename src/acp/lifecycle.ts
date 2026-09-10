@@ -119,6 +119,13 @@ export async function onFinalize(event: FinalizeHookEvent): Promise<PromptHookOb
 
   if (!engine.settings.enabled) return;
   if (turns.length === 0) return;
+  // [HOOK-EXP 探针] 无条件输出 settings 实际值（判定 hookExperiment 是否被读到）
+  try {
+    diagLog(LOG_TOOLS_VISIBILITY_FILE, `[hook-exp-probe] stage=${stage} hookExperiment=${String(engine.settings.hookExperiment)} enabled=${String(engine.settings.enabled)}`);
+  } catch { /* ignore */ }
+  // —— V0.7.13-PERF：hook-exp 实验完成（已实锤宿主链路 + 定位超时根因），彻底撤除。
+  //   实验结论：finalize hook 返回 { preparedHistory } 能真正接管发送内容；
+  //   真正根因是 stage1 全量投影 >10s 超出宿主 hook 预算 → mutation 被丢弃。
 
   // V0.7.5：stage2（before_send_to_model）先验证 stage1 注入的 nudge 是否仍在
   // preparedHistory（宿主 applyFinalizedCurrentUserTurn / mergeAdjacentTurns 可能改动）。

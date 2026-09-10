@@ -68,11 +68,12 @@ function turnsFromPayload(payload: Record<string, unknown>): PromptTurn[] {
   return Array.isArray(t) ? (t as PromptTurn[]) : [];
 }
 
-/** 投影失败：透传原始 history（不破坏用户请求），绝不抛给宿主。 */
-async function safeProject(engine: AcpEngine, sessionKey: string, chatId: string | undefined, isSubTask: boolean | undefined, stage: string, turns: PromptTurn[]): Promise<PromptTurn[] | undefined> {
+/** 投影失败：透传原始 history（不破坏用户请求），绝不抛给宿主。
+ *  V0.8-P6.1b：返回完整结果对象（含 delivery/pressure 元数据），调用方自行取 preparedHistory。 */
+async function safeProject(engine: AcpEngine, sessionKey: string, chatId: string | undefined, isSubTask: boolean | undefined, stage: string, turns: PromptTurn[]): Promise<Awaited<ReturnType<AcpEngine["project"]>> | undefined> {
   try {
     const result = await engine.project(sessionKey, chatId, isSubTask, stage, turns);
-    return result.preparedHistory;
+    return result;
   } catch (error) {
     try { console.log(`[acp] projection failed, passthrough: ${String(error)}`); } catch { /* noop */ }
     return undefined;
@@ -157,15 +158,16 @@ export async function onFinalize(event: FinalizeHookEvent): Promise<PromptHookOb
     } catch { /* ignore */ }
   }
 
-  const projected = await safeProject(engine, sessionKey, ctx.chatId, ctx.isSubTask, stage, turns);
-  if (projected === undefined) return;
+  const projectedFull = await safeProject(engine, sessionKey, ctx.chatId, ctx.isSubTask, stage, turns);
+  if (projectedFull === undefined) return;
+  const projected = (projectedFull.preparedHistory ?? turns) as PromptTurn[];
 
   // —— V0.8-P6.1 实验 A/D/E：LLM emergency fold（llmEmergencyFold=true 且 forced 且超目标时触发一次）。
   if (engine.settings.llmEmergencyFold && stage === "before_finalize_prompt") {
     try {
       const g6b = globalThis as Record<string, unknown>;
       const foldState = (g6b.__acpLlmFoldState ??= { running: false, lastAt: 0 }) as { running: boolean; lastAt: number };
-      const delivery6 = projected as unknown as { delivery?: { level?: string; effectiveTokens?: number } };
+      const delivery6 = projectedFull as unknown as { delivery?: { level?: string; effectiveTokens?: number } };
       const level = delivery6?.delivery?.level;
       const effTok = delivery6?.delivery?.effectiveTokens ?? 0;
       // gentle 目标 = 70% × modelContextLimit（与 pressure.ts gentle 档一致）。
@@ -237,9 +239,9 @@ export async function onFinalize(event: FinalizeHookEvent): Promise<PromptHookOb
   }
   // V0.7.5：delivery 证明链 trace——engine 已返回 delivery（armed/carrier/delivered），
   // 这里补 final 验证（本次返回的 preparedHistory 是否含 nudge）。
-  const engineDelivery = projected as unknown as { delivery?: NudgeDelivery };
+  const engineDelivery = projectedFull as unknown as { delivery?: NudgeDelivery };
   if (engineDelivery?.delivery) {
-    const finalHasNudge = findNudgeTurn(projected as PromptTurn[]) !== undefined;
+    const finalHasNudge = findNudgeTurn(projected) !== undefined;
     const final = markFinalCheck(engineDelivery.delivery, finalHasNudge);
     diagLog(LOG_TOOLS_VISIBILITY_FILE, `[nudge-delivery] stage=${stage} armed=${final.armed ? 1 : 0} carrier=${final.carrierSelected ?? "-"} delivered=${final.deliveredToPreparedHistory ? 1 : 0} final=${final.finalPreparedHistoryHasNudge ? 1 : 0} reason=${final.reason ?? "-"}`);
     // 也写进 trace.jsonl（与 chatTrace 同构；失败不影响主流程）

@@ -87,7 +87,7 @@ test("P1: usage 缺失/为0 时 effective estimate 仍发现压力 (effective so
   const eff = computeEffectiveTokens({ estimatedTokens: 150_000 });
   assert.equal(eff.source, "estimate");
   assert.equal(eff.effectiveTokens, 150_000);
-  assert.equal(eff.confidence, "low");
+  assert.equal(eff.confidence, "medium", "V0.8: projection estimate = medium");
   const r = evaluatePressure({
     usagePct: 0.75, effectiveTokens: eff.effectiveTokens, tokenEstimate: 150_000,
     kernelShouldInject: false, kernelReason: "", prevEpoch: undefined,
@@ -248,16 +248,17 @@ test("P11: V0.7.1 回归 — credit 基准错位（base>est）时不得永久压
 test("T1: computeEffectiveTokens 三源组合（estimate only / actual only / host only / all）", () => {
   // estimate only
   const e = computeEffectiveTokens({ estimatedTokens: 60_000 });
-  assert.equal(e.effectiveTokens, 60_000); assert.equal(e.source, "estimate"); assert.equal(e.confidence, "low");
+  assert.equal(e.effectiveTokens, 60_000); assert.equal(e.source, "estimate"); assert.equal(e.confidence, "medium"); // V0.8: projection estimate = medium
   // actual only → actual 优先（真实 usage），confidence=high
   const a = computeEffectiveTokens({ estimatedTokens: 10_000, actualTokens: 90_000 });
   assert.equal(a.effectiveTokens, 90_000); assert.equal(a.source, "upstream"); assert.equal(a.confidence, "high");
-  // host only → host 真实，confidence=medium
+  // host only → V0.8: host 仅存档不参与 effective；effective=projection estimate
   const h = computeEffectiveTokens({ estimatedTokens: 10_000, hostTokens: 80_000 });
-  assert.equal(h.effectiveTokens, 80_000); assert.equal(h.source, "host"); assert.equal(h.confidence, "medium");
+  assert.equal(h.effectiveTokens, 10_000); assert.equal(h.source, "estimate"); assert.equal(h.confidence, "medium");
+  assert.equal(h.hostTokens, 80_000, "host 仍存档在 snapshot 上供审计");
   // all three → actual 优先（V0.7.13-P3-I.1：不再 max，estimate 高估不顶掉真实值）
   const all = computeEffectiveTokens({ estimatedTokens: 500_000, actualTokens: 70_000, hostTokens: 95_000 });
-  assert.equal(all.effectiveTokens, 70_000); assert.equal(all.source, "hybrid"); assert.equal(all.confidence, "high");
+  assert.equal(all.effectiveTokens, 70_000); assert.equal(all.source, "upstream"); assert.equal(all.confidence, "high");
   // actual+host，无 estimate → actual 优先（V0.7.13-P3-I.1 变更）
   const ah = computeEffectiveTokens({ estimatedTokens: 0, actualTokens: 70_000, hostTokens: 60_000 });
   assert.equal(ah.effectiveTokens, 70_000);
@@ -289,10 +290,11 @@ test("T3: UsageManager 生命周期（per-session、credit 累加/net 消费/清
   // 真实 usage 180k：超额 100k → credit 消费到 20k（只按超额部分）。
   m1.recordUpstreamUsage({ contextTokens: 180_000 });
   assert.equal(m1.getCompressionCredit(), 20_000, "只按超额部分消费");
-  // host(100k) + actual(180k, corrected 160k) 都存在 → source=hybrid，effective=max
+  // V0.8: actual 修正后 correctedActual=160k 唯一权威；host 仅存档。
   const snap = m1.getEffectiveSnapshot(80_000);
-  assert.equal(snap.source, "hybrid");
-  assert.equal(snap.effectiveTokens, 160_000, "max(correctedActual=160k, host=100k, est=80k)");
+  assert.equal(snap.source, "upstream");
+  assert.equal(snap.effectiveTokens, 160_000, "correctedActual=180k-20k credit=160k");
+  assert.equal(snap.hostTokens, 100_000, "host 存档供审计");
 });
 
 test("T4: protocol-aware normalizeUsage（Anthropic / OpenAI / Responses 不 double-count cached）", () => {
@@ -386,15 +388,16 @@ test("V0.7.2-U1: recordUpstreamUsage 是 Actual 唯一入口；拿不到保持 u
   assert.equal(mgr.getLatestActual(), undefined, "只有 estimate/host 时 actual 必须 undefined");
   const snap = mgr.getEffectiveSnapshot(80_000);
   assert.equal(snap.actualTokens, undefined, "effective snapshot 的 actual 必须 undefined");
-  assert.equal(snap.source, "host", "host 可用时 source=host");
-  assert.equal(snap.confidence, "medium", "host 可用时 confidence=medium");
+  assert.equal(snap.source, "estimate", "V0.8: host 仅存档，effective source=estimate");
+  assert.equal(snap.confidence, "medium", "projection estimate → confidence=medium");
+  assert.equal(snap.hostTokens, 75_000, "V0.8: host 存档在 snapshot 上（但不参与 effective）");
 
   // 真实 upstream actual 到达后：actual 有值；host 仍在 → source=hybrid（三源同存）、confidence=high。
   mgr.recordUpstreamUsage({ contextTokens: 120_000, hop: 3 });
   assert.equal(mgr.getLatestActual(), 120_000);
   const snap2 = mgr.getEffectiveSnapshot(80_000);
   assert.equal(snap2.actualTokens, 120_000);
-  assert.equal(snap2.source, "hybrid", "host+actual 同存 → hybrid");
+  assert.equal(snap2.source, "upstream", "V0.8: host 不再参与 source，actual 到达 → upstream");
   assert.equal(snap2.confidence, "high");
 });
 
@@ -445,7 +448,7 @@ test("V0.7.2-U3: hop ledger 逐 hop 持久化 estimate/actual/host/credit/source
   assert.equal(ledger[0].hop, 1);
   assert.equal(ledger[0].estimateTokens, 80_000);
   assert.equal(ledger[0].actualTokens, undefined, "hop1 actual 必须 undefined（未拿到）");
-  assert.equal(ledger[0].source, "host");
+  assert.equal(ledger[0].source, "estimate", "V0.8: ledger 的 source 反映 effective 实际来源");
   assert.equal(ledger[0].confidence, "medium");
   // 自动 ledger（hop2，actual 95k，source=hybrid 因为 host 也在；
   // credit 已按 net accounting 消费：20k - (95k-80k 超额) = 5k）

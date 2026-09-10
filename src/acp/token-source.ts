@@ -41,17 +41,23 @@ export interface TokenSnapshot {
 }
 
 /**
- * computeEffectiveTokens：宿主真实测量优先，estimate 仅作 fallback。
- * V0.7.13-P3-I.1：effective 不再取 max（estimate 高估时会顶掉宿主真实值）。
- * 依据建议文档第 8 阶段 + P3-E 取证（ACP estimate 594K vs 宿主真实 191K）：
- *   correctedActual = max(0, actualTokens - compressionCredit)
- *   effectiveTokens = host ?? correctedActual ?? estimate
- * 说明：host（宿主侧 currentWindowSize 真实 tokenizer 计数）为最高优先；
- *       无 host 时退回 correctedActual；都无才用 estimate。
+ * computeEffectiveTokens：实际发送上下文的 Token 唯一合成规则（V0.8 重构）。
+ *
+ * 权威优先级（任务书第四节）：
+ *   1. correctedActual —— provider 真实 usage（压缩 credit 修正后）。
+ *      生产链路暂无 provider usage 回调，恒 undefined（绝不伪造）。
+ *   2. projectionEstimate —— 本次实际发送投影（requestHistory 同一份输入）的
+ *      本地估算。它是"实际发送上下文"的最佳可用近似，source 明确标 estimate。
+ *   3. hostTokens（DB currentWindowSize）只是宿主回合结束的滞后重算，
+ *      反映的是"上一回合结束时的原始 DB 历史计数"，与实际发送内容脱节，
+ *      ——仅存档审计（getLatestHost / ledger.hostTokens），不再参与 effective 决策。
+ *
+ * 禁止 effective = max(...)（estimate 高估时顶掉真实值，V0.7.13-P3-E 实证）。
  */
 export function computeEffectiveTokens(input: {
   estimatedTokens: number;
   actualTokens?: number;
+  /** 仅存档，不参与 effective 决策。 */
   hostTokens?: number;
   compressionCredit?: number;
 }): TokenSnapshot {
@@ -68,31 +74,19 @@ export function computeEffectiveTokens(input: {
 
   const correctedActual = actual !== undefined ? Math.max(0, actual - credit) : undefined;
 
-  // —— V0.7.13-P3-I.1：真实测量优先，estimate 仅作 fallback。
-  //   优先级：correctedActual（provider 真实 usage，压缩 credit 修正后）>
-  //           host（宿主 currentWindowSize 真实 tokenizer 计数）>
-  //           estimate（CJK 估算，仅兜底）。
-  //   原因：estimate 是 CJK 加权估算（对中文高估 ~3 倍），max 会让 estimate 顶掉
-  //   真实值（594K vs 真实 191K）、nudge 过早触发。而 actual 是 provider 返回的
-  //   精确 usage，可信度最高，host 次之。
   const est = Number.isFinite(estimatedTokens) && estimatedTokens > 0 ? estimatedTokens : 0;
   let effectiveTokens: number;
   if (correctedActual !== undefined && correctedActual > 0) {
     effectiveTokens = correctedActual;
-  } else if (host !== undefined) {
-    effectiveTokens = host;
   } else {
     effectiveTokens = est;
   }
 
   let source: TokenSource = "estimate";
-  if (actual !== undefined && host !== undefined) source = "hybrid";
-  else if (actual !== undefined) source = "upstream";
-  else if (host !== undefined) source = "host";
-
+  if (actual !== undefined) source = "upstream";
   const confidence: TokenConfidence =
     actual !== undefined ? "high"
-    : host !== undefined ? "medium"
+    : est > 0 ? "medium"
     : "low";
 
   return {

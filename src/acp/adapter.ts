@@ -318,14 +318,16 @@ export function createEngine(dataDir?: string): AcpEngine {
     const usageManager = createUsageManager(opts.usageState);
     const nextStats: AcpRuntimeStats = { ...opts.prevStats as AcpRuntimeStats };
     const prevEpoch = (opts.prevNudgeState as { acpEpoch?: PressureEpoch }).acpEpoch;
-    // —— V0.7.1：effective pressure 由 UsageManager 计算（estimate/actual/host 明确区分）。
-    // 宿主侧测量（尽力而为；DB 不可读返回 undefined，绝不拖垮请求）。
+    // —— V0.8 Token 重构：host（DB currentWindowSize）是宿主回合结束的滞后重算值，
+    //   与"实际发送上下文"脱节（DB 存原始完整历史，请求发投影）。它不再参与
+    //   effective 决策（computeEffectiveTokens 已移除 host 分支），仅作为
+    //   趋势审计存档（recordHostUsage → ledger.hostTokens）。
+    //   读取保留尽力而为（失败 undefined 不影响请求链路）。
     const hostTokens = opts.chatId
       ? await getHostUsageAdapter().getCurrentContextTokens(String(opts.chatId))
       : undefined;
     if (hostTokens !== undefined) usageManager.recordHostUsage(hostTokens, opts.hopNo);
     usageManager.recordEstimate(opts.tokenEstimate, opts.hopNo);
-    // 若插件曾通过工具链路记录过上游 usage，则注入（见 recordUpstreamUsage 调用点）。
     const eff = usageManager.getEffectiveSnapshot(opts.tokenEstimate);
     const pressurePct = opts.config.modelContextLimit > 0
       ? (eff.effectiveTokens || opts.tokenEstimate) / opts.config.modelContextLimit
@@ -843,12 +845,13 @@ export function createEngine(dataDir?: string): AcpEngine {
         mapping.messages = stripOldAnchorMessages(mapping.messages) as CoreMessage[];
         const coveredIds = collectCoveredMessageIds(cached.kernelState);
         const tokenEstimate = estimateProjectionTokens(mapping.messages, coveredIds);
-        // —— V0.7.13-P3-I：tokenCount 优先宿主真实值（hostTokens），无则 fallback estimate。
-        //   对齐原版 billion-context（tokenCount = 上游真实 input_tokens，非 estimate）。
-        const hostTokens = chatId
-          ? await getHostUsageAdapter().getCurrentContextTokens(String(chatId))
-          : undefined;
-        const kernelTokenCount = hostTokens ?? tokenEstimate;
+        // —— V0.8 Token 重构：kernel tokenCount = 本次发送投影的估算（projectionEstimate）。
+        //   对齐原版 billion-context 语义：tokenCount = "上一轮实际发送内容的 token 数"
+        //   （原版用 session.stats.lastInputTokens = 上游真实值）。生产链路拿不到
+        //   provider usage，投影估算就是"实际发送上下文"的最佳可用值。
+        //   V0.7.13-P3-I 的 hostTokens ?? estimate 已废弃：host 是 DB 回合结束滞后
+        //   重算值（原始历史计数，含未发送部分），与实际发送上下文脱节。
+        const kernelTokenCount = tokenEstimate;
 
         const turn = core.processTurn({
           messages: mapping.messages,

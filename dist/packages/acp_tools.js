@@ -4044,16 +4044,12 @@ function computeEffectiveTokens(input) {
   let effectiveTokens;
   if (correctedActual !== void 0 && correctedActual > 0) {
     effectiveTokens = correctedActual;
-  } else if (host !== void 0) {
-    effectiveTokens = host;
   } else {
     effectiveTokens = est;
   }
   let source = "estimate";
-  if (actual !== void 0 && host !== void 0) source = "hybrid";
-  else if (actual !== void 0) source = "upstream";
-  else if (host !== void 0) source = "host";
-  const confidence = actual !== void 0 ? "high" : host !== void 0 ? "medium" : "low";
+  if (actual !== void 0) source = "upstream";
+  const confidence = actual !== void 0 ? "high" : est > 0 ? "medium" : "low";
   return {
     estimatedTokens: est,
     actualTokens: correctedActual !== void 0 && actual !== void 0 ? actual : void 0,
@@ -4798,8 +4794,7 @@ function createEngine(dataDir) {
         mapping.messages = stripOldAnchorMessages(mapping.messages);
         const coveredIds = collectCoveredMessageIds(cached.kernelState);
         const tokenEstimate = estimateProjectionTokens(mapping.messages, coveredIds);
-        const hostTokens = chatId ? await getHostUsageAdapter().getCurrentContextTokens(String(chatId)) : void 0;
-        const kernelTokenCount = hostTokens ?? tokenEstimate;
+        const kernelTokenCount = tokenEstimate;
         const turn = core.processTurn({
           messages: mapping.messages,
           state: cached.kernelState,

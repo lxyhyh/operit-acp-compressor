@@ -59,6 +59,7 @@ import { createUsageManager, type UsageManager, type UsageManagerState } from ".
 import type { TokenSnapshot } from "./token-source";
 import { createOperitHostUsageAdapter, type HostUsageAdapter } from "./host-usage-adapter";
 import { detectProtocol, normalizeUsage, type ProviderUsage } from "./token-source";
+import type { FoldRange } from "./llm-fold";
 import {
   buildNudgeCarrier,
   createNudgeDelivery,
@@ -230,6 +231,10 @@ export interface AcpEngine {
   search(sessionKey: string, query: string): Promise<unknown[]>;
   status(sessionKey: string, messages: PromptTurnLike[]): Promise<{ report: string; state: CompressionState }>;
   loadState(sessionKey: string): Promise<OperitAcpSessionState>;
+  /** V0.8-P6.2：fold 范围选择（dispatch 前冻结，确定性，与 emergency 段选择同构）。 */
+  foldSelectRange(sessionKey: string, turns: PromptTurnLike[]): Promise<{ ok: boolean; range?: FoldRange; reason?: string }>;
+  /** V0.8-P6.2：fold apply 前的上下文重查数据源（当前持久化状态 + 当前 raw turns）。 */
+  getFoldApplyContext(sessionKey: string): Promise<{ stateVersion: number; kernelState: CompressionState; rawTurns: PromptTurnLike[] }>;
   core: CompressionCore;
   settings: AdapterSettings;
 }
@@ -1416,6 +1421,76 @@ export function createEngine(dataDir?: string): AcpEngine {
 
     async loadState(sessionKey) {
       return persistence.load(sessionKey);
+    },
+
+    // —— V0.8-P6.2：LLM Fold 范围选择（dispatch 前冻结；与 emergency 段选择同构）。
+    async foldSelectRange(sessionKey, turns) {
+      try {
+        const loaded = await persistence.load(sessionKey);
+        const state = loaded.kernelState;
+        const mapping = mapTurnsWithIdentity(turns);
+        const messages = mapping.messages;
+        const byRaw = state.messageRefs?.byRaw ?? {};
+        // 与 project() emergency 段选择完全同构：保护区 = 最近 8 条。
+        const PROTECTED = 8;
+        if (messages.length <= PROTECTED) {
+          return { ok: false, reason: "history-too-short" };
+        }
+        const covered = collectCoveredMessageIds(state);
+        const recentIds = new Set(messages.slice(-PROTECTED).map((m) => m.id));
+        let startIdx = -1;
+        for (let i = 0; i < messages.length - PROTECTED; i++) {
+          const m = messages[i];
+          if (covered.has(m.id) || recentIds.has(m.id)) continue;
+          if (startIdx < 0) startIdx = i;
+        }
+        if (startIdx >= 0) {
+          // 段终点：保护区之前最后一条未覆盖消息。
+          let endIdx = startIdx;
+          for (let i = startIdx; i < messages.length - PROTECTED; i++) {
+            const m = messages[i];
+            if (!covered.has(m.id) && !recentIds.has(m.id)) endIdx = i;
+          }
+          const seg = messages.slice(startIdx, endIdx + 1);
+          const chars = seg.reduce((n, m) => n + (m.text ? m.text.length : 0), 0);
+          if (chars < settings.minCompressRange) {
+            return { ok: false, reason: "range-below-min-chars" };
+          }
+          const startRef = Object.entries(byRaw).find(([, v]) => v === seg[0].id)?.[0];
+          const endRef = Object.entries(byRaw).find(([, v]) => v === seg[seg.length - 1].id)?.[0];
+          if (!startRef || !endRef) {
+            return { ok: false, reason: "refs-not-found" };
+          }
+          const range: FoldRange = {
+            startRef,
+            endRef,
+            startId: seg[0].id,
+            endId: seg[seg.length - 1].id,
+            ids: seg.map((m) => m.id),
+            chars,
+            seg: seg.map((m) => ({ id: m.id, role: String(m.role), contentType: String(m.contentType), text: String(m.text ?? "") })),
+          };
+          return { ok: true, range };
+        }
+        return { ok: false, reason: "no-uncovered-head" };
+      } catch (e) {
+        try { console.log(`[acp] foldSelectRange failed: ${String(e)}`); } catch { /* noop */ }
+        return { ok: false, reason: "select-error" };
+      }
+    },
+
+    // —— V0.8-P6.2：apply 前状态重查数据源（当前持久化状态 + 当前 raw turns）。
+    async getFoldApplyContext(sessionKey) {
+      const loaded = await persistence.load(sessionKey);
+      const rawTurns =
+        (rawTurnsCache.get(sessionKey) as PromptTurnLike[] | undefined) ??
+        (loaded.lastRawTurns as PromptTurnLike[] | undefined) ??
+        (await persistence.loadRawTurns(sessionKey) as unknown as PromptTurnLike[]);
+      return {
+        stateVersion: loaded.hostMetadata.stateVersion ?? 0,
+        kernelState: loaded.kernelState,
+        rawTurns: Array.isArray(rawTurns) ? rawTurns : [],
+      };
     },
   };
 }

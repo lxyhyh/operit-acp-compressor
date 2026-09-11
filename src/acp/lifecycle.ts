@@ -19,6 +19,7 @@ import { appendAcpSystemPrompt } from "./system-prompt";
 import { loadAdapterSettings } from "./config";
 import { LOG_ACP_FILE, LOG_TOOLS_VISIBILITY_FILE } from "./paths";
 import { deliveryTraceLine, findNudgeTurn, markFinalCheck, type NudgeDelivery } from "./nudge-delivery";
+import { createFoldJob, newFoldJobId, releaseFoldSlot, runFoldJob, tryAcquireFoldSlot } from "./llm-fold";
 
 /** trace 写入器（lazy require；与 trace.ts 的 chatTrace 同构，失败不影响主流程）。 */
 function requireTraceWriter(): ((line: string) => void) | undefined {
@@ -162,81 +163,88 @@ export async function onFinalize(event: FinalizeHookEvent): Promise<PromptHookOb
   if (projectedFull === undefined) return;
   const projected = (projectedFull.preparedHistory ?? turns) as PromptTurn[];
 
-  // —— V0.8-P6.1 实验 A/D/E：LLM emergency fold（llmEmergencyFold=true 且 forced 且超目标时触发一次）。
+  // —— V0.8-P6.2：LLM Fold Job（压缩事务语义）。
+  //   P6.1d 病灶：fire-and-forget 回包后 status() 重选 ranges[0]，summary 输入
+  //   （slice 伪输入）与 apply 范围未绑定。P6.2 起改为 Compression Job Snapshot：
+  //   ①dispatch 前冻结 range（foldSelectRange，与 emergency 段选择同构）；
+  //   ②prompt 输入 = range 覆盖的真实 turns；
+  //   ③回包后 apply-check（stateVersion / identity / coverage）通过才允许用
+  //   snapshot range 落块，冲突一律 discard（禁止回包后重选 range）。
+  //   单 session 单并发（foldInFlight），保留 rawInput marker 防压缩回声。
   if (engine.settings.llmEmergencyFold && stage === "before_finalize_prompt") {
     try {
       const g6b = globalThis as Record<string, unknown>;
       const foldState = (g6b.__acpLlmFoldState ??= { running: false, lastAt: 0 }) as { running: boolean; lastAt: number };
-      const p6c = projectedFull as unknown as { pressure?: { level?: string; effectiveTokens?: number; usagePct?: number } };
+      const p6c = projectedFull as unknown as { pressure?: { level?: string; effectiveTokens?: number } };
       const level = p6c?.pressure?.level;
       const effTok = p6c?.pressure?.effectiveTokens ?? 0;
       // gentle 目标 = 70% × modelContextLimit（与 pressure.ts gentle 档一致）。
       const targetTok = Math.round((engine.settings.modelContextLimit || 200000) * 0.7);
       const overTarget = effTok > targetTok;
-      // 冷却 120s：防止实验期连环触发（实验期安全网）。
+      // 冷却 120s：防止实验期连环触发。
       const cooled = Date.now() - foldState.lastAt > 120_000;
       if (level === "forced" && overTarget && !foldState.running && cooled) {
-        foldState.running = true;
-        foldState.lastAt = Date.now();
-        inFlightMap.set(sessionKey, true);
         const t0 = Date.now();
         diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-begin] chat=${(ctx.chatId ?? "none").slice(0, 8)} eff=${effTok} target=${targetTok} t0=${t0}`);
-        try {
-          const toolsNs = (globalThis as Record<string, unknown>).Tools as Record<string, unknown> | undefined;
-          const Chat6 = toolsNs?.Chat as { sendMessage?: (...a: unknown[]) => Promise<Record<string, unknown>> } | undefined;
-          if (Chat6 && typeof Chat6.sendMessage === "function") {
-            // V0.8-P6.1d.1：fire-and-forget——不在 hook 内等待 LLM 回包。
-            //   实测（09-11 15:43 chat=6f88d3fa）：hook 内 await + timeout_ms=4000，
-            //   宿主首包延迟 ~5s 必超时（[lfold-err] Timeout waiting for AI reply），
-            //   且宿主 hook 总预算 ~10s 也不允许 hook 内长等。
-            //   → 本回合 hook 立即返回投影结果；fold 回包后台落块，下一回合受益。
-            const prompt = `[ACP-LFOLD] 请把以下对话历史压缩为一段不超过 2000 字的中文摘要，保留关键决策、结论、数据与未完成任务。直接输出摘要正文。\n\n[ACP 压缩请求] ${turns.slice(0, 40).map((t) => `${t.kind}:${String(t.content).slice(0, 80)}`).join("\n")}`;
-            const sendPromise = Chat6.sendMessage(prompt, ctx.chatId, undefined, undefined, {
-              persist_turn: false, hide_user_message: true, notify_reply: false, disable_warning: true, timeout_ms: 30000,
-            });
-            diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-dispatch] chat=${(ctx.chatId ?? "none").slice(0, 8)} promptLen=${prompt.length} mode=fire-and-forget`);
-            void sendPromise
-              .then(async (reply) => {
-                const text = String(reply?.text ?? reply?.response ?? reply?.message ?? (reply?.result as Record<string, unknown> | undefined)?.text ?? "");
-                const t1 = Date.now();
-                diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-llm] chat=${(ctx.chatId ?? "none").slice(0, 8)} ok=1 ms=${t1 - t0} textLen=${text.length} head=${text.slice(0, 60).replace(/\n/g, " ")}`);
-                if (text.length >= 200) {
-                  // 实验 E：拿 LLM 文本走 applyCompression（最早未覆盖段建真 block）。
-                  const e6 = engine as unknown as { applyCompression: (sk: string, ranges: Array<{ startRef: string; endRef: string; summary: string; topic?: string }>, turns: unknown[], chatId?: string) => Promise<unknown> };
-                  // 范围：用 kernel 状态里最早的未覆盖段（复用 engine 内部 range 选择太重，实验期直接取第一段）。
-                  const st = await (engine as unknown as { status?: (sk: string) => Promise<unknown> }).status?.(sessionKey!).catch(() => undefined);
-                  const ranges = (st as { compressibleRanges?: Array<{ startId: string; endId: string }> } | undefined)?.compressibleRanges ?? [];
-                  if (ranges.length > 0) {
-                    const r0 = ranges[0];
-                    const ac = await e6.applyCompression(sessionKey, [{ startRef: r0.startId, endRef: r0.endId, summary: text, topic: "V0.8-P6.1 llm-fold" }], turns, ctx.chatId);
-                    diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-apply] chat=${(ctx.chatId ?? "none").slice(0, 8)} ms=${Date.now() - t1} result=${JSON.stringify(ac).slice(0, 200)}`);
-                  } else {
-                    diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-apply] skip: no compressible ranges`);
-                  }
-                } else {
-                  diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-llm] text too short (${text.length}), skip apply`);
-                }
-              })
-              .catch((e6: unknown) => {
-                diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-err] chat=${(ctx.chatId ?? "none").slice(0, 8)} ms=${Date.now() - t0} err=${String(e6).slice(0, 160)}`);
-              })
-              .finally(() => {
-                foldState.running = false;
-                inFlightMap.set(sessionKey, false);
-                diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-end] chat=${(ctx.chatId ?? "none").slice(0, 8)} totalMs=${Date.now() - t0} mode=async`);
-              });
+        // —— ①冻结范围（在发起 LLM 之前；禁止回包后重新选择）。
+        const sel = await engine.foldSelectRange(sessionKey!, turns);
+        if (!sel.ok || !sel.range) {
+          foldState.lastAt = Date.now();
+          diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-discard] chat=${(ctx.chatId ?? "none").slice(0, 8)} phase=select reason=${sel.reason ?? "unknown"}`);
+        } else {
+          const jobId = newFoldJobId();
+          if (!tryAcquireFoldSlot(sessionKey!, jobId)) {
+            diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-discard] chat=${(ctx.chatId ?? "none").slice(0, 8)} phase=slot reason=job-in-flight`);
           } else {
-            diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-llm] Chat.sendMessage unavailable (Tools.Chat missing)`);
-            foldState.running = false;
-            inFlightMap.set(sessionKey, false);
+            // —— ②构造 job snapshot（prompt 输入 = range 真实 turns）。
+            const job = createFoldJob({
+              jobId,
+              sessionKey: sessionKey!,
+              chatId: ctx.chatId,
+              stateVersion: (projectedFull as unknown as { state?: { hostMetadata?: { stateVersion?: number } } } | undefined)?.state?.hostMetadata?.stateVersion ?? 0,
+              range: sel.range,
+            });
+            diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-snapshot] job=${job.jobId} chat=${(ctx.chatId ?? "none").slice(0, 8)} stateVersion=${job.stateVersion} start=${job.startRef} end=${job.endRef} inputIds=${job.inputTurnIds.length} chars=${job.inputChars} promptLen=${job.prompt.length}`);
+            foldState.running = true;
+            foldState.lastAt = Date.now();
+            inFlightMap.set(sessionKey!, true);
+            // —— ③fire-and-forget dispatch（hook 立即返回投影，回包后台落块）。
+            const toolsNs = (globalThis as Record<string, unknown>).Tools as Record<string, unknown> | undefined;
+            const Chat6 = toolsNs?.Chat as { sendMessage?: (...a: unknown[]) => Promise<Record<string, unknown>> } | undefined;
+            if (Chat6 && typeof Chat6.sendMessage === "function") {
+              const sendPromise = Chat6.sendMessage(job.prompt, ctx.chatId, undefined, undefined, {
+                persist_turn: false, hide_user_message: true, notify_reply: false, disable_warning: true, timeout_ms: 30000,
+              });
+              diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-dispatch] job=${job.jobId} chat=${(ctx.chatId ?? "none").slice(0, 8)} promptLen=${job.prompt.length} mode=fire-and-forget`);
+              void sendPromise
+                .then((reply) => runFoldJob(job, {
+                  sendLLM: async () => reply,
+                  getFoldApplyContext: (sk) => engine.getFoldApplyContext(sk),
+                  applyCompression: (sk, ranges, t, cid) => (engine as unknown as { applyCompression: (a: string, b: unknown, c: unknown, d?: string) => Promise<{ blocksCreated: number; tokensCompressed: number; errors: string[]; warnings: string[] }> }).applyCompression(sk, ranges, t, cid),
+                  log: (line) => diagLog(LOG_TOOLS_VISIBILITY_FILE, line),
+                  onDone: (r) => {
+                    foldState.running = false;
+                    inFlightMap.set(sessionKey!, false);
+                    releaseFoldSlot(sessionKey!, job.jobId);
+                    diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-end] job=${job.jobId} chat=${(ctx.chatId ?? "none").slice(0, 8)} totalMs=${Date.now() - t0} ok=${r.ok ? 1 : 0} reason=${r.reason ?? "-"} blocks=${r.blocksCreated ?? 0} tokens=${r.tokensCompressed ?? 0}`);
+                  },
+                }))
+                .catch((e6: unknown) => {
+                  foldState.running = false;
+                  inFlightMap.set(sessionKey!, false);
+                  releaseFoldSlot(sessionKey!, job.jobId);
+                  diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-err] job=${job.jobId} chat=${(ctx.chatId ?? "none").slice(0, 8)} ms=${Date.now() - t0} err=${String(e6).slice(0, 160)}`);
+                });
+            } else {
+              diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-err] job=${job.jobId} chat=${(ctx.chatId ?? "none").slice(0, 8)} err=Chat-unavailable`);
+              foldState.running = false;
+              inFlightMap.set(sessionKey!, false);
+              releaseFoldSlot(sessionKey!, job.jobId);
+            }
           }
-        } catch (e6) {
-          diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-err] chat=${(ctx.chatId ?? "none").slice(0, 8)} ms=${Date.now() - t0} err=${String(e6).slice(0, 160)}`);
-          foldState.running = false;
-          inFlightMap.set(sessionKey, false);
         }
       }
-    } catch { /* 实验段整体失败不影响主流程 */ }
+    } catch { /* fold 段整体失败不影响主流程 */ }
   }
   // finalize 返回：preparedHistory 投影 + systemPrompt 追加 ACP 指南。
   // （SystemPromptComposeHook 返回值宿主不采纳——19:49 实测 after 阶段 len 未变，

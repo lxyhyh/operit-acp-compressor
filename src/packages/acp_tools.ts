@@ -92,6 +92,7 @@
 
 import { createEngine } from "../acp/adapter";
 import { buildSessionKey } from "../acp/session";
+import { markCompressReceived, markTaskEndFoldApplied, getTaskEndFoldState } from "../acp/task-end-fold";
 import type { AcpEngine } from "../acp/adapter";
 
 // 共享 engine 实例（模块级，subpackage 只加载一次）。
@@ -211,10 +212,19 @@ export async function compress(params: {
     if (ranges.length === 0) {
       return { success: false, message: "content 为空：至少需要一个 { startId, endId, summary } 范围。" };
     }
+    // —— V0.8-P7：模型主动 compress 捕获（task-end fold 证据链）。
+    try {
+      const sk0 = sessionKey;
+      if (getTaskEndFoldState(sk0)?.phase === "delivered") markCompressReceived(sk0);
+    } catch { /* 状态机失败不影响压缩 */ }
     const turns = Array.isArray(params.messages) ? params.messages : [];
     // V0.7.2：显式传递 chatId（禁止在 engine 内用 sessionKey.split 推导）。
     const chatId = injectedChatId(params as Record<string, unknown>) || params.chatId || "";
     const result = await e.applyCompression(sessionKey, ranges, turns as never, chatId || undefined);
+    // —— V0.8-P7：落块成功 → task-end fold 终态（Test2 完成链最后一环）。
+    if ((result?.blocksCreated ?? 0) > 0) {
+      try { markTaskEndFoldApplied(sessionKey); } catch { /* noop */ }
+    }
     const savedTokens = result.tokensCompressed || 0;
     const blocks = result.blocksCreated || 0;
     return {

@@ -5287,6 +5287,72 @@ ${lines.join("\n")}${active.length > 3 ? `
     },
     async loadState(sessionKey) {
       return persistence.load(sessionKey);
+    },
+    // —— V0.8-P6.2：LLM Fold 范围选择（dispatch 前冻结；与 emergency 段选择同构）。
+    async foldSelectRange(sessionKey, turns) {
+      try {
+        const loaded = await persistence.load(sessionKey);
+        const state = loaded.kernelState;
+        const mapping = mapTurnsWithIdentity(turns);
+        const messages = mapping.messages;
+        const byRaw = state.messageRefs?.byRaw ?? {};
+        const PROTECTED = 8;
+        if (messages.length <= PROTECTED) {
+          return { ok: false, reason: "history-too-short" };
+        }
+        const covered = collectCoveredMessageIds(state);
+        const recentIds = new Set(messages.slice(-PROTECTED).map((m) => m.id));
+        let startIdx = -1;
+        for (let i = 0; i < messages.length - PROTECTED; i++) {
+          const m = messages[i];
+          if (covered.has(m.id) || recentIds.has(m.id)) continue;
+          if (startIdx < 0) startIdx = i;
+        }
+        if (startIdx >= 0) {
+          let endIdx = startIdx;
+          for (let i = startIdx; i < messages.length - PROTECTED; i++) {
+            const m = messages[i];
+            if (!covered.has(m.id) && !recentIds.has(m.id)) endIdx = i;
+          }
+          const seg = messages.slice(startIdx, endIdx + 1);
+          const chars = seg.reduce((n, m) => n + (m.text ? m.text.length : 0), 0);
+          if (chars < settings.minCompressRange) {
+            return { ok: false, reason: "range-below-min-chars" };
+          }
+          const startRef = Object.entries(byRaw).find(([, v]) => v === seg[0].id)?.[0];
+          const endRef = Object.entries(byRaw).find(([, v]) => v === seg[seg.length - 1].id)?.[0];
+          if (!startRef || !endRef) {
+            return { ok: false, reason: "refs-not-found" };
+          }
+          const range = {
+            startRef,
+            endRef,
+            startId: seg[0].id,
+            endId: seg[seg.length - 1].id,
+            ids: seg.map((m) => m.id),
+            chars,
+            seg: seg.map((m) => ({ id: m.id, role: String(m.role), contentType: String(m.contentType), text: String(m.text ?? "") }))
+          };
+          return { ok: true, range };
+        }
+        return { ok: false, reason: "no-uncovered-head" };
+      } catch (e) {
+        try {
+          console.log(`[acp] foldSelectRange failed: ${String(e)}`);
+        } catch {
+        }
+        return { ok: false, reason: "select-error" };
+      }
+    },
+    // —— V0.8-P6.2：apply 前状态重查数据源（当前持久化状态 + 当前 raw turns）。
+    async getFoldApplyContext(sessionKey) {
+      const loaded = await persistence.load(sessionKey);
+      const rawTurns = rawTurnsCache.get(sessionKey) ?? loaded.lastRawTurns ?? await persistence.loadRawTurns(sessionKey);
+      return {
+        stateVersion: loaded.hostMetadata.stateVersion ?? 0,
+        kernelState: loaded.kernelState,
+        rawTurns: Array.isArray(rawTurns) ? rawTurns : []
+      };
     }
   };
 }
@@ -5335,6 +5401,48 @@ function buildSessionKey(ctx) {
     return `${chatId}|sub|${safe(ctx.functionType)}|${safe(ctx.promptFunctionType)}`;
   }
   return chatId;
+}
+
+// src/acp/task-end-fold.ts
+var PENDING_TTL_MS = 10 * 60 * 1e3;
+function store() {
+  const g = globalThis;
+  if (!g.__acpTaskEndFoldStore) {
+    g.__acpTaskEndFoldStore = { states: /* @__PURE__ */ new Map() };
+  }
+  return g.__acpTaskEndFoldStore;
+}
+function log(sessionKey, line) {
+  try {
+    Tools.Files.write(
+      LOG_TOOLS_VISIBILITY_FILE,
+      `${(/* @__PURE__ */ new Date()).toISOString()} [task-end-fold] ${line} sk=${sessionKey.slice(0, 12)}
+`,
+      true,
+      "android"
+    );
+  } catch {
+  }
+}
+function markCompressReceived(sessionKey) {
+  const st = store().states.get(sessionKey);
+  if (st && st.phase === "delivered") {
+    st.compressReceived = true;
+    log(sessionKey, `compress received identity=${st.turnIdentity}`);
+  }
+}
+function markTaskEndFoldApplied(sessionKey) {
+  const s = store();
+  const st = s.states.get(sessionKey);
+  if (st) {
+    st.applied = true;
+    st.phase = "applied";
+    log(sessionKey, `applied identity=${st.turnIdentity}`);
+    s.states.delete(sessionKey);
+  }
+}
+function getTaskEndFoldState(sessionKey) {
+  return store().states.get(sessionKey);
 }
 
 // src/packages/acp_tools.ts
@@ -5389,9 +5497,20 @@ async function compress(params) {
     if (ranges.length === 0) {
       return { success: false, message: "content \u4E3A\u7A7A\uFF1A\u81F3\u5C11\u9700\u8981\u4E00\u4E2A { startId, endId, summary } \u8303\u56F4\u3002" };
     }
+    try {
+      const sk0 = sessionKey;
+      if (getTaskEndFoldState(sk0)?.phase === "delivered") markCompressReceived(sk0);
+    } catch {
+    }
     const turns = Array.isArray(params.messages) ? params.messages : [];
     const chatId = injectedChatId(params) || params.chatId || "";
     const result = await e.applyCompression(sessionKey, ranges, turns, chatId || void 0);
+    if ((result?.blocksCreated ?? 0) > 0) {
+      try {
+        markTaskEndFoldApplied(sessionKey);
+      } catch {
+      }
+    }
     const savedTokens = result.tokensCompressed || 0;
     const blocks = result.blocksCreated || 0;
     return {

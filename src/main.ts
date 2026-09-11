@@ -21,6 +21,7 @@ import { installIntlSegmenter } from "./shims/segmenter-shim";
 installIntlSegmenter();
 
 import { onFinalize, onEstimateFinalize, onEstimateHistory, onSystemPromptCompose, onToolLifecycle } from "./acp/lifecycle";
+import { onChatRuntimeEvent } from "./acp/task-end-hook";
 import { loadConfig, saveConfig, DEFAULT_CONFIG, type AcpConfig } from "./config";
 
 // IPC 通道必须在 main 脚本【模块顶层】注册（guide 3.2.5 示例），
@@ -145,10 +146,27 @@ export function registerAcpHooks(): void {
     } catch (e) {
         try { console.log(`[acp] registerSystemPromptComposeHook error: ${String(e)}`); } catch { /* noop */ }
     }
+    // —— V0.8-P7：任务结束信号 hook（state_changed, state=completed）。
+    //   宿主在整轮流式响应+工具循环+消息落库后经 dispatchAsync（独立协程）派发，
+    //   不阻塞主链、不打断任何 LLM stream。completed 时刻仅评估压力并置 pending，
+    //   绝不 dispatch 新请求、不生成摘要（docs/p7-audit.md 阶段3 方案B）。
+    try {
+        if (typeof (ToolPkg as unknown as Record<string, unknown>).registerChatRuntimeHook === "function") {
+            (ToolPkg as never as { registerChatRuntimeHook: (d: unknown) => void }).registerChatRuntimeHook({
+                id: "acp.task_end_fold",
+                function: onChatRuntimeEvent as never,
+            });
+            try { console.log("[acp] registerChatRuntimeHook OK: acp.task_end_fold"); } catch { /* noop */ }
+        } else {
+            try { console.log("[acp] registerChatRuntimeHook unavailable（宿主 API < 1.0.1），P7 状态机待机"); } catch { /* noop */ }
+        }
+    } catch (e) {
+        try { console.log(`[acp] registerChatRuntimeHook error: ${String(e)}`); } catch { /* noop */ }
+    }
 }
 
 // 宿主要求注册的 handler 函数本身也是「模块导出」。
-export { onFinalize, onEstimateFinalize, onEstimateHistory, onSystemPromptCompose, onToolLifecycle };
+export { onFinalize, onEstimateFinalize, onEstimateHistory, onSystemPromptCompose, onToolLifecycle, onChatRuntimeEvent };
 
 // UI 设置页：独立文件随包分发（dist/ui/settings/index.ui.js）。
 export function registerToolboxUi(): void {

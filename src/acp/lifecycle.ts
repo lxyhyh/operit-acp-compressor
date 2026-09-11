@@ -20,6 +20,7 @@ import { loadAdapterSettings } from "./config";
 import { LOG_ACP_FILE, LOG_TOOLS_VISIBILITY_FILE } from "./paths";
 import { deliveryTraceLine, findNudgeTurn, markFinalCheck, type NudgeDelivery } from "./nudge-delivery";
 import { createFoldJob, newFoldJobId, releaseFoldSlot, runFoldJob, tryAcquireFoldSlot } from "./llm-fold";
+import { consumePendingTaskEndFold } from "./task-end-fold";
 
 /** trace 写入器（lazy require；与 trace.ts 的 chatTrace 同构，失败不影响主流程）。 */
 function requireTraceWriter(): ((line: string) => void) | undefined {
@@ -250,6 +251,22 @@ export async function onFinalize(event: FinalizeHookEvent): Promise<PromptHookOb
   // （SystemPromptComposeHook 返回值宿主不采纳——19:49 实测 after 阶段 len 未变，
   //  而 PromptFinalizeHookReturn 支持 systemPrompt 字段，改由此通道注入。）
   const result: PromptHookObjectResult = { preparedHistory: projected as PromptTurn[] };
+  // —— V0.8-P7：task-end fold 一次性指令注入（方案B：completed 时置 pending，
+  //   下一次正常请求 finalize 注入 SYSTEM 指令 → 模型响应开头主动 acp_tools:compress）。
+  if (stage === "before_finalize_prompt" && !isCompressionTurn) {
+    try {
+      const te = consumePendingTaskEndFold(sessionKey, rawInputStr || undefined);
+      if (te.instruction) {
+        result.preparedHistory = [
+          ...(projected as PromptTurn[]),
+          { kind: "SYSTEM", content: te.instruction } as PromptTurn,
+        ];
+        diagLog(LOG_TOOLS_VISIBILITY_FILE, `[task-end-fold] injected SYSTEM instruction len=${te.instruction.length} chat=${(ctx.chatId ?? "none").slice(0, 8)}`);
+      }
+    } catch (e7) {
+      diagLog(LOG_TOOLS_VISIBILITY_FILE, `[task-end-fold] inject failed: ${String(e7).slice(0, 120)}`);
+    }
+  }
   const sp = typeof payload.systemPrompt === "string" ? payload.systemPrompt : undefined;
   if (sp && sp.length > 0) {
     const next = appendAcpSystemPrompt(sp);

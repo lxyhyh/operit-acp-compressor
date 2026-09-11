@@ -2,6 +2,7 @@
   "schema_version": 1,
   "toolpkg_id": "com.operit.acp_compressor",
   "version": "0.3.0",
+  "api_version": "1.0.1",
   "author": ["Operit ACP Team"],
   "main": "dist/main.js",
   "display_name": {

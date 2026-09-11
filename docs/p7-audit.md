@@ -50,3 +50,15 @@
 
 - completed 事件载荷无 history → 压力评估用持久化 state 的 lastEstimate/usage 快照
 - 模型收到指令但拒绝执行 → pending 过期，无假块（Test4）
+
+## 宿主版本依赖（2026-09-12 补充，实机排查结论）
+
+**`registerChatRuntimeHook`（ToolPkg API 1.0.1）尚未进入任何正式发布版本。**
+
+实机验证（2026-09-12 02:30-02:35）：
+- 本机安装 Operit **1.12.1+5（versionCode 48）= 官方最新正式版 v1.12.1**（GitHub release 2026-08-08 发布）
+- 对安装 APK 全量 strings 检索：`registerChatRuntimeHook`、`ChatRuntimeHookRegistry`、`ToolPkgChatRuntimeHookBridge` 均为 **0 次命中** → 该 API 在正式版中不存在
+- GitHub 对照：
+  - `v1.12.1` tag：`examples/types/toolpkg.d.ts` 无 `registerChatRuntimeHook`（0）；`ChatRuntimeHookRegistry.kt`/`ToolPkgChatRuntimeHookBridge.kt` 均 404（不存在）
+  - `main` 分支（最新提交 2026-09-10，审计基线 b2c76100）：API 与实现类齐全 → 本审计基于 main 分支正确，但**该代码尚未发布**
+- 结论：P7 机制依赖宿主发布含 ToolPkg API 1.0.1 的版本（预计 v1.13.0+）。在宿主升级前，插件侧守卫会正确走「API 不可用 → 状态机待机」分支，不产生任何副作用；升级后需重新实机验证 Test1-6。

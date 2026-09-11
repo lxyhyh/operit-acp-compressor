@@ -1514,7 +1514,7 @@ function buildNudgeTextFromReason(reason: string, level: NudgeLevel): string {
   } else {
     lines.push("[ACP] 上下文已接近硬上限，请立即通过 package_proxy 调用 acp_tools:compress 压缩最旧、已消费的内容。若本提示持续出现，压缩是继续任务的前提，不要忽略。");
   }
-  lines.push("调用格式：package_proxy({\"tool_name\":\"acp_tools:acp_status\",\"params\":{}})；package_proxy({\"tool_name\":\"acp_tools:compress\",\"params\":{\"content\":[{\"startId\":\"m00001\",\"endId\":\"m00050\",\"summary\":\"...\"}]}})。tool_name 恰好一个「包名:工具名」，params 必须是合法 JSON 对象。");
+  lines.push("调用格式（package_proxy 顶层恰好两个参数：tool_name 为一个字符串，params 为一个合法 JSON 对象；tool_name 绝不能放在 params 里）：package_proxy({\"tool_name\":\"acp_tools:acp_status\",\"params\":{}})；package_proxy({\"tool_name\":\"acp_tools:compress\",\"params\":{\"content\":[{\"startId\":\"m00001\",\"endId\":\"m00050\",\"summary\":\"...\"}]}})。");
   if (reason) lines.push(`（pressure: ${reason}）`);
   return lines.join("\n");
 }
@@ -1530,8 +1530,9 @@ function buildNudgeText(nudge: { reason: string; compressibleRanges: { startRef:
   } else {
     lines.push("[ACP] 上下文已接近硬上限，请立即通过 package_proxy 调用 acp_tools:compress 压缩最旧、已消费的内容。若本提示持续出现，压缩是继续任务的前提，不要忽略。");
   }
-  // 精确调用格式（模型照抄；tool_name 恰好一个「包名:工具名」字符串，params 必须为合法 JSON 对象）。
-  lines.push("调用格式（package_proxy 两个参数，tool_name 恰好一个字符串，params 必须是合法 JSON 对象，不可为空串/数组/全角字符）：");
+  // 精确调用格式（模型照抄；package_proxy 顶层恰好两个参数：tool_name 字符串 + params JSON 对象）。
+  // 注意：tool_name 必须作为 package_proxy 的顶层参数，不能写进 params 内部，也不能混入其他工具的参数结构。
+  lines.push("调用格式（package_proxy 顶层恰好两个参数：tool_name 为一个字符串，params 为一个合法 JSON 对象；tool_name 绝不能放在 params 里）：");
   lines.push("1) 查范围：package_proxy({\"tool_name\":\"acp_tools:acp_status\",\"params\":{}})；");
   lines.push("2) 压缩：package_proxy({\"tool_name\":\"acp_tools:compress\",\"params\":{\"content\":[{\"startId\":\"m00001\",\"endId\":\"m00050\",\"summary\":\"...\"}]}})；");
   lines.push("3) 吸收单条巨型输出：package_proxy({\"tool_name\":\"acp_tools:absorb\",\"params\":{\"ref\":\"m00042\",\"summary\":\"...\"}})。");

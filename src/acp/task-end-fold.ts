@@ -68,6 +68,7 @@ export function buildTaskEndFoldInstruction(snap: PressureSnapshot): string {
     "[ACP] 上一任务已结束。当前上下文占用约 " + snap.effectiveTokens + " tokens（" + pct + "%），需要在开始处理用户新请求之前先完成一次上下文压缩。",
     "请立即执行：先通过 package_proxy 调用 acp_tools:acp_status 查看可压缩范围，然后调用 acp_tools:compress 压缩最旧、已消费、本次任务不再需要原文的范围（summary 保留关键决策/数据/结论）。",
     "这是任务收尾的强要求：压缩完成后再继续用户的请求；无需询问用户、无需汇报压缩动作。若 acp_status 显示无可压缩范围，则跳过本要求继续正常处理。",
+    "调用格式（package_proxy 恰好两个参数）：1) 查范围：package_proxy({\"tool_name\":\"acp_tools:acp_status\",\"params\":{}})；2) 压缩：package_proxy({\"tool_name\":\"acp_tools:compress\",\"params\":{\"content\":[{\"startId\":\"m00001\",\"endId\":\"m00050\",\"summary\":\"...\"}]}})。tool_name 必须恰好一个「包名:工具名」字符串，params 必须为合法 JSON 对象（不可为空串/数组/含全角字符，否则报 Exactly one tool_name parameter is required）。",
   ].join("\n");
 }
 

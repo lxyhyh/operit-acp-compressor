@@ -1,7 +1,7 @@
 /**
  * acp/task-end-hook.ts — V0.8-P7 ChatRuntimeHook 桥。
  *
- * 宿主链路（docs/p7-audit.md）：
+ * 宿主链路（docs/archive/p7-audit.md）：
  * MessageProcessingDelegate(整轮完成) → ChatRuntimeHolder.observeRuntimeHooks
  * → ChatRuntimeHookRegistry.dispatchAsync（独立协程，不阻塞主链）
  * → ToolPkgChatRuntimeHookBridge → 本插件 onChatRuntimeEvent。

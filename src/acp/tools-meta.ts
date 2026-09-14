@@ -7,12 +7,12 @@
  * 纯数据 + 零依赖（不 import Tools/环境），便于测试与跨 runtime 复用。
  *
  * V0.7.13-P2：不再注入 availableTools（无 ToolPromptComposeHook 注册）。
- * V0.9.3：模型侧直接调用工具面注册的 acp_tools:* 工具（宿主自动桥接，无需 package_proxy 中转），
+ * V0.9.4：模型侧直接调用工具面注册的 acp_tools:* 工具（宿主自动桥接，无需 package_proxy 中转），
  * 本文件仅作为元数据源保留（测试/审计用）。
  */
 
 export interface AcpToolMeta {
-  /** 工具名（裸名，直接作为调用名）。 */
+  /** 工具名（模型调用名，对应工具面 acp_tools:<name>）。 */
   name: string;
   /** 注入时的 categoryName（Operit 工具分组）。 */
   categoryName: string;
@@ -24,7 +24,7 @@ export interface AcpToolMeta {
   parameters: Record<string, unknown>;
 }
 
-/** 4 个注入模型主对话的核心工具。 */
+/** 5 个核心工具（compress/absorb/decompress/search_context/acp_status，供系统提示与工具面注册对齐）。 */
 export const ACP_CORE_TOOLS: readonly AcpToolMeta[] = [
   {
     name: "compress",

@@ -1022,7 +1022,7 @@ export function createEngine(dataDir?: string): AcpEngine {
           else nextStats.emergencyNudges += 1;
         }
         // —— V0.8 二阶段：Emergency 折叠重建（cap 退役为核心改动）。
-        //   取证（docs/v0.7.13-p3e 等）：V0.7.6 删除 preflight/safety-emergency 后，
+        //   取证（docs/archive/v0.7.13-p3e 等）：V0.7.6 删除 preflight/safety-emergency 后，
         //   超预算时无任何自动建块，只剩 capProjectionSize 硬截断——实测一轮请求
         //   cap 截断 58 条消息、361K→163K（-55%），cap 成为主要压缩手段，
         //   违反"cap 仅安全护栏"任务书六。

@@ -4,8 +4,8 @@
  * - onFinalize：PromptFinalizeHook。同一 send 周期（同 fingerprint）只做
  *   一次 state mutation：第一阶段投影，第二阶段复用缓存（幂等）。
  * - onSystemPromptCompose：after_compose_system_prompt 阶段幂等追加 ACP 提示
- *   （V0.7.13-P2 起提示统一指向 Operit 原生 package_proxy(tool_name="acp_tools:xxx")，
- *   不再注入裸名 ACP 工具，也不再注册 ToolPromptComposeHook）。
+ *   （V0.9.4 起提示直接调用工具面注册的 acp_tools:* 工具（宿主自动桥接），
+ *   不再注册 ToolPromptComposeHook，也不再引导 package_proxy 中转）。
  * - onEstimateFinalize：恒 no-op（不注册估算钩子——宿主主线程同步等待
  *   估算钩子返回大 JSON 会 ANR；官方示例从不注册）。
  *
@@ -295,8 +295,7 @@ export async function onFinalize(event: FinalizeHookEvent): Promise<PromptHookOb
 }
 
 /** 注入用的 ACP 工具（模块级单例）。 */
-// V0.7.13-P2：不再注入 ACP 裸工具到 availableTools。
-// 走 Operit 原生 package_proxy(tool_name="acp_tools:xxx") 契约，见 docs/v0.7.13-p1-toolprompt-contract.md。
+// V0.9.4：工具面已注册 acp_tools:*（宿主自动桥接），不再注入 ACP 裸工具到 availableTools。
 
 /**
  * SystemPromptComposeHook 处理函数（具名导出）。

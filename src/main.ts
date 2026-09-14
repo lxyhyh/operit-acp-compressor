@@ -4,8 +4,9 @@
  * 架构（方向 1，对齐 billion-context）：
  * - 不再注册 AiProvider / 直连上游（退役 provider/upstream/compress-loop 直连路径）。
  * - 注册 PromptFinalizeHook：发送前把历史投影为压缩视图（preparedHistory 整体替换）。
- * - ACP 工具不再注入 availableTools：V0.7.13-P2 改为走 Operit 原生
- *   package_proxy(tool_name="acp_tools:xxx") 契约（见 docs/v0.7.13-p1-toolprompt-contract.md）。
+ * - ACP 工具不再注入 availableTools：V0.9.4 起工具面直接注册 acp_tools:*
+ *   工具（宿主自动桥接，模型直接调用 acp_tools:xxx，无需 package_proxy 中转，
+ *   见 docs/archive/v0.7.13-p1-toolprompt-contract.md 的 V0.9.4 修订）。
  * - 注册 SystemPromptComposeHook：after 阶段幂等追加 ACP 系统提示（引导模型主动压缩）。
  * - 注册 PromptEstimateFinalizeHook / PromptEstimateHistoryHook：估算链路只读投影，
  *   使宿主"右上角上下文计数 / summary 阈值判断"基于压缩后视图（与真实发送一致）。
@@ -149,7 +150,7 @@ export function registerAcpHooks(): void {
     // —— V0.8-P7：任务结束信号 hook（state_changed, state=completed）。
     //   宿主在整轮流式响应+工具循环+消息落库后经 dispatchAsync（独立协程）派发，
     //   不阻塞主链、不打断任何 LLM stream。completed 时刻仅评估压力并置 pending，
-    //   绝不 dispatch 新请求、不生成摘要（docs/p7-audit.md 阶段3 方案B）。
+    //   绝不 dispatch 新请求、不生成摘要（docs/archive/p7-audit.md 阶段3 方案B）。
     try {
         if (typeof (ToolPkg as unknown as Record<string, unknown>).registerChatRuntimeHook === "function") {
             (ToolPkg as never as { registerChatRuntimeHook: (d: unknown) => void }).registerChatRuntimeHook({

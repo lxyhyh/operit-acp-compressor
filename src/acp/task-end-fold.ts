@@ -1,7 +1,7 @@
 /**
  * acp/task-end-fold.ts — V0.8-P7 任务结束压缩状态机。
  *
- * 设计（docs/p7-audit.md 阶段3 方案B）：
+ * 设计（docs/archive/p7-audit.md 阶段3 方案B）：
  * - `state_changed(state=completed)` = 任务真结束信号（宿主 MessageProcessingDelegate
  *   在整轮流式响应+工具循环+消息落库后置位一次；ChatRuntimeHookRegistry.dispatchAsync
  *   独立协程派发，不阻塞、不打断任何进行中的 LLM stream）。
@@ -66,9 +66,9 @@ export function buildTaskEndFoldInstruction(snap: PressureSnapshot): string {
   const pct = snap.contextLimit > 0 ? Math.round((snap.effectiveTokens / snap.contextLimit) * 100) : 0;
   return [
     "[ACP] 上一任务已结束。当前上下文占用约 " + snap.effectiveTokens + " tokens（" + pct + "%），需要在开始处理用户新请求之前先完成一次上下文压缩。",
-    "请立即执行：先通过 package_proxy 调用 acp_tools:acp_status 查看可压缩范围，然后调用 acp_tools:compress 压缩最旧、已消费、本次任务不再需要原文的范围（summary 保留关键决策/数据/结论）。",
+    "请立即执行：先调用 acp_tools:acp_status 查看可压缩范围，然后调用 acp_tools:compress 压缩最旧、已消费、本次任务不再需要原文的范围（summary 保留关键决策/数据/结论）。",
     "这是任务收尾的强要求：压缩完成后再继续用户的请求；无需询问用户、无需汇报压缩动作。若 acp_status 显示无可压缩范围，则跳过本要求继续正常处理。",
-    "调用格式（package_proxy 恰好两个参数）：1) 查范围：package_proxy({\"tool_name\":\"acp_tools:acp_status\",\"params\":{}})；2) 压缩：package_proxy({\"tool_name\":\"acp_tools:compress\",\"params\":{\"content\":[{\"startId\":\"m00001\",\"endId\":\"m00050\",\"summary\":\"...\"}]}})。tool_name 必须恰好一个「包名:工具名」字符串，params 必须为合法 JSON 对象（不可为空串/数组/含全角字符，否则报 Exactly one tool_name parameter is required）。",
+    "调用方式（直接调用 acp_tools 工具，无需 package_proxy 中转）：1) 查范围：acp_tools:acp_status；2) 压缩：acp_tools:compress，content 传 [{startId,endId,summary}]。工具已在工具面注册（宿主自动桥接），请勿使用 package_proxy 包装。",
   ].join("\n");
 }
 

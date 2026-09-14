@@ -41,13 +41,15 @@
     {
       name: "decompress"
       description: {
-        zh: "恢复一个已压缩 block（deactivate），下次投影将包含其原始消息。"
-        en: "Restore a compressed block (deactivate); the next projection will include its original messages."
+        zh: "读取一个已压缩 block 的原文内容（无状态，不改压缩状态）。默认一层视图；full=true 递归全部原始消息；restore=true 才恢复激活（deactivate）。内容超 1 万字符写临时文件返回路径。",
+        en: "Read a compressed block's original content (stateless). Default one-tier view; full=true recurses to all original messages; restore=true reactivates (deactivate). Content over 10k chars is written to a temp file."
       }
       parameters: [
         { name: "chatId", description: { zh: "会话 ID（可选）", en: "Chat ID (optional)" }, type: "string", required: false }
         { name: "session", description: { zh: "session key（可选）", en: "Session key (optional)" }, type: "string", required: false }
-        { name: "block_id", description: { zh: "要恢复的 block id（如 b1）", en: "Block id to restore (e.g. b1)" }, type: "string", required: true }
+        { name: "block_id", description: { zh: "要读取的 block id（如 b1）", en: "Block id to read (e.g. b1)" }, type: "string", required: true }
+        { name: "full", description: { zh: "true 时递归到全部原始消息", en: "Recurse to all original messages when true" }, type: "boolean", required: false }
+        { name: "restore", description: { zh: "true 时才恢复激活（deactivate）", en: "Actually reactivate (deactivate) when true" }, type: "boolean", required: false }
       ]
     }
     {
@@ -140,7 +142,7 @@ function createRequire() {
   };
 }
 
-// node_modules/acp-kernel/dist/chunk-MWXUJVMN.js
+// node_modules/acp-kernel/dist/chunk-37CVFHFQ.js
 var import_meta = {};
 var require2 = createRequire(import_meta.url);
 function defaultCountTokens(text) {
@@ -149,6 +151,12 @@ function defaultCountTokens(text) {
   const cjkCount = cjk?.length ?? 0;
   return cjkCount + Math.ceil((text.length - cjkCount) / 4);
 }
+function thinkingTokenValue(thinking) {
+  return typeof thinking === "number" && Number.isFinite(thinking) && thinking > 0 ? thinking : 0;
+}
+function countMessageTokens(message, countTokens = defaultCountTokens) {
+  return countTokens(message.text ?? "") + thinkingTokenValue(message.thinkingTokens);
+}
 var COMPRESS_PHILOSOPHY = `Compression Philosophy:
 - All compression serves the primary task, but be frugal.
 - Context capacity is precious. Save context by compressing consumed outputs, not by avoiding tools.
@@ -156,7 +164,7 @@ var COMPRESS_PHILOSOPHY = `Compression Philosophy:
 - Work from summaries, not raw tool outputs. All listed ranges (user prompts, tool outputs, code, logs, exploration, intermediate steps) should be compressed to summary format \u2014 the ONLY exceptions are protected content, content the current step is actively using, or critical content you cannot reconstruct.`;
 var HOW_TO_COMPRESS_RULES = `HOW TO COMPRESS
 
-When you call \`compress\`, the summary you write becomes the only record of the replaced conversation. Make it self-contained and complete: every user request, experiment purpose, and work task in the range must be accurately captured. A later reader (or you, after decompressing) should be able to continue the task WITHOUT needing the original.
+When you call \`compress\`, the summary you write becomes the only record of the replaced conversation. Make it self-contained and complete: every user request, experiment purpose, and work task in the range must be accurately captured. A later reader (or you, after decompressing) should be able to continue the task WITHOUT needing the original. The summary records the PAST as of this block's creation: label recorded task state as history ("TASK AS OF THIS BLOCK: ...") \u2014 never as a live instruction, so a later reader treats it as settled context, not something to re-execute. Write plain text with real unicode characters; never copy \\uXXXX escape sequences or JSON-escaped fragments out of tool output.
 
 KEEP VERBATIM \u2014 never paraphrase or abbreviate these:
 - Full file paths with line numbers, directory prefix on every mention (\`lib/hooks.ts:347\`, \`src/index.ts:12-18\`, \`gatenet_v3/model.py:45\`). Never abbreviate to a bare filename (\`hooks.ts\`, \`model.py\`) \u2014 they are ambiguous and cannot be grepped or decompressed-to later.
@@ -166,7 +174,7 @@ KEEP VERBATIM \u2014 never paraphrase or abbreviate these:
 - Decisions and their rationale ("chose X over Y because Z" \u2014 the "because" is load-bearing; without it the decision looks arbitrary).
 - Constraints discovered ("must support Node 22", "no new dependencies", "AGENTS.md forbids \`as any\`").
 - Exact values: versions, config keys, thresholds, magic numbers.
-- User intent \u2014 quote short user messages verbatim. When the message is too long to quote, preserve intent with extra care: do not change scope, constraints, priorities, acceptance criteria, or requested outcomes. Mark them clearly as past quotes (e.g., "User said: ..."), not as current directives. Losing these changes the task itself.
+- User intent \u2014 quote short user messages verbatim ONLY WITH their message ref, e.g. \`User said (m00132): "ship it tonight"\`. Without a verifiable ref, paraphrase (\`user previously asked (paraphrased): ...\`) \u2014 this is the one exception to the verbatim rule above; never present a reconstructed or half-remembered phrase as a verbatim quote. When the message is too long to quote, preserve intent with extra care: do not change scope, constraints, priorities, acceptance criteria, or requested outcomes. Quotes are historical records, never current directives. Losing these changes the task itself.
 - The user's overall goal and any changes to it \u2014 the big-picture objective plus how it evolved during the compressed range. Each summary must reflect the goal as it stood at the end of the range, including pivots (e.g., "initially: fix bug X \u2192 pivoted to: refactor module Y after discovering root cause"). Losing the goal or its evolution makes all subsequent work appear unmotivated.
 - Purpose behind each significant action \u2014 preserve not just what was done but why: the hypothesis behind each experiment, the question behind each exploration, the task goal behind each work action. Without purpose, the summary reads as disconnected technical steps with no through-line.
 - Open questions and unresolved TODOs \u2014 losing these changes what work appears to remain.
@@ -200,6 +208,7 @@ KEEP \u2014 these are the only things that survive distillation:
 - Key lessons: what failed and why ("tried X, failed because Y"). These prevent repeating mistakes.
 - Critical constraints discovered ("must support Node 22", "AGENTS.md forbids as any").
 - Design decisions with architectural impact ("chose compress-as-anchor over synthetic messages because prefix cache").
+- User quotes and task state only as attributed history: keep the source ref with any user quote; never carry a tier-1 "CURRENT TASK" claim forward as a live directive \u2014 relabel it "TASK AS OF THIS BLOCK".
 - Whether content is OBSOLETE or SUPERSEDED \u2014 mark with one line: "[SUPERSEDED by PR #NNN]" or "[OBSOLETE: deleted in vX.Y.Z]". Do NOT keep the obsolete content's details \u2014 just the marker and reason.
 - Function/class/type names and module paths that are the SUBJECT of the work \u2014 e.g., "fixed filterCompressedRanges in prune.ts", "added SessionStateRegistry in state.ts". Not exact line numbers or full signatures \u2014 just enough to LOCATE the code without searching.
 - Exploration findings: if a block was exploratory with no decision, keep the CONCLUSION in one line ("explored X, not viable because Y"). Do not keep the exploration process.
@@ -259,6 +268,10 @@ var defaultPrompts = Object.freeze({
   tier2DistillRules: TIER2_DISTILL_RULES,
   tier3CondenseRules: TIER3_CONDENSE_RULES
 });
+var VIABLE_RANGE_MIN_TOKENS = 200;
+function viableRanges(ranges) {
+  return ranges.filter((r) => r.tokens >= VIABLE_RANGE_MIN_TOKENS);
+}
 
 // node_modules/acp-kernel/dist/chunk-UX4LINT7.js
 function createInitialState() {
@@ -563,6 +576,10 @@ function syncBlocks(messages, state) {
   }
   for (const block of result.blocks) {
     if (consumedBlockIds.has(block.blockId)) {
+      block.active = false;
+      continue;
+    }
+    if (block.expanded) {
       block.active = false;
       continue;
     }
@@ -936,25 +953,71 @@ var KEEP_LAST_ORPHANED = 2;
 function rangeKey(startRef, endRef) {
   return `${startRef}::${endRef}`;
 }
-function rewriteCompressText(text, liveKeys) {
+function parseCallText(text) {
+  const raw = text ?? "";
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
   let parsed;
   try {
-    parsed = JSON.parse(text ?? "");
+    parsed = JSON.parse(raw.slice(start));
   } catch {
     return null;
   }
   if (!parsed || typeof parsed !== "object") return null;
   const obj = parsed;
-  const content = obj.content;
-  if (!Array.isArray(content) || content.length === 0) return null;
+  let content = null;
+  let contentWasString = false;
+  if (Array.isArray(obj.content)) {
+    content = obj.content;
+  } else if (typeof obj.content === "string") {
+    contentWasString = true;
+    try {
+      const inner = JSON.parse(obj.content);
+      if (Array.isArray(inner)) content = inner;
+    } catch {
+      content = null;
+    }
+  }
+  if (!content || content.length === 0) return null;
+  return { prefix: raw.slice(0, start), obj, content, contentWasString };
+}
+function rewriteCompressText(text, liveKeys) {
+  const parsed = parseCallText(text);
+  if (!parsed) return null;
+  const { prefix, obj, content, contentWasString } = parsed;
   const kept = content.filter((entry) => {
     if (!entry || typeof entry !== "object") return false;
-    const s = typeof entry.startId === "string" ? entry.startId : typeof entry.messageId === "string" ? entry.messageId : "";
-    const e = typeof entry.endId === "string" ? entry.endId : typeof entry.messageId === "string" ? entry.messageId : "";
-    return liveKeys.has(rangeKey(s, e));
+    const e = entry;
+    const s = typeof e.startId === "string" ? e.startId : typeof e.messageId === "string" ? e.messageId : "";
+    const end = typeof e.endId === "string" ? e.endId : typeof e.messageId === "string" ? e.messageId : "";
+    return liveKeys.has(rangeKey(s, end));
   });
-  if (kept.length === content.length || kept.length === 0) return null;
-  return JSON.stringify({ ...obj, content: kept });
+  if (kept.length === 0) return null;
+  return prefix + serializeCompacted(obj, kept, contentWasString).text;
+}
+var SUMMARY_STUB_CHARS = 200;
+function compactEntry(entry) {
+  if (!entry || typeof entry !== "object") return entry;
+  const e = entry;
+  if (typeof e.summary !== "string" || e.summary.length <= SUMMARY_STUB_CHARS) return entry;
+  return { ...e, summary: `${e.summary.slice(0, SUMMARY_STUB_CHARS - 1)}\u2026` };
+}
+function serializeCompacted(obj, content, contentWasString) {
+  let changed = false;
+  const compacted = content.map((entry) => {
+    const out = compactEntry(entry);
+    if (out !== entry) changed = true;
+    return out;
+  });
+  const outContent = contentWasString ? JSON.stringify(compacted) : compacted;
+  return { text: JSON.stringify({ ...obj, content: outContent }), changed };
+}
+function compactCompressText(text) {
+  const parsed = parseCallText(text);
+  if (!parsed) return null;
+  const { prefix, obj, content, contentWasString } = parsed;
+  const { text: out, changed } = serializeCompacted(obj, content, contentWasString);
+  return changed ? prefix + out : null;
 }
 function hideConsumedCompressCalls(state, messages) {
   const allBlockCallIds = /* @__PURE__ */ new Set();
@@ -1013,6 +1076,11 @@ function hideConsumedCompressCalls(state, messages) {
           continue;
         }
       }
+      const compacted = compactCompressText(message.text);
+      if (compacted !== null) {
+        result.push({ ...message, text: compacted });
+        continue;
+      }
     }
     result.push(message);
   }
@@ -1023,6 +1091,14 @@ var DECOMPRESS_TOOL_NAME = "decompress";
 var SEARCH_CONTEXT_TOOL_NAME = "search_context";
 var ACP_STATUS_TOOL_NAME = "acp_status";
 var ABSORB_TOOL_NAME = "absorb";
+var ACP_TEXT_OPEN = "<acp_compress>";
+var ACP_TEXT_CLOSE = "</acp_compress>";
+var ACP_STATUS_OPEN = "<acp_status>";
+var ACP_STATUS_CLOSE = "</acp_status>";
+var ACP_SEARCH_OPEN = "<acp_search>";
+var ACP_SEARCH_CLOSE = "</acp_search>";
+var ACP_DECOMPRESS_OPEN = "<acp_decompress>";
+var ACP_DECOMPRESS_CLOSE = "</acp_decompress>";
 var COMPRESS_TOOL = {
   name: COMPRESS_TOOL_NAME,
   description: "Replace a contiguous range of older conversation with a detailed summary you write. Use when content is genuinely consumed. Batch form: content=[{startId,endId,summary,topic?}]. REQUIRED \u2014 compress without content is invalid.",
@@ -1100,6 +1176,70 @@ var COMPRESS_TOOL_OPENAI = {
     }
   }
 };
+var TEXT_PROMPT_SECTIONS = [
+  ["acpTags", `ACP TAGS
+
+Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`],
+  ["textProtocol", `COMPRESSION PROTOCOL (TEXT)
+
+You manage context by emitting a special trigger in your text output. When you decide a range of conversation is genuinely consumed and should be compressed into a summary, output EXACTLY this marker (the proxy intercepts and executes it; the marker is stripped from what the user sees):
+
+${ACP_TEXT_OPEN}{"content":[{"startId":"m00150","endId":"m00220","summary":"...","topic":"optional"}]}${ACP_TEXT_CLOSE}
+
+Rules for the trigger:
+- Output the marker on its own, with NO surrounding prose. Just the raw marker.
+- JSON shape matches the compress tool: {"content":[{startId,endId,summary,topic?}]}. Batch multiple ranges in one trigger.
+- After emitting the marker, STOP your turn. Do not continue with other text \u2014 the proxy will execute the compression and return the result, then you continue fresh.
+- Do NOT wrap the marker in code fences, quotes, or commentary.
+- NEVER compress on short conversations or when context is small (well below the window limit). Only compress when context is genuinely large.`],
+  ["textTools", `ACP TOOLS (TEXT TRIGGERS)
+
+Since host tools cannot coexist with a declared tools field, ALL ACP tools use text triggers. Emit the marker; the proxy intercepts and executes it; the marker is stripped from what the user sees.
+
+1. acp_status \u2014 view context usage, compression state, and compressible ranges:
+   ${ACP_STATUS_OPEN}${ACP_STATUS_CLOSE}
+   No payload needed. Use this FIRST when unsure about context state.
+
+2. search_context \u2014 search compressed block summaries by keyword:
+   ${ACP_SEARCH_OPEN}{"query":"auth token refresh"}${ACP_SEARCH_CLOSE}
+   Use when you need details that may have been compressed away.
+
+3. decompress \u2014 restore compressed content for exact details:
+   ${ACP_DECOMPRESS_OPEN}{"blockId":"b5"}${ACP_DECOMPRESS_CLOSE}
+   Optional: {"blockId":"b5","toFile":"/tmp/b5.txt"} to write to file instead.
+   Optional: {"blockId":"b5","full":true} to restore all the way to original messages.
+
+Rules for ALL triggers:
+- Output on its own, NO surrounding prose. Just the raw marker.
+- After emitting, STOP your turn. The proxy executes and returns the result.
+- Do NOT wrap in code fences, quotes, or commentary.`]
+];
+var HYBRID_PROMPT_SECTIONS = [
+  ["acpTags", `ACP TAGS
+
+Each message in the conversation is annotated with a <acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`],
+  ["textProtocol", `COMPRESSION PROTOCOL (TEXT)
+
+You manage context by emitting a special trigger in your text output. When you decide a range of conversation is genuinely consumed and should be compressed into a summary, output EXACTLY this marker (the proxy intercepts and executes it; the marker is stripped from what the user sees):
+
+${ACP_TEXT_OPEN}{"content":[{"startId":"m00150","endId":"m00220","summary":"...","topic":"optional"}]}${ACP_TEXT_CLOSE}
+
+Rules for the trigger:
+- Output the marker on its own, with NO surrounding prose. Just the raw marker.
+- JSON shape: {"content":[{startId,endId,summary,topic?}]}. Batch multiple ranges in one trigger.
+- After emitting the marker, STOP your turn. Do not continue with other text \u2014 the proxy will execute the compression and return the result, then you continue fresh.
+- Do NOT wrap the marker in code fences, quotes, or commentary.
+- NEVER compress on short conversations or when context is small (well below the window limit). Only compress when context is genuinely large.`],
+  ["functionTools", `ACP TOOLS (FUNCTION CALLS)
+
+The proxy also provides these as real function tools you can call directly (they appear in your tool list). Call them like any other function; the proxy executes them and returns the result, then you continue.
+
+- acp_status \u2014 view context usage, compression state, and compressible ranges. No arguments. Use this FIRST when unsure about context state.
+- search_context \u2014 search compressed block summaries by keyword. Arguments: {"query":"...","limit":5}.
+- decompress \u2014 restore compressed content for exact details. Arguments: {"blockId":"b5"} (optional "toFile":"/tmp/x.txt", "full":true).
+
+Note: compress is ONLY available via the text marker above (it needs batch ranges + an immediate stop), NOT as a function tool.`]
+];
 var DECOMPRESS_TOOL_OPENAI = {
   type: "function",
   function: {
@@ -1499,6 +1639,40 @@ function applyMessageFilters(messages, config) {
   }
   return { messages: working, ...tally };
 }
+function refNum(ref) {
+  const m = ref.match(/\d+/);
+  return m ? parseInt(m[0], 10) : 0;
+}
+var M_REF = /^m\d+$/;
+function resolveBlockSpan(block, byRaw) {
+  if (block.startRef && block.endRef && M_REF.test(block.startRef) && M_REF.test(block.endRef)) {
+    return { startRef: block.startRef, endRef: block.endRef };
+  }
+  const refs = block.effectiveMessageIds.map((id) => byRaw[id]).filter((r) => typeof r === "string" && r !== "BLOCKED");
+  if (refs.length === 0) return null;
+  const sorted = [...refs].sort((a, b) => refNum(a) - refNum(b));
+  return { startRef: sorted[0], endRef: sorted[sorted.length - 1] };
+}
+function activeBlockSpans(state) {
+  const spans = [];
+  for (const block of state.blocks) {
+    if (!block.active) continue;
+    const span = resolveBlockSpan(block, state.messageRefs.byRaw);
+    if (!span) continue;
+    spans.push({ blockId: block.blockId, tier: block.tier, ...span });
+  }
+  return spans;
+}
+function formatCreatedBlocks(state, newBlocks) {
+  const parts = [];
+  for (const block of newBlocks) {
+    const span = resolveBlockSpan(block, state.messageRefs.byRaw);
+    parts.push(
+      span ? `${block.blockId}=${span.startRef}\u2013${span.endRef}` : block.blockId
+    );
+  }
+  return parts.length > 0 ? `blocks: ${parts.join(", ")}` : "";
+}
 function formatTokens(tokens) {
   if (tokens < 1e3) return String(tokens);
   if (tokens < 1e4) return (tokens / 1e3).toFixed(1) + "K";
@@ -1531,7 +1705,8 @@ function renderMessage(message, map, countTokens, strategy, snapshot = null) {
     "^" + escapeRegex(TAG_OPEN) + "[^>]*" + GT + escapeRegex(ref) + escapeRegex(TAG_CLOSE) + "\\n?"
   );
   const cleanText = (message.text || "").replace(ownTagRe, "");
-  const tokens = snapshot ? snapshot[ref] ?? (snapshot[ref] = countTokens(cleanText)) : countTokens(cleanText);
+  const textTokens = snapshot ? snapshot[ref] ?? (snapshot[ref] = countTokens(cleanText)) : countTokens(cleanText);
+  const tokens = textTokens + thinkingTokenValue(message.thinkingTokens);
   const type = classifyType(message);
   const prefix = acpTag(ref, tokens, type) + "\n";
   if (!cleanText) return { ...message, text: prefix };
@@ -1610,8 +1785,12 @@ function adjustBoundariesForReasoningPairs(startIndex, endIndex, messages) {
         j++;
       }
       const companion = messages[j + 1];
-      if (companion !== void 0 && companion.role === "assistant" && (companion.contentType === "text" || companion.contentType === "tool-call") && j + 1 > newEndIndex) {
-        newEndIndex = j + 1;
+      if (companion !== void 0 && companion.role === "assistant" && (companion.contentType === "text" || companion.contentType === "tool-call")) {
+        let e = j + 1;
+        while (e + 1 < messages.length && messages[e + 1].role === "assistant" && (messages[e + 1].contentType === "text" || messages[e + 1].contentType === "tool-call")) {
+          e++;
+        }
+        if (e > newEndIndex) newEndIndex = e;
       }
     }
     if (msg.role === "assistant" && (msg.contentType === "text" || msg.contentType === "tool-call")) {
@@ -1627,9 +1806,63 @@ function adjustBoundariesForReasoningPairs(startIndex, endIndex, messages) {
   }
   return { startIndex: newStartIndex, endIndex: newEndIndex };
 }
-function refNum(ref) {
-  const n = parseInt(ref.slice(1), 10);
-  return Number.isNaN(n) ? -1 : n;
+function isAssistantAct(msg) {
+  return msg.role === "assistant" && (msg.contentType === "text" || msg.contentType === "tool-call");
+}
+function computeTurnGroups(messages) {
+  const resultIdByCallId = /* @__PURE__ */ new Map();
+  for (const msg of messages) {
+    if (msg.contentType === "tool-result" && typeof msg.toolCallId === "string" && msg.id) {
+      if (!resultIdByCallId.has(msg.toolCallId))
+        resultIdByCallId.set(msg.toolCallId, msg.id);
+    }
+  }
+  const grouped = /* @__PURE__ */ new Set();
+  const groups = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!msg.id || grouped.has(msg.id)) continue;
+    if (!(msg.contentType === "reasoning" || isAssistantAct(msg))) continue;
+    let reasoningStart = i;
+    if (msg.contentType === "reasoning") {
+      while (reasoningStart > 0 && messages[reasoningStart - 1].contentType === "reasoning") {
+        reasoningStart--;
+      }
+    } else {
+      let s = i;
+      while (s > 0 && isAssistantAct(messages[s - 1])) s--;
+      reasoningStart = s;
+      while (reasoningStart > 0 && messages[reasoningStart - 1].contentType === "reasoning") {
+        reasoningStart--;
+      }
+    }
+    const burstStart = (() => {
+      let s = reasoningStart;
+      while (s < messages.length && messages[s].contentType === "reasoning")
+        s++;
+      return s;
+    })();
+    if (burstStart >= messages.length || !isAssistantAct(messages[burstStart])) {
+      continue;
+    }
+    let burstEnd = burstStart;
+    while (burstEnd + 1 < messages.length && isAssistantAct(messages[burstEnd + 1])) {
+      burstEnd++;
+    }
+    const members = /* @__PURE__ */ new Set();
+    for (let k = reasoningStart; k <= burstEnd; k++) {
+      const m = messages[k];
+      if (!m.id) continue;
+      members.add(m.id);
+      if (m.role === "assistant" && m.contentType === "tool-call" && typeof m.toolCallId === "string") {
+        const rid = resultIdByCallId.get(m.toolCallId);
+        if (rid) members.add(rid);
+      }
+    }
+    for (const id of members) grouped.add(id);
+    groups.push([...members]);
+  }
+  return groups;
 }
 function estimateTextTokens(text) {
   return Math.ceil(text.length / 4);
@@ -1654,7 +1887,7 @@ function computeProtectedRefs(messages, state, config, countTokens = estimateTex
     if (isNeverPreserveRecent(msg)) continue;
     const ref = state.messageRefs.byRaw[msg.id];
     if (!ref || ref === "BLOCKED") continue;
-    visible.push({ ref, tokens: countTokens(msg.text ?? "") });
+    visible.push({ ref, tokens: countMessageTokens(msg, countTokens) });
   }
   if (preserveN > 0) {
     for (const m of visible.slice(-preserveN)) {
@@ -1683,42 +1916,50 @@ function buildCompressibleRanges(messages, state, config, protectedZoneRefs, cou
   const compressibleMsgs = [];
   const protectedMsgs = [];
   const protectedCallIds = collectProtectedToolCallIds(messages, config);
+  let skipSinceCompressible = false;
+  let skipSinceProtected = false;
   for (const msg of messages) {
-    if (isSyntheticOrPruned(msg, state)) continue;
     const ref = state.messageRefs.byRaw[msg.id];
     if (!ref || ref === "BLOCKED") continue;
-    const rn = refNum(ref);
+    if (isSyntheticOrPruned(msg, state)) {
+      skipSinceCompressible = true;
+      skipSinceProtected = true;
+      continue;
+    }
     if (isMessageProtectedWithPairing(msg, config, protectedCallIds)) {
       protectedMsgs.push({
         ref,
-        refNum: rn,
-        tokens: countTokens(msg.text ?? ""),
+        gapBefore: skipSinceProtected,
+        tokens: countMessageTokens(msg, countTokens),
         tools: msg.toolName ? [msg.toolName] : []
       });
+      skipSinceProtected = false;
+      skipSinceCompressible = true;
       continue;
     }
     if (protectedZoneRefs?.has(ref)) {
+      skipSinceCompressible = true;
+      skipSinceProtected = true;
       continue;
     }
     compressibleMsgs.push({
       ref,
-      refNum: rn,
-      tokens: countTokens(msg.text ?? ""),
+      gapBefore: skipSinceCompressible,
+      tokens: countMessageTokens(msg, countTokens),
       chars: (msg.text ?? "").length,
       isTool: isToolMessage(msg),
       isUser: msg.role === "user"
     });
+    skipSinceCompressible = false;
+    skipSinceProtected = true;
   }
   const compressible = [];
   let cur = null;
-  let prevRefNum = -2;
   for (const info of compressibleMsgs) {
-    const hasGap = info.refNum > prevRefNum + 1;
-    if (cur && (info.isUser && cur.count >= 3 || hasGap)) {
+    if (cur && (info.isUser && cur.count >= 3 || info.gapBefore)) {
       compressible.push(cur);
       cur = null;
     }
-    prevRefNum = info.refNum;
     if (!cur) {
       cur = {
         startRef: info.ref,
@@ -1727,13 +1968,15 @@ function buildCompressibleRanges(messages, state, config, protectedZoneRefs, cou
         tokens: info.tokens,
         chars: info.chars,
         toolPct: info.isTool ? 100 : 0,
-        textPct: info.isTool ? 0 : 100
+        textPct: info.isTool ? 0 : 100,
+        userMsgs: info.isUser ? 1 : 0
       };
     } else {
       cur.endRef = info.ref;
       cur.count++;
       cur.tokens += info.tokens;
       cur.chars = (cur.chars ?? 0) + info.chars;
+      if (info.isUser) cur.userMsgs = (cur.userMsgs ?? 0) + 1;
       if (info.isTool) {
         cur.toolPct = Math.round((cur.toolPct * (cur.count - 1) + 100) / cur.count);
       } else {
@@ -1745,14 +1988,11 @@ function buildCompressibleRanges(messages, state, config, protectedZoneRefs, cou
   if (cur) compressible.push(cur);
   const protectedRanges = [];
   let pcur = null;
-  let pPrevRefNum = -2;
   for (const info of protectedMsgs) {
-    const hasGap = info.refNum > pPrevRefNum + 1;
-    if (pcur && hasGap) {
+    if (pcur && info.gapBefore) {
       protectedRanges.push(pcur);
       pcur = null;
     }
-    pPrevRefNum = info.refNum;
     if (!pcur) {
       pcur = {
         startRef: info.ref,
@@ -1792,7 +2032,8 @@ function mergeBatch(batch) {
     tokens,
     chars,
     toolPct,
-    textPct: 100 - toolPct
+    textPct: 100 - toolPct,
+    userMsgs: batch.reduce((s, r) => s + (r.userMsgs ?? 0), 0)
   };
   if (batch.some((r) => r.dangerous === true)) {
     merged.dangerous = true;
@@ -2340,6 +2581,42 @@ function applySingleRange(input) {
       )} from compression range (recent/last-user zone).`
     );
   }
+  {
+    const reasoningIds = /* @__PURE__ */ new Set();
+    const callIds = /* @__PURE__ */ new Set();
+    for (const m of input.messages) {
+      if (!m.id) continue;
+      if (m.contentType === "reasoning") reasoningIds.add(m.id);
+      if (m.role === "assistant" && m.contentType === "tool-call") callIds.add(m.id);
+    }
+    const withdrawIds = /* @__PURE__ */ new Set();
+    let splitTurnCount = 0;
+    for (const group of computeTurnGroups(input.messages)) {
+      const foldHasReasoning = group.some(
+        (id) => effectiveMessageIds.has(id) && reasoningIds.has(id)
+      );
+      if (!foldHasReasoning) continue;
+      const keptHasCall = group.some(
+        (id) => !effectiveMessageIds.has(id) && callIds.has(id)
+      );
+      if (!keptHasCall) continue;
+      splitTurnCount++;
+      for (const id of group) withdrawIds.add(id);
+    }
+    if (withdrawIds.size > 0) {
+      for (const id of withdrawIds) effectiveMessageIds.delete(id);
+      const beforeWithdraw = filteredIds.length;
+      filteredIds = filteredIds.filter((id) => !withdrawIds.has(id));
+      if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
+        throw new Error(
+          `Range would split ${splitTurnCount} turn(s) at the protected-zone boundary: a visible tool-call must keep its reasoning run (strict-echo providers reject a rebuilt request that lost it). Shrink the range to end before the turn starts, or wait until the whole turn ages out of the protected zone.`
+        );
+      }
+      warnings.push(
+        `Withdrawn ${beforeWithdraw - filteredIds.length} message(s) from compression range to keep ${splitTurnCount} turn(s) intact (visible tool-call would lose its reasoning run).`
+      );
+    }
+  }
   if (!isBlockBoundary && filteredIds.length === 0 && consumedBlockIds.length > 0) {
     const first = consumedBlockIds[0];
     const last = consumedBlockIds[consumedBlockIds.length - 1];
@@ -2353,7 +2630,7 @@ function applySingleRange(input) {
   let compressedTokens = 0;
   for (const id of filteredIds) {
     const message = input.messages.find((entry) => entry.id === id);
-    compressedTokens += input.countTokens(message?.text ?? "");
+    compressedTokens += message ? countMessageTokens(message, input.countTokens) : 0;
   }
   for (const consumedId of consumedBlockIds) {
     const consumed = blockById(input.state, consumedId);
@@ -2560,6 +2837,9 @@ function decideNudge(input) {
   const growthReady = firstSightMassReady || growthSinceReference >= growthFloor;
   const t2Count = tiers[2]?.targetBlocks.length ?? 0;
   const t3Count = tiers[3]?.targetBlocks.length ?? 0;
+  const tierCountUsageFloor = config.nudge.minContextLimitPct;
+  const t2CountReady = t2Count >= config.tiers.tier2Trigger && usage >= tierCountUsageFloor;
+  const t3CountReady = t3Count >= config.tiers.tier3Trigger && usage >= tierCountUsageFloor;
   if (pressure) {
     const candidates = [1];
     if (config.tiers.enabled) {
@@ -2582,19 +2862,19 @@ function decideNudge(input) {
     if (t1Eff >= nudgeGrowthTokens) {
       injectedTier = 1;
       injectedReason = `T1 effective ${t1Eff} >= ${nudgeGrowthTokens}, growth ${growthSinceReference}, usage ${Math.round(usage * 100)}%`;
-    } else if (config.tiers.enabled && (t2Count >= config.tiers.tier2Trigger || t2Pen >= tier2Threshold && t2Pen > t1Eff)) {
+    } else if (config.tiers.enabled && (t2CountReady || t2Pen >= tier2Threshold && t2Pen > t1Eff)) {
       const lastShown = state.nudge.lastShownByTier[2] ?? 0;
       const cadenceMet = lastShown === 0 || tokenCount - lastShown >= growthFloor;
       if (cadenceMet) {
         injectedTier = 2;
-        injectedReason = t2Count >= config.tiers.tier2Trigger ? `T2 distill ready: ${t2Count} tier-1 blocks >= tier2Trigger ${config.tiers.tier2Trigger} (${t2Pen} tokens), usage ${Math.round(usage * 100)}%` : `T2 distill ready: ${tiers[2].targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tier2Threshold} (1.5x) and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
+        injectedReason = t2CountReady ? `T2 distill ready: ${t2Count} tier-1 blocks >= tier2Trigger ${config.tiers.tier2Trigger} (${t2Pen} tokens), usage ${Math.round(usage * 100)}%` : `T2 distill ready: ${tiers[2].targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tier2Threshold} (1.5x) and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
       }
-    } else if (config.tiers.enabled && (t3Count >= config.tiers.tier3Trigger || t3Pen >= tier2Threshold && t3Pen > t2Pen && t3Pen > t1Eff)) {
+    } else if (config.tiers.enabled && (t3CountReady || t3Pen >= tier2Threshold && t3Pen > t2Pen && t3Pen > t1Eff)) {
       const lastShown = state.nudge.lastShownByTier[3] ?? 0;
       const cadenceMet = lastShown === 0 || tokenCount - lastShown >= growthFloor;
       if (cadenceMet) {
         injectedTier = 3;
-        injectedReason = t3Count >= config.tiers.tier3Trigger ? `T3 condense ready: ${t3Count} tier-2 blocks >= tier3Trigger ${config.tiers.tier3Trigger} (${t3Pen} tokens), usage ${Math.round(usage * 100)}%` : `T3 condense ready: ${tiers[3].targetBlocks.length} tier-2 blocks (${t3Pen} tokens) >= ${tier2Threshold} (1.5x) and > T2 ${t2Pen} and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
+        injectedReason = t3CountReady ? `T3 condense ready: ${t3Count} tier-2 blocks >= tier3Trigger ${config.tiers.tier3Trigger} (${t3Pen} tokens), usage ${Math.round(usage * 100)}%` : `T3 condense ready: ${tiers[3].targetBlocks.length} tier-2 blocks (${t3Pen} tokens) >= ${tier2Threshold} (1.5x) and > T2 ${t2Pen} and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
       }
     }
   }
@@ -2611,9 +2891,14 @@ function decideNudge(input) {
   } else {
     const tiersList = [1, 2, 3];
     const eligible = tiersList.filter((t) => config.tiers.enabled || t === 1);
-    const countReady = (t) => t === 2 ? t2Count >= config.tiers.tier2Trigger : t === 3 ? t3Count >= config.tiers.tier3Trigger : false;
+    const countReadyUngated = (t) => t === 2 ? t2Count >= config.tiers.tier2Trigger : t === 3 ? t3Count >= config.tiers.tier3Trigger : false;
+    const countReady = (t) => countReadyUngated(t) && usage >= tierCountUsageFloor;
     const ready = eligible.filter((t) => (tiers[t]?.pending ?? 0) >= nudgeGrowthTokens).map((t) => `T${t} ${tiers[t].pending}`);
-    const readyCount = eligible.filter((t) => (tiers[t]?.pending ?? 0) < nudgeGrowthTokens && countReady(t)).map((t) => `T${t} ${t === 2 ? t2Count : t3Count} blocks (count)`);
+    const readyCount = eligible.filter(
+      (t) => (tiers[t]?.pending ?? 0) < nudgeGrowthTokens && countReadyUngated(t)
+    ).map(
+      (t) => `T${t} ${t === 2 ? t2Count : t3Count} blocks (count${usage >= tierCountUsageFloor ? "" : ", usage-gated"})`
+    );
     const readyAll = [...ready, ...readyCount];
     const readyHint = readyAll.length > 0 ? `, ready: ${readyAll.join(", ")}` : "";
     const blocked = eligible.filter(
@@ -2650,6 +2935,7 @@ function decideNudge(input) {
     reason,
     compressibleRanges: rec?.recommendedRanges ?? [],
     protectedRanges: rec?.contextRanges.protected ?? [],
+    activeBlockSpans: activeBlockSpans(state),
     tierTargetBlocks: injectedTier ? tiers[injectedTier].targetBlocks : [],
     contextUsage: usage,
     tier: injectedTier,
@@ -2675,7 +2961,7 @@ function computeContextBreakdown(messages, total, growth, countTokens) {
   const count = countTokens ?? ((t) => Math.ceil(t.length / 4));
   let system = 0, tool = 0, summaries = 0, code = 0, text = 0;
   for (const msg of messages) {
-    const tokens = count(msg.text ?? "");
+    const tokens = countMessageTokens(msg, count);
     if (msg.text?.startsWith("[Compressed conversation section]")) {
       summaries += tokens;
     } else if (msg.contentType === "tool-call" || msg.contentType === "tool-result") {
@@ -2732,6 +3018,71 @@ function countOccurrences(haystack, needle) {
   }
   return count;
 }
+var LEAN_TOOL_PROMPTS = {
+  compress: {
+    description: "Replace consumed conversation ranges with self-contained summaries using mNNNNN or bN refs.",
+    paramDescriptions: {
+      content: "Direct array; no JSON strings/nesting/mix.",
+      startId: "Inclusive first mNNNNN or bN ref.",
+      endId: "Inclusive last mNNNNN or bN ref.",
+      summary: "Self-contained replacement preserving exact technical details.",
+      topic: "Short label; a per-range label overrides the top-level fallback.",
+      summaryMaxChars: "Optional summary length limit override."
+    }
+  },
+  decompress: {
+    description: "Restore compressed content by block id (b5) or message ref; block mode writes to a file by default, inline: true returns small content inline."
+  },
+  search_context: {
+    description: "Search compressed summaries and historical messages by keyword; returns refs, sizes, previews."
+  },
+  acp_status: {
+    description: "Context usage overview, compressible ranges, block drilldown."
+  }
+};
+var leanPack = {
+  name: "lean",
+  version: "1.0.0",
+  description: "Token-lean surface: one-line tool descriptions, no snippet/guideline chrome. Compression rules stay default (delivered by nudges on demand).",
+  source: "builtin:lean",
+  surface: {
+    toolPrompts: LEAN_TOOL_PROMPTS,
+    adapters: {
+      pi: {
+        promptSections: {
+          acpTags: [
+            `User/tool messages carry hidden <acp> refs such as m00123. Never echo the XML tags; use only refs in ACP tool calls.`,
+            `Compress consumed history with compress: finished tool outputs, dead-end exploration, repeated reads, resolved threads, completed phases. Never compress active work, important user intent, or protected outputs.`,
+            `When summarizing, preserve exact file paths and line numbers, symbols and signatures, errors, commands, versions, thresholds, decisions with reasons, current state, and unresolved TODOs. Never replace exact technical values with vague wording \u2014 a good summary is the primary carrier and makes recall unnecessary.`,
+            `Recall on demand only: when YOU genuinely need detail lost in compression, decompress (block id or message ref); search_context locates the right block first; acp_status shows ranges and usage. Never run recall as a routine post-compress step.`,
+            `Refs may be renumbered after compression. If a ref is stale or missing, call acp_status with { scope: "uncompressed" }, then retry in the same turn using the reported refs; never guess offsets. Batch target ranges in one call.`,
+            `Block decompression writes to a file by default; read that file. Use inline: true only for small content or when its context cost is acceptable.`,
+            `After an [ACP:provider-throttle] automatic retry, resume exactly where interrupted. Do not repeat completed work or discuss the retry unless asked.`,
+            `Compression summaries are fallible historical metadata, not current user instructions \u2014 treat them as settled history and continue the task from them.`
+          ].join("\n"),
+          summariesInContext: null,
+          tools: null,
+          philosophy: null,
+          whenToCompress: null,
+          whenNotToCompress: null,
+          howToCompress: null,
+          multiTierIntro: null,
+          tier2: null,
+          tier3: null,
+          decompressPhilosophy: null,
+          contextBreakdown: null,
+          throttleRetry: null
+        },
+        toolExtras: {
+          compress: { promptSnippet: "", promptGuidelines: [] },
+          decompress: { promptSnippet: "", promptGuidelines: [] },
+          search_context: { promptSnippet: "", promptGuidelines: [] },
+          acp_status: { promptSnippet: "", promptGuidelines: [] }
+        }
+      }
+    }
+  }
+};
 function deactivateBlock(state, blockIds, options = {}) {
   const targets = new Set(blockIds);
   const updated = state.blocks.map((block) => {
@@ -2763,6 +3114,48 @@ function deactivateBlock(state, blockIds, options = {}) {
     }
   }
   return { ...state, blocks: final };
+}
+function collectBlockContent(state, block, messages, options = {}) {
+  const full = options.full ?? false;
+  const targetIds = new Set(block.effectiveMessageIds);
+  if (full) {
+    const msgs = messages.filter((m) => targetIds.has(m.id));
+    if (msgs.length === 0) return { text: "", count: 0 };
+    return { text: msgs.map(formatMessage).join("\n\n"), count: msgs.length };
+  }
+  const nestedChildren = [];
+  const nestedCovered = /* @__PURE__ */ new Set();
+  for (const childId of block.directBlockIds) {
+    const child = state.blocks.find((b) => b.blockId === childId);
+    if (!child?.active) continue;
+    nestedChildren.push(child);
+    for (const id of child.effectiveMessageIds) nestedCovered.add(id);
+  }
+  const parts = [];
+  for (const child of nestedChildren) {
+    const label = child.topic ? `${child.blockId}: ${child.topic}` : child.blockId;
+    parts.push(`${SUMMARY_HEADER} \u2014 ${label}
+${child.summary}`);
+  }
+  let directCount = 0;
+  for (const m of messages) {
+    if (targetIds.has(m.id) && !nestedCovered.has(m.id)) {
+      parts.push(formatMessage(m));
+      directCount++;
+    }
+  }
+  const count = directCount + nestedChildren.length;
+  if (count === 0) return { text: "", count: 0 };
+  return { text: parts.join("\n\n"), count };
+}
+function formatMessage(message) {
+  const text = message.text ?? "";
+  if (message.toolName && message.contentType !== "text") {
+    return `[${message.role} \u2022 ${message.toolName}]
+${text}`;
+  }
+  return `[${message.role}]
+${text}`;
 }
 function stem(word) {
   let w = word;
@@ -3201,6 +3594,13 @@ function loadAdapterSettings() {
     // V0.7.13-HOOK-EXP：实验开关（实验已完成；保留开关但恢复文件读取）。
     hookExperiment: readBool("hookExperiment", false),
     llmEmergencyFold: readBool("llmEmergencyFold", false),
+    tier2Trigger: readNum("tier2Trigger", 5),
+    tier3Trigger: readNum("tier3Trigger", 10),
+    // V0.9.4 缓存友好：maxShrinkPerCompress（0~1），未配置/非法 → undefined（不引导，legacy）。
+    maxShrinkPerCompress: (() => {
+      const raw = readNum("maxShrinkPerCompress", -1);
+      return raw > 0 && raw <= 1 ? raw : void 0;
+    })(),
     dataDir: DATA_DIR
   };
 }
@@ -4024,6 +4424,19 @@ function evaluatePressureInner(input) {
     decisionReason: "gentle-inject"
   };
 }
+function detectTierOpportunity(input) {
+  const t2 = input.tier2Trigger ?? 5;
+  const t3 = input.tier3Trigger ?? 10;
+  let t1Count = 0;
+  let t2Count = 0;
+  for (const b of input.activeBlocks) {
+    if (b.tier === 2) t2Count++;
+    else if (!b.tier || b.tier === 1) t1Count++;
+  }
+  if (t2Count >= t3) return "t3-condense-ready";
+  if (t1Count >= t2) return "t2-distill-ready";
+  return void 0;
+}
 function evaluatePressure(input) {
   const r = evaluatePressureInner(input);
   return {
@@ -4574,9 +4987,16 @@ function createEngine(dataDir) {
           const finalPrepared = projected && Array.isArray(projected) ? [...projected] : [...turns];
           let stage2NudgeText;
           let stage2Delivery;
+          const stage2TierHint = detectTierOpportunity({
+            activeBlocks: cached2.kernelState.blocks,
+            tier2Trigger: settings.tier2Trigger,
+            tier3Trigger: settings.tier3Trigger
+          });
           if (stage2Pressure.pressure.allowInject && settings.nudgeEnabled) {
             stage2Delivery = createNudgeDelivery(hookStage);
-            stage2NudgeText = buildNudgeTextFromReason(stage2Pressure.pressure.decisionReason, stage2Level);
+            const stage2Spans = activeBlockSpans(cached2.kernelState);
+            const stage2SpansText = stage2Spans.length > 0 ? stage2Spans.map((s) => `${s.blockId}(${s.tier}:${s.startRef}..${s.endRef})`).join(", ") : "";
+            stage2NudgeText = buildNudgeTextFromReason(stage2Pressure.pressure.decisionReason, stage2Level, stage2TierHint, stage2SpansText, settings.maxShrinkPerCompress);
             const stage2Carrier = buildNudgeCarrier(stage2NudgeText, stage2Level);
             finalPrepared.push({ kind: stage2Carrier.kind, content: stage2Carrier.content, metadata: stage2Carrier.metadata });
             stage2Delivery = markDelivered(stage2Delivery, stage2NudgeText, stage2Carrier, stage2Level);
@@ -4650,9 +5070,16 @@ function createEngine(dataDir) {
           const cacheFinal = projected && Array.isArray(projected) && projected.length > 0 ? [...projected] : [...turns];
           let cacheNudgeText;
           let cacheDelivery;
+          const cacheTierHint = detectTierOpportunity({
+            activeBlocks: cached.kernelState.blocks,
+            tier2Trigger: settings.tier2Trigger,
+            tier3Trigger: settings.tier3Trigger
+          });
           if (cachePressure.pressure.allowInject && settings.nudgeEnabled) {
             cacheDelivery = createNudgeDelivery(hookStage);
-            cacheNudgeText = buildNudgeTextFromReason(cachePressure.pressure.decisionReason, cacheLevel);
+            const cacheSpans = activeBlockSpans(cached.kernelState);
+            const cacheSpansText = cacheSpans.length > 0 ? cacheSpans.map((s) => `${s.blockId}(${s.tier}:${s.startRef}..${s.endRef})`).join(", ") : "";
+            cacheNudgeText = buildNudgeTextFromReason(cachePressure.pressure.decisionReason, cacheLevel, cacheTierHint, cacheSpansText, settings.maxShrinkPerCompress);
             const cacheCarrier = buildNudgeCarrier(cacheNudgeText, cacheLevel);
             cacheFinal.push({ kind: cacheCarrier.kind, content: cacheCarrier.content, metadata: cacheCarrier.metadata });
             cacheDelivery = markDelivered(cacheDelivery, cacheNudgeText, cacheCarrier, cacheLevel);
@@ -4731,9 +5158,16 @@ function createEngine(dataDir) {
               const incFinal = [...capped];
               let incNudgeText;
               let incDelivery;
+              const incTierHint = detectTierOpportunity({
+                activeBlocks: cached.kernelState.blocks,
+                tier2Trigger: settings.tier2Trigger,
+                tier3Trigger: settings.tier3Trigger
+              });
               if (incPressure.pressure.allowInject && settings.nudgeEnabled) {
                 incDelivery = createNudgeDelivery(hookStage);
-                incNudgeText = buildNudgeTextFromReason(incPressure.pressure.decisionReason, incLevel);
+                const incSpans = activeBlockSpans(cached.kernelState);
+                const incSpansText = incSpans.length > 0 ? incSpans.map((s) => `${s.blockId}(${s.tier}:${s.startRef}..${s.endRef})`).join(", ") : "";
+                incNudgeText = buildNudgeTextFromReason(incPressure.pressure.decisionReason, incLevel, incTierHint, incSpansText, settings.maxShrinkPerCompress);
                 const incCarrier = buildNudgeCarrier(incNudgeText, incLevel);
                 incFinal.push({ kind: incCarrier.kind, content: incCarrier.content, metadata: incCarrier.metadata });
                 incDelivery = markDelivered(incDelivery, incNudgeText, incCarrier, incLevel);
@@ -4884,7 +5318,7 @@ function createEngine(dataDir) {
         let delivery;
         if (pressure.allowInject && settings.nudgeEnabled) {
           delivery = createNudgeDelivery(hookStage);
-          nudgeText = buildNudgeText(turn.nudge, level);
+          nudgeText = buildNudgeText(turn.nudge, level, settings.maxShrinkPerCompress);
           const active = getActiveAbsorbCandidates(nextAbsorbCandidates);
           if (active.length > 0) {
             const lines = active.slice(0, 3).map((c) => `- ref=${c.ref} tool=${c.tool} size=${c.chars}`);
@@ -5173,12 +5607,15 @@ ${lines.join("\n")}${active.length > 3 ? `
         });
         projectionCache.delete(sessionKey);
         estimateCache.delete(sessionKey);
+        const createdBlocksText = newBlockIds.length > 0 ? formatCreatedBlocks(applied.state, applied.state.blocks.filter((b) => newBlockIds.includes(b.blockId))) : "";
         return {
           state: applied.state,
           blocksCreated: applied.result.blocksCreated,
           tokensCompressed: applied.result.tokensCompressed,
           errors: applied.result.errors,
-          warnings: applied.result.warnings
+          warnings: applied.result.warnings,
+          // V0.9.1 block-map：新建块的 ref 跨度（b3=m00044–m00097），模型据此精确蒸馏。
+          ...createdBlocksText ? { createdBlocks: createdBlocksText } : {}
         };
       } finally {
         release();
@@ -5206,6 +5643,34 @@ ${lines.join("\n")}${active.length > 3 ? `
         estimateCache.delete(sessionKey);
         chatTrace(void 0, { type: "decompress", detail: { blockId } });
         return { ok: true };
+      } finally {
+        release();
+      }
+    },
+    // V0.9.2 decompress-content：无状态读取 block 原文（copy-paste，不改 state）。
+    // 原版 bc-upstream 同款思路：优先 raw turns 原文缓存 → collectBlockContent 现抓 → 大内容写临时文件。
+    async decompressContent(sessionKey, blockId, full) {
+      const release = await acquireLock(sessionKey);
+      try {
+        const loaded = await persistence.load(sessionKey);
+        const block = loaded.kernelState.blocks.find((b) => b.blockId === blockId);
+        if (!block) return { ok: false, error: `block ${blockId} not found` };
+        const rawTurns = rawTurnsCache.get(sessionKey) ?? loaded.lastRawTurns ?? await persistence.loadRawTurns(sessionKey);
+        const mapping = mapTurnsWithIdentity(rawTurns);
+        const collected = collectBlockContent(loaded.kernelState, block, mapping.messages, { full: full === true });
+        const body = collected.text || block.summary || "";
+        if (!body) return { ok: false, error: `block ${blockId} \u65E0\u5185\u5BB9` };
+        if (body.length > 1e4) {
+          try {
+            const safeId = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
+            const tmpPath = `${settings.dataDir}/acp-decompress-${safeId}-${Date.now()}.txt`;
+            await Tools.Files.write(tmpPath, body, false, "android");
+            return { ok: true, body: "", count: collected.count, tempFile: tmpPath };
+          } catch {
+            return { ok: true, body: body.slice(0, 4e3) + "\n...\uFF08\u5185\u5BB9\u8FC7\u957F\uFF0C\u622A\u65AD\u663E\u793A\uFF09", count: collected.count };
+          }
+        }
+        return { ok: true, body, count: collected.count };
       } finally {
         release();
       }
@@ -5266,6 +5731,12 @@ ${lines.join("\n")}${active.length > 3 ? `
       const mapping = promptTurnsToCoreMessages(messages);
       const tokenCount = estimateProjectionTokens(mapping.messages, collectCoveredMessageIds(loaded.kernelState));
       const report = core.status(loaded.kernelState, tokenCount, config);
+      const viable = buildViableRanges(
+        loaded.kernelState,
+        mapping.messages,
+        loaded.kernelState.messageRefs?.byRaw ?? {},
+        settings.minCompressRange
+      );
       const stats = loaded.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS;
       const totalFolds = (stats.compressSucceeded ?? 0) + (stats.emergencyTriggered ?? 0);
       const proactiveRate = totalFolds > 0 ? Math.round((stats.compressSucceeded ?? 0) / totalFolds * 100) : 0;
@@ -5274,6 +5745,10 @@ ${lines.join("\n")}${active.length > 3 ? `
       const enriched = {
         ...typeof report === "object" && report !== null ? report : { raw: report },
         runtimeStats: stats,
+        // V0.9.1 block-map：当前所有 active block 的 ref 跨度（模型据此传 block id 蒸馏 T2/T3）。
+        blockSpans: activeBlockSpans(loaded.kernelState),
+        // V0.9.2 viableRanges：真正可压的连续范围（已过滤 <200 tokens 碎片 + 保护区）。
+        viableRanges: viable,
         metrics: {
           proactiveCompressRatePct: proactiveRate,
           emergencySharePct: emergencyRate,
@@ -5356,33 +5831,83 @@ ${lines.join("\n")}${active.length > 3 ? `
     }
   };
 }
-function buildNudgeTextFromReason(reason, level) {
+function buildViableRanges(state, messages, byRaw, minCompressRange) {
+  const PROTECTED = 8;
+  if (messages.length <= PROTECTED) return [];
+  const covered = collectCoveredMessageIds(state);
+  const recentIds = new Set(messages.slice(-PROTECTED).map((m) => m.id));
+  const raw = Object.entries(byRaw);
+  const ranges = [];
+  let segStart = null;
+  for (let i = 0; i < messages.length - PROTECTED; i++) {
+    const m = messages[i];
+    const isCovered = covered.has(m.id) || recentIds.has(m.id);
+    if (!isCovered && segStart === null) segStart = i;
+    if (isCovered && segStart !== null) {
+      pushRange(ranges, messages, segStart, i - 1, raw);
+      segStart = null;
+    }
+  }
+  if (segStart !== null) {
+    pushRange(ranges, messages, segStart, messages.length - PROTECTED - 1, raw);
+  }
+  return viableRanges(
+    ranges.filter((r) => r.tokens * 4 >= minCompressRange || r.tokens >= 200)
+  );
+}
+function pushRange(out, messages, startIdx, endIdx, raw) {
+  if (startIdx > endIdx) return;
+  const seg = messages.slice(startIdx, endIdx + 1);
+  const tokens = seg.reduce((n, m) => n + (m.text ? m.text.length / 4 : 0), 0);
+  const startRef = raw.find(([, v]) => v === seg[0].id)?.[0] ?? "";
+  const endRef = raw.find(([, v]) => v === seg[seg.length - 1].id)?.[0] ?? "";
+  if (startRef && endRef) out.push({ startRef, endRef, tokens: Math.round(tokens) });
+}
+function buildNudgeTextFromReason(reason, level, tierHint, blockSpansText, maxShrink) {
   const lines = [];
   if (level === "gentle") {
     lines.push("[ACP] \u4E0A\u4E0B\u6587\u4F7F\u7528\u7387\u5DF2\u63A5\u8FD1\u9608\u503C\uFF0C\u8BF7\u6CE8\u610F\u8FD1\u671F\u5BF9\u8BDD\u7684\u4E0A\u4E0B\u6587\u5360\u7528\uFF0C\u5EFA\u8BAE\u5728\u5408\u9002\u65F6\u673A\u538B\u7F29\u5DF2\u6D88\u8D39\u7684\u65E7\u5185\u5BB9\u3002");
-    lines.push("\u538B\u7F29\u8BF7\u901A\u8FC7 Operit package_proxy \u8C03\u7528 acp_tools:compress\uFF08\u8303\u56F4\u538B\u7F29\uFF09\u3001acp_tools:absorb\uFF08\u5438\u6536\u5355\u6761\u5DE8\u578B\u8F93\u51FA\uFF09\u3001acp_tools:decompress\uFF08\u6062\u590D\uFF09\u3001acp_tools:search_context\uFF08\u641C\u7D22\uFF09\u3001acp_tools:acp_status\uFF08\u67E5\u72B6\u6001/\u8303\u56F4\uFF09\u3002");
+    lines.push("\u538B\u7F29\u8BF7\u76F4\u63A5\u8C03\u7528 acp_tools \u5DE5\u5177\uFF1Aacp_tools:compress\uFF08\u8303\u56F4\u538B\u7F29\uFF09\u3001acp_tools:absorb\uFF08\u5438\u6536\u5355\u6761\u5DE8\u578B\u8F93\u51FA\uFF09\u3001acp_tools:decompress\uFF08\u6062\u590D\u539F\u6587\uFF09\u3001acp_tools:search_context\uFF08\u641C\u7D22\uFF09\u3001acp_tools:acp_status\uFF08\u67E5\u72B6\u6001/\u8303\u56F4\uFF09\u3002");
   } else if (level === "strong") {
     lines.push("[ACP] \u4E0A\u4E0B\u6587\u4F7F\u7528\u7387\u5DF2\u8F83\u9AD8\uFF0C\u8BF7\u7ACB\u5373\u538B\u7F29\u5DF2\u6D88\u8D39\u7684\u65E7\u5185\u5BB9\u4EE5\u91CA\u653E\u7A7A\u95F4\u3002");
-    lines.push("\u538B\u7F29\u8BF7\u901A\u8FC7 Operit package_proxy \u8C03\u7528 acp_tools:compress\uFF08\u8303\u56F4\u538B\u7F29\uFF09\u3001acp_tools:absorb\uFF08\u5438\u6536\u5355\u6761\u5DE8\u578B\u8F93\u51FA\uFF09\u3001acp_tools:decompress\uFF08\u6062\u590D\uFF09\u3001acp_tools:search_context\uFF08\u641C\u7D22\uFF09\u3001acp_tools:acp_status\uFF08\u67E5\u72B6\u6001/\u8303\u56F4\uFF09\u3002");
+    lines.push("\u538B\u7F29\u8BF7\u76F4\u63A5\u8C03\u7528 acp_tools \u5DE5\u5177\uFF1Aacp_tools:compress\uFF08\u8303\u56F4\u538B\u7F29\uFF09\u3001acp_tools:absorb\uFF08\u5438\u6536\u5355\u6761\u5DE8\u578B\u8F93\u51FA\uFF09\u3001acp_tools:decompress\uFF08\u6062\u590D\u539F\u6587\uFF09\u3001acp_tools:search_context\uFF08\u641C\u7D22\uFF09\u3001acp_tools:acp_status\uFF08\u67E5\u72B6\u6001/\u8303\u56F4\uFF09\u3002");
   } else {
-    lines.push("[ACP] \u4E0A\u4E0B\u6587\u5DF2\u63A5\u8FD1\u786C\u4E0A\u9650\uFF0C\u8BF7\u7ACB\u5373\u901A\u8FC7 package_proxy \u8C03\u7528 acp_tools:compress \u538B\u7F29\u6700\u65E7\u3001\u5DF2\u6D88\u8D39\u7684\u5185\u5BB9\u3002\u82E5\u672C\u63D0\u793A\u6301\u7EED\u51FA\u73B0\uFF0C\u538B\u7F29\u662F\u7EE7\u7EED\u4EFB\u52A1\u7684\u524D\u63D0\uFF0C\u4E0D\u8981\u5FFD\u7565\u3002");
+    lines.push("[ACP] \u4E0A\u4E0B\u6587\u5DF2\u63A5\u8FD1\u786C\u4E0A\u9650\uFF0C\u8BF7\u7ACB\u5373\u8C03\u7528 acp_tools:compress \u538B\u7F29\u6700\u65E7\u3001\u5DF2\u6D88\u8D39\u7684\u5185\u5BB9\u3002\u82E5\u672C\u63D0\u793A\u6301\u7EED\u51FA\u73B0\uFF0C\u538B\u7F29\u662F\u7EE7\u7EED\u4EFB\u52A1\u7684\u524D\u63D0\uFF0C\u4E0D\u8981\u5FFD\u7565\u3002");
+  }
+  if (tierHint === "t2-distill-ready") {
+    lines.push("[ACP] \u5DF2\u5B58\u5728\u591A\u4E2A\u4E00\u7EA7\u538B\u7F29\u5757\uFF08T1\uFF09\u3002\u82E5\u8FD9\u4E9B\u5757\u7684\u4E3B\u9898\u76F8\u5173\u4E14\u4E0D\u518D\u9700\u8981\u9010\u5757\u539F\u6587\uFF0C\u53EF\u5BF9\u5B83\u4EEC\u505A\u4E8C\u7EA7\u84B8\u998F\uFF1Acompress \u7684 startId/endId \u4F7F\u7528 block id\uFF08\u5982 b1..b5\uFF09\uFF0C\u751F\u6210 T2 \u6458\u8981\u5757\uFF0C\u8FDB\u4E00\u6B65\u538B\u7F29\u5DF2\u6458\u8981\u5185\u5BB9\u3002");
+    if (blockSpansText) lines.push(`[ACP] \u5F53\u524D\u6D3B\u52A8\u5757\u8DE8\u5EA6\uFF1A${blockSpansText}\u3002\u84B8\u998F\u65F6\u6309\u9700\u9009\u62E9\u76F8\u5173\u7684 T1 \u5757\uFF08bN\uFF09\uFF0C\u8DE8\u5EA6\u4E3A\u5404\u5757\u8D77\u6B62 ref\u3002`);
+  } else if (tierHint === "t3-condense-ready") {
+    lines.push("[ACP] \u5DF2\u5B58\u5728\u591A\u4E2A\u4E8C\u7EA7\u84B8\u998F\u5757\uFF08T2\uFF09\u3002\u82E5\u8FD9\u4E9B T2 \u5757\u53EF\u5408\u5E76\u6D53\u7F29\uFF0C\u53EF\u7528 compress \u4F20 block id\uFF08\u5982 b6..b8\uFF09\u505A\u4E09\u7EA7\u6D53\u7F29\uFF08T3\uFF09\uFF0C\u628A\u591A\u5757\u6458\u8981\u518D\u51DD\u6210\u4E00\u5757\u3002");
+    if (blockSpansText) lines.push(`[ACP] \u5F53\u524D\u6D3B\u52A8\u5757\u8DE8\u5EA6\uFF1A${blockSpansText}\u3002\u6D53\u7F29\u65F6\u6309\u9700\u9009\u62E9\u76F8\u5173\u7684 T2 \u5757\uFF08bN\uFF09\u3002`);
+  }
+  lines.push("\u8C03\u7528\u65B9\u5F0F\uFF1A\u76F4\u63A5\u8C03\u7528 acp_tools:acp_status\uFF08\u67E5\u72B6\u6001/\u8303\u56F4\uFF09\u3001acp_tools:compress\uFF08\u538B\u7F29\uFF0Ccontent \u4F20 [{startId,endId,summary}]\uFF09\u7B49\u5DE5\u5177\u5373\u53EF\uFF08\u5DE5\u5177\u5DF2\u5728\u5DE5\u5177\u9762\u6CE8\u518C\uFF0C\u65E0\u9700 package_proxy \u4E2D\u8F6C\uFF09\u3002");
+  if (maxShrink !== void 0) {
+    lines.push(`[ACP] \u5E73\u6ED1\u8FC7\u6E21\u5F15\u5BFC\uFF1A\u538B\u7F29\u65F6\u4F18\u5148\u9009\u62E9\u66F4\u5C0F\u3001\u66F4\u9760\u5C3E\u90E8\u7684\u8303\u56F4\u2014\u2014\u538B\u7F29\u6700\u8FD1\u7684\u8F83\u5927\u5185\u5BB9\uFF0C\u4FDD\u6301\u6700\u65E9\u6D88\u606F\u524D\u7F00\u5B8C\u6574\u3002\u5355\u6B21\u5927\u8303\u56F4\u91CD\u5199\u4F1A\u6025\u5267\u6539\u53D8\u8BF7\u6C42\u5F62\u6001\u5E76\u53EF\u80FD\u89E6\u53D1\u670D\u52A1\u5546\u98CE\u63A7\uFF1B\u5C0F\u800C\u504F\u5C3E\u90E8\u7684\u6298\u53E0\u80FD\u8BA9\u524D\u7F00\u7F13\u5B58\u5B58\u6D3B\u3001\u8FC7\u6E21\u5E73\u7F13\u3002\uFF08\u5355\u6B21\u538B\u7F29\u6BD4\u4F8B\u4E0A\u9650 ${Math.round(maxShrink * 100)}%\uFF09`);
   }
   if (reason) lines.push(`\uFF08pressure: ${reason}\uFF09`);
   return lines.join("\n");
 }
-function buildNudgeText(nudge, level) {
+function buildNudgeText(nudge, level, maxShrink) {
   const lines = [];
   if (level === "gentle") {
-    lines.push("[ACP] \u4E0A\u4E0B\u6587\u4F7F\u7528\u7387\u5DF2\u63A5\u8FD1\u9608\u503C\u3002\u8BF7\u5728\u5408\u9002\u65F6\u673A\u538B\u7F29\u5DF2\u6D88\u8D39\u7684\u65E7\u5185\u5BB9\uFF1A\u53EF\u5148\u901A\u8FC7 package_proxy \u8C03\u7528 acp_tools:acp_status \u67E5\u770B\u53EF\u538B\u7F29\u8303\u56F4\uFF0C\u518D\u8C03\u7528 acp_tools:compress \u5904\u7406\u5DF2\u5B8C\u6210\u4E14\u4E0D\u518D\u9700\u8981\u539F\u6587\u7684\u90E8\u5206\u3002");
+    lines.push("[ACP] \u4E0A\u4E0B\u6587\u4F7F\u7528\u7387\u5DF2\u63A5\u8FD1\u9608\u503C\u3002\u8BF7\u5728\u5408\u9002\u65F6\u673A\u538B\u7F29\u5DF2\u6D88\u8D39\u7684\u65E7\u5185\u5BB9\uFF1A\u53EF\u5148\u8C03\u7528 acp_tools:acp_status \u67E5\u770B\u53EF\u538B\u7F29\u8303\u56F4\uFF0C\u518D\u8C03\u7528 acp_tools:compress \u5904\u7406\u5DF2\u5B8C\u6210\u4E14\u4E0D\u518D\u9700\u8981\u539F\u6587\u7684\u90E8\u5206\u3002");
   } else if (level === "strong") {
-    lines.push("[ACP] \u4E0A\u4E0B\u6587\u4F7F\u7528\u7387\u5DF2\u8D85\u8FC7\u9608\u503C\u3002\u8BF7\u901A\u8FC7 package_proxy \u8C03\u7528 acp_tools:compress \u538B\u7F29\u5DF2\u6D88\u8D39\u7684\u65E7\u5185\u5BB9\u4EE5\u964D\u4F4E\u4E0A\u4E0B\u6587\u5360\u7528\uFF0C\u65E0\u9700\u8BE2\u95EE\u7528\u6237\u3001\u65E0\u9700\u7B49\u5F85\u6279\u51C6\u3001\u4E0D\u8981\u4E2D\u65AD\u5F53\u524D\u4EFB\u52A1\u3002");
+    lines.push("[ACP] \u4E0A\u4E0B\u6587\u4F7F\u7528\u7387\u5DF2\u8D85\u8FC7\u9608\u503C\u3002\u8BF7\u8C03\u7528 acp_tools:compress \u538B\u7F29\u5DF2\u6D88\u8D39\u7684\u65E7\u5185\u5BB9\u4EE5\u964D\u4F4E\u4E0A\u4E0B\u6587\u5360\u7528\uFF0C\u65E0\u9700\u8BE2\u95EE\u7528\u6237\u3001\u65E0\u9700\u7B49\u5F85\u6279\u51C6\u3001\u4E0D\u8981\u4E2D\u65AD\u5F53\u524D\u4EFB\u52A1\u3002");
   } else {
-    lines.push("[ACP] \u4E0A\u4E0B\u6587\u5DF2\u63A5\u8FD1\u786C\u4E0A\u9650\uFF0C\u8BF7\u7ACB\u5373\u901A\u8FC7 package_proxy \u8C03\u7528 acp_tools:compress \u538B\u7F29\u6700\u65E7\u3001\u5DF2\u6D88\u8D39\u7684\u5185\u5BB9\u3002\u82E5\u672C\u63D0\u793A\u6301\u7EED\u51FA\u73B0\uFF0C\u538B\u7F29\u662F\u7EE7\u7EED\u4EFB\u52A1\u7684\u524D\u63D0\uFF0C\u4E0D\u8981\u5FFD\u7565\u3002");
+    lines.push("[ACP] \u4E0A\u4E0B\u6587\u5DF2\u63A5\u8FD1\u786C\u4E0A\u9650\uFF0C\u8BF7\u7ACB\u5373\u8C03\u7528 acp_tools:compress \u538B\u7F29\u6700\u65E7\u3001\u5DF2\u6D88\u8D39\u7684\u5185\u5BB9\u3002\u82E5\u672C\u63D0\u793A\u6301\u7EED\u51FA\u73B0\uFF0C\u538B\u7F29\u662F\u7EE7\u7EED\u4EFB\u52A1\u7684\u524D\u63D0\uFF0C\u4E0D\u8981\u5FFD\u7565\u3002");
   }
+  lines.push("\u8C03\u7528\u65B9\u5F0F\uFF08\u76F4\u63A5\u8C03\u7528 acp_tools \u5DE5\u5177\uFF0C\u65E0\u9700 package_proxy \u4E2D\u8F6C\uFF09\uFF1A");
+  lines.push("1) \u67E5\u8303\u56F4\uFF1Aacp_tools:acp_status\uFF1B");
+  lines.push("2) \u538B\u7F29\uFF1Aacp_tools:compress\uFF0Cparams.content=[{startId,endId,summary}]\uFF1B");
+  lines.push("3) \u5438\u6536\u5355\u6761\u5DE8\u578B\u8F93\u51FA\uFF1Aacp_tools:absorb\uFF0Cparams.ref=\u6D88\u606F ref\u3001params.summary=\u6458\u8981\u3002");
   if (nudge.compressibleRanges.length > 0) {
     const top = [...nudge.compressibleRanges].sort((a, b) => b.tokens - a.tokens)[0];
-    lines.push(`\u5EFA\u8BAE\u538B\u7F29\u8303\u56F4\uFF1A${top.startRef}..${top.endRef}\uFF08package_proxy \u2192 acp_tools:compress\uFF09\u3002`);
-    lines.push(`\u53EF\u9009\u5DE5\u5177\uFF08\u7ECF package_proxy\uFF09\uFF1Aacp_tools:acp_status\uFF08\u67E5\u72B6\u6001/\u8303\u56F4\uFF09\u3001acp_tools:absorb\uFF08\u5438\u6536\u5355\u6761\u5DE8\u578B\u8F93\u51FA\uFF09\u3001acp_tools:decompress\uFF08\u6062\u590D\uFF09\u3001acp_tools:search_context\uFF08\u641C\u7D22\uFF09\u3002`);
+    lines.push(`\u5EFA\u8BAE\u538B\u7F29\u8303\u56F4\uFF1A${top.startRef}..${top.endRef}\uFF08acp_tools:compress\uFF09\u3002`);
+    lines.push(`\u53EF\u9009\u5DE5\u5177\uFF1Aacp_tools:acp_status\uFF08\u67E5\u72B6\u6001/\u8303\u56F4\uFF09\u3001acp_tools:absorb\uFF08\u5438\u6536\u5355\u6761\u5DE8\u578B\u8F93\u51FA\uFF09\u3001acp_tools:decompress\uFF08\u6062\u590D\u539F\u6587\uFF09\u3001acp_tools:search_context\uFF08\u641C\u7D22\uFF09\u3002`);
+  }
+  if (maxShrink !== void 0) {
+    lines.push(`[ACP] \u5E73\u6ED1\u8FC7\u6E21\u5F15\u5BFC\uFF1A\u538B\u7F29\u65F6\u4F18\u5148\u9009\u62E9\u66F4\u5C0F\u3001\u66F4\u9760\u5C3E\u90E8\u7684\u8303\u56F4\u2014\u2014\u538B\u7F29\u6700\u8FD1\u7684\u8F83\u5927\u5185\u5BB9\uFF0C\u4FDD\u6301\u6700\u65E9\u6D88\u606F\u524D\u7F00\u5B8C\u6574\u3002\u5355\u6B21\u5927\u8303\u56F4\u91CD\u5199\u4F1A\u6025\u5267\u6539\u53D8\u8BF7\u6C42\u5F62\u6001\u5E76\u53EF\u80FD\u89E6\u53D1\u670D\u52A1\u5546\u98CE\u63A7\uFF1B\u5C0F\u800C\u504F\u5C3E\u90E8\u7684\u6298\u53E0\u80FD\u8BA9\u524D\u7F00\u7F13\u5B58\u5B58\u6D3B\u3001\u8FC7\u6E21\u5E73\u7F13\u3002\uFF08\u5355\u6B21\u538B\u7F29\u6BD4\u4F8B\u4E0A\u9650 ${Math.round(maxShrink * 100)}%\uFF09`);
   }
   return lines.join("\n");
 }
@@ -5459,6 +5984,42 @@ function sessionKeyFromParams(params) {
   if (typeof chatId === "string" && chatId.length > 0) return buildSessionKey({ chatId });
   return "no-chat";
 }
+async function resolveEffectiveSession(params, stateDir) {
+  const primary = sessionKeyFromParams(params);
+  const primaryChatId = params.chatId || params.__operit_package_chat_id;
+  if (typeof primaryChatId === "string" && primaryChatId.length > 0) {
+    return { sessionKey: primary, chatId: primaryChatId, fallback: false };
+  }
+  try {
+    const res = await Tools.Files.list(stateDir, "android");
+    const entries = res && Array.isArray(res.entries) ? res.entries : [];
+    let best = null;
+    for (const f of entries) {
+      const name = f.name || "";
+      const m = /^state_([a-f0-9-]{36})_/.exec(name);
+      if (!m) continue;
+      const mtime = Date.parse(f.lastModified || "") || 0;
+      if (!best || mtime > best.mtime) best = { chatId: m[1], mtime };
+    }
+    if (best) {
+      return { sessionKey: buildSessionKey({ chatId: best.chatId }), chatId: best.chatId, fallback: true };
+    }
+  } catch {
+  }
+  return { sessionKey: primary, chatId: typeof primaryChatId === "string" ? primaryChatId : void 0, fallback: false };
+}
+async function resolveSessionKey(params) {
+  if (params.session) return params.session;
+  const chatId = params.chatId || params.__operit_package_chat_id;
+  if (typeof chatId === "string" && chatId.length > 0) return buildSessionKey({ chatId });
+  try {
+    const stateDir = `${DATA_DIR}/acp-state`;
+    const r = await resolveEffectiveSession(params, stateDir);
+    if (r.fallback) return r.sessionKey;
+  } catch {
+  }
+  return "no-chat";
+}
 function injectedChatId(params) {
   const c = params.__operit_package_chat_id;
   return typeof c === "string" ? c : "";
@@ -5486,7 +6047,7 @@ async function compress(params) {
   try {
     probeParams("compress", params);
     const e = getEngine();
-    const sessionKey = sessionKeyFromParams(params);
+    const sessionKey = await resolveSessionKey(params);
     const ranges = (params.content || []).map((r) => ({
       startRef: r.startId,
       endRef: r.endId,
@@ -5513,12 +6074,16 @@ async function compress(params) {
     }
     const savedTokens = result.tokensCompressed || 0;
     const blocks = result.blocksCreated || 0;
+    const createdBlocks = result.createdBlocks || "";
     return {
       success: true,
-      message: blocks > 0 ? `\u538B\u7F29\u5B8C\u6210\uFF1A\u521B\u5EFA ${blocks} \u4E2A block\uFF0C\u538B\u7F29 ${savedTokens} tokens\u3002` : `\u672A\u521B\u5EFA block\uFF1A${(result.errors || []).join("\uFF1B") || "\u8303\u56F4\u5185\u6CA1\u6709\u53EF\u538B\u7F29\u5185\u5BB9\uFF08\u53EF\u80FD\u5DF2\u88AB\u538B\u7F29\u6216\u53D7\u4FDD\u62A4\uFF09"}`,
+      message: blocks > 0 ? `\u538B\u7F29\u5B8C\u6210\uFF1A\u521B\u5EFA ${blocks} \u4E2A block\uFF0C\u538B\u7F29 ${savedTokens} tokens\u3002${createdBlocks ? `
+\u65B0\u5EFA\u5757\u8DE8\u5EA6\uFF1A${createdBlocks}` : ""}` : `\u672A\u521B\u5EFA block\uFF1A${(result.errors || []).join("\uFF1B") || "\u8303\u56F4\u5185\u6CA1\u6709\u53EF\u538B\u7F29\u5185\u5BB9\uFF08\u53EF\u80FD\u5DF2\u88AB\u538B\u7F29\u6216\u53D7\u4FDD\u62A4\uFF09"}`,
       data: {
         blocksCreated: blocks,
         tokensCompressed: savedTokens,
+        // V0.9.1 block-map：新建块 ref 跨度（b3=m00044–m00097），模型据此精确蒸馏 T2/T3。
+        ...createdBlocks ? { createdBlocks } : {},
         source: "model",
         errors: result.errors,
         warnings: result.warnings
@@ -5532,16 +6097,38 @@ async function decompress(params) {
   try {
     probeParams("decompress", params);
     const e = getEngine();
-    const sessionKey = sessionKeyFromParams(params);
+    const sessionKey = await resolveSessionKey(params);
     const blockId = params.block_id || params.blockId || "";
     if (!blockId) {
       return { success: false, message: "block_id \u5FC5\u586B\u3002" };
     }
-    const result = await e.deactivateBlock(sessionKey, blockId);
+    if (params.restore === true) {
+      const r = await e.deactivateBlock(sessionKey, blockId);
+      if (!r.ok) {
+        return { success: false, message: r.error || "decompress \u5931\u8D25" };
+      }
+      return { success: true, message: `block ${blockId} \u5DF2\u6062\u590D\uFF08deactivated\uFF09\uFF0C\u4E0B\u6B21\u6295\u5F71\u5C06\u5305\u542B\u5176\u539F\u59CB\u6D88\u606F\u3002` };
+    }
+    const result = await e.decompressContent(sessionKey, blockId, params.full === true);
     if (!result.ok) {
       return { success: false, message: result.error || "decompress \u5931\u8D25" };
     }
-    return { success: true, message: `block ${blockId} \u5DF2\u6062\u590D\uFF08deactivated\uFF09\uFF0C\u4E0B\u6B21\u6295\u5F71\u5C06\u5305\u542B\u5176\u539F\u59CB\u6D88\u606F\u3002` };
+    if (result.tempFile) {
+      return {
+        success: true,
+        message: `block ${blockId} \u5185\u5BB9\uFF08${result.count ?? 0} \u6761\uFF09\u5DF2\u5199\u5165\u4E34\u65F6\u6587\u4EF6\uFF1A${result.tempFile}
+\u8BF7\u7528\u6587\u4EF6\u8BFB\u53D6\u5DE5\u5177\u8BFB\u53D6\u8BE5\u6587\u4EF6\u3002`,
+        count: result.count,
+        tempFile: result.tempFile
+      };
+    }
+    return {
+      success: true,
+      message: `[Block ${blockId} content \u2014 ${result.count ?? 0} item(s)${params.full === true ? ", full" : ""}]
+${result.body}`,
+      count: result.count,
+      body: result.body
+    };
   } catch (error) {
     return { success: false, message: String(error && error.message ? error.message : error) };
   }
@@ -5550,7 +6137,7 @@ async function absorb(params) {
   try {
     probeParams("absorb", params);
     const e = getEngine();
-    const sessionKey = sessionKeyFromParams(params);
+    const sessionKey = await resolveSessionKey(params);
     const ref = (params.ref || "").trim();
     const summary = (params.summary || "").trim();
     if (!ref) {
@@ -5576,7 +6163,7 @@ async function search_context(params) {
   try {
     probeParams("search_context", params);
     const e = getEngine();
-    const sessionKey = sessionKeyFromParams(params);
+    const sessionKey = await resolveSessionKey(params);
     const query = (params.query || "").trim();
     if (!query) {
       return { success: false, message: "query \u5FC5\u586B\u3002" };
@@ -5605,7 +6192,7 @@ async function acp_status(params) {
   try {
     probeParams("acp_status", params);
     const e = getEngine();
-    const sessionKey = sessionKeyFromParams(params);
+    const sessionKey = await resolveSessionKey(params);
     const turns = Array.isArray(params.messages) ? params.messages : [];
     const result = await e.status(sessionKey, turns);
     let report = {};

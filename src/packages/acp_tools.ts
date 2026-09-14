@@ -41,13 +41,15 @@
     {
       name: "decompress"
       description: {
-        zh: "恢复一个已压缩 block（deactivate），下次投影将包含其原始消息。"
-        en: "Restore a compressed block (deactivate); the next projection will include its original messages."
+        zh: "读取一个已压缩 block 的原文内容（无状态，不改压缩状态）。默认一层视图；full=true 递归全部原始消息；restore=true 才恢复激活（deactivate）。内容超 1 万字符写临时文件返回路径。",
+        en: "Read a compressed block's original content (stateless). Default one-tier view; full=true recurses to all original messages; restore=true reactivates (deactivate). Content over 10k chars is written to a temp file."
       }
       parameters: [
         { name: "chatId", description: { zh: "会话 ID（可选）", en: "Chat ID (optional)" }, type: "string", required: false }
         { name: "session", description: { zh: "session key（可选）", en: "Session key (optional)" }, type: "string", required: false }
-        { name: "block_id", description: { zh: "要恢复的 block id（如 b1）", en: "Block id to restore (e.g. b1)" }, type: "string", required: true }
+        { name: "block_id", description: { zh: "要读取的 block id（如 b1）", en: "Block id to read (e.g. b1)" }, type: "string", required: true }
+        { name: "full", description: { zh: "true 时递归到全部原始消息", en: "Recurse to all original messages when true" }, type: "boolean", required: false }
+        { name: "restore", description: { zh: "true 时才恢复激活（deactivate）", en: "Actually reactivate (deactivate) when true" }, type: "boolean", required: false }
       ]
     }
     {
@@ -92,6 +94,7 @@
 
 import { createEngine } from "../acp/adapter";
 import { buildSessionKey } from "../acp/session";
+import { DATA_DIR } from "../acp/paths";
 import { markCompressReceived, markTaskEndFoldApplied, getTaskEndFoldState } from "../acp/task-end-fold";
 import type { AcpEngine } from "../acp/adapter";
 
@@ -137,34 +140,54 @@ function sessionKeyFromParams(params: { chatId?: string; session?: string; __ope
  * - fallback 必须显式返回 chatId（让模型/日志知道作用于哪个会话）；
  * - 若有多个候选（歧义）→ 不 fallback，保持主会话并返回诊断。
  */
-function resolveEffectiveSession(
+async function resolveEffectiveSession(
   params: { chatId?: string; session?: string; __operit_package_chat_id?: string },
   stateDir: string,
-): { sessionKey: string; chatId?: string; fallback: boolean } {
+): Promise<{ sessionKey: string; chatId?: string; fallback: boolean }> {
   const primary = sessionKeyFromParams(params);
   const primaryChatId = params.chatId || (params as Record<string, unknown>).__operit_package_chat_id;
   // 快速路径：注入的 chatId 本身就有 state（最常见情况）→ 直接用，不扫描。
   if (typeof primaryChatId === "string" && primaryChatId.length > 0) {
     return { sessionKey: primary, chatId: primaryChatId, fallback: false };
   }
-  // 无注入 chatId → 扫描 state 目录找最近活跃会话（受控）。
+  // V0.9.3：无注入 chatId → 扫描 state 目录，按最近修改时间找"最近活跃"的会话（受控）。
+  // 原实现要求"恰一个"候选才 fallback，但实际有 14+ 会话必然歧义 → fallback 永远不触发
+  // → 无 chatId 时永远落 no-chat 空会话（acp_status 全 0 / compress refs unknown）。
+  // 新策略：无注入时选最近活跃（lastModified 最新）的 state 文件所属会话；若一个都没有 → no-chat。
   try {
-    const res = Tools.Files.list(stateDir, "android");
-    const files = (Array.isArray(res) ? res : [])
-      .map((f: unknown) => (typeof f === "string" ? f : ""))
-      .filter((f: string) => f.endsWith(".json") && !f.includes("raw"));
-    // 解析 chatId 前缀（state_<chatId>_<hash>.json）
-    const sessions = new Map<string, number>(); // chatId -> blocks 估算（用文件存在近似）
-    for (const f of files) {
-      const m = /^state_([a-f0-9-]{36})_/.exec(f);
-      if (m) sessions.set(m[1], 1);
+    const res = await Tools.Files.list(stateDir, "android");
+    const entries = (res && Array.isArray(res.entries) ? res.entries : []) as Array<{
+      name?: string;
+      lastModified?: string;
+    }>;
+    let best: { chatId: string; mtime: number } | null = null;
+    for (const f of entries) {
+      const name = f.name || "";
+      const m = /^state_([a-f0-9-]{36})_/.exec(name);
+      if (!m) continue;
+      const mtime = Date.parse(f.lastModified || "") || 0;
+      if (!best || mtime > best.mtime) best = { chatId: m[1], mtime };
     }
-    if (sessions.size === 1) {
-      const [onlyChat] = sessions.keys();
-      return { sessionKey: buildSessionKey({ chatId: onlyChat }), chatId: onlyChat, fallback: true };
+    if (best) {
+      return { sessionKey: buildSessionKey({ chatId: best.chatId }), chatId: best.chatId, fallback: true };
     }
   } catch { /* 扫描失败 → 保持主会话 */ }
   return { sessionKey: primary, chatId: typeof primaryChatId === "string" ? primaryChatId : undefined, fallback: false };
+}
+
+/** 工具统一入口：解析有效 session key（含无 chatId 时的受控 fallback）。 */
+async function resolveSessionKey(params: { chatId?: string; session?: string; __operit_package_chat_id?: string }): Promise<string> {
+  // 有显式 session / chatId → 直接用（不扫描，最快路径）。
+  if (params.session) return params.session;
+  const chatId = params.chatId || (params as Record<string, unknown>).__operit_package_chat_id;
+  if (typeof chatId === "string" && chatId.length > 0) return buildSessionKey({ chatId });
+  // 无注入 → 受控 fallback（最近活跃会话），而不是 no-chat。
+  try {
+    const stateDir = `${DATA_DIR}/acp-state`;
+    const r = await resolveEffectiveSession(params, stateDir);
+    if (r.fallback) return r.sessionKey;
+  } catch { /* noop */ }
+  return "no-chat";
 }
 
 /** 从宿主注入的完整参数里取当前会话 chatId（兼容各注入形态）。 */
@@ -201,7 +224,7 @@ export async function compress(params: {
   try {
     probeParams("compress", params as Record<string, unknown>);
     const e = getEngine();
-    const sessionKey = sessionKeyFromParams(params);
+    const sessionKey = await resolveSessionKey(params);
     const ranges = (params.content || []).map((r) => ({
       startRef: r.startId,
       endRef: r.endId,
@@ -227,14 +250,17 @@ export async function compress(params: {
     }
     const savedTokens = result.tokensCompressed || 0;
     const blocks = result.blocksCreated || 0;
+    const createdBlocks = (result as { createdBlocks?: string }).createdBlocks || "";
     return {
       success: true,
       message: blocks > 0
-        ? `压缩完成：创建 ${blocks} 个 block，压缩 ${savedTokens} tokens。`
+        ? `压缩完成：创建 ${blocks} 个 block，压缩 ${savedTokens} tokens。${createdBlocks ? `\n新建块跨度：${createdBlocks}` : ""}`
         : `未创建 block：${(result.errors || []).join("；") || "范围内没有可压缩内容（可能已被压缩或受保护）"}`,
       data: {
         blocksCreated: blocks,
         tokensCompressed: savedTokens,
+        // V0.9.1 block-map：新建块 ref 跨度（b3=m00044–m00097），模型据此精确蒸馏 T2/T3。
+        ...(createdBlocks ? { createdBlocks } : {}),
         source: "model",
         errors: result.errors,
         warnings: result.warnings,
@@ -250,20 +276,44 @@ export async function decompress(params: {
   session?: string;
   block_id?: string;
   blockId?: string;
+  full?: boolean;
+  restore?: boolean;
 }): Promise<unknown> {
   try {
     probeParams("decompress", params as Record<string, unknown>);
     const e = getEngine();
-    const sessionKey = sessionKeyFromParams(params);
+    const sessionKey = await resolveSessionKey(params);
     const blockId = params.block_id || params.blockId || "";
     if (!blockId) {
       return { success: false, message: "block_id 必填。" };
     }
-    const result = await e.deactivateBlock(sessionKey, blockId);
+    // V0.9.2：默认无状态读原文（copy-paste，不改 state，原版 bc-upstream 同款）。
+    // restore=true 时才 deactivate（恢复激活，下次投影含原始消息）。
+    if (params.restore === true) {
+      const r = await e.deactivateBlock(sessionKey, blockId);
+      if (!r.ok) {
+        return { success: false, message: r.error || "decompress 失败" };
+      }
+      return { success: true, message: `block ${blockId} 已恢复（deactivated），下次投影将包含其原始消息。` };
+    }
+    const result = await e.decompressContent(sessionKey, blockId, params.full === true);
     if (!result.ok) {
       return { success: false, message: result.error || "decompress 失败" };
     }
-    return { success: true, message: `block ${blockId} 已恢复（deactivated），下次投影将包含其原始消息。` };
+    if (result.tempFile) {
+      return {
+        success: true,
+        message: `block ${blockId} 内容（${result.count ?? 0} 条）已写入临时文件：${result.tempFile}\n请用文件读取工具读取该文件。`,
+        count: result.count,
+        tempFile: result.tempFile,
+      };
+    }
+    return {
+      success: true,
+      message: `[Block ${blockId} content — ${result.count ?? 0} item(s)${params.full === true ? ", full" : ""}]\n${result.body}`,
+      count: result.count,
+      body: result.body,
+    };
   } catch (error) {
     return { success: false, message: String(error && (error as Error).message ? (error as Error).message : error) };
   }
@@ -278,7 +328,7 @@ export async function absorb(params: {
   try {
     probeParams("absorb", params as Record<string, unknown>);
     const e = getEngine();
-    const sessionKey = sessionKeyFromParams(params);
+    const sessionKey = await resolveSessionKey(params);
     const ref = (params.ref || "").trim();
     const summary = (params.summary || "").trim();
     if (!ref) {
@@ -309,7 +359,7 @@ export async function search_context(params: {
   try {
     probeParams("search_context", params as Record<string, unknown>);
     const e = getEngine();
-    const sessionKey = sessionKeyFromParams(params);
+    const sessionKey = await resolveSessionKey(params);
     const query = (params.query || "").trim();
     if (!query) {
       return { success: false, message: "query 必填。" };
@@ -343,7 +393,7 @@ export async function acp_status(params: {
   try {
     probeParams("acp_status", params as Record<string, unknown>);
     const e = getEngine();
-    const sessionKey = sessionKeyFromParams(params);
+    const sessionKey = await resolveSessionKey(params);
     const turns = Array.isArray(params.messages) ? params.messages : [];
     const result = await e.status(sessionKey, turns as never);
     let report: unknown = {};

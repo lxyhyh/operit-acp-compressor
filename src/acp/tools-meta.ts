@@ -7,7 +7,7 @@
  * 纯数据 + 零依赖（不 import Tools/环境），便于测试与跨 runtime 复用。
  *
  * V0.7.13-P2：不再注入 availableTools（无 ToolPromptComposeHook 注册）。
- * 模型侧经 Operit 原生 package_proxy(tool_name="acp_tools:xxx") 调用，
+ * V0.9.3：模型侧直接调用工具面注册的 acp_tools:* 工具（宿主自动桥接，无需 package_proxy 中转），
  * 本文件仅作为元数据源保留（测试/审计用）。
  */
 
@@ -29,7 +29,7 @@ export const ACP_CORE_TOOLS: readonly AcpToolMeta[] = [
   {
     name: "compress",
     categoryName: "acp_compressor",
-    descriptionZh: "压缩指定消息范围（startId..endId）为摘要 block。startId/endId 必须是 acp_status 报告中的 ref id（如 m00001）或 block id（如 b1）。summary 需保留关键信息。",
+    descriptionZh: "压缩指定消息范围（startId..endId）为摘要 block。startId/endId 必须是 acp_status 报告中的 ref id（如 m00001）或 block id（如 b1）。传消息 ref 生成 T1 块；传 block id（b1..bN）会把已压缩块蒸馏为 T2（二级）、T2 块浓缩为 T3（三级）。summary 需保留关键信息。",
     descriptionEn: "Compress a message range (startId..endId) into a summary block. startId/endId must be ref ids (e.g. m00001) or block ids (e.g. b1) reported by acp_status. The summary must retain key information.",
     parameters: {
       type: "object",
@@ -69,12 +69,14 @@ export const ACP_CORE_TOOLS: readonly AcpToolMeta[] = [
   {
     name: "decompress",
     categoryName: "acp_compressor",
-    descriptionZh: "恢复一个已压缩 block（deactivate），下次投影将包含其原始消息。",
-    descriptionEn: "Restore a compressed block (deactivate); the next projection will include its original messages.",
+    descriptionZh: "读取一个已压缩 block 的原文内容（无状态 copy-paste，不改压缩状态）。默认返回一层视图（直接消息+嵌套摘要）；full=true 递归到全部原始消息。restore=true 时才真正恢复激活（deactivate，下次投影含原始消息）。内容超 1 万字符时写入临时文件并返回路径。",
+    descriptionEn: "Read a compressed block's original content (stateless copy-paste; does not change compression state). Default returns one-tier view (direct messages + nested summaries); full=true recurses to all original messages. restore=true actually reactivates (deactivate; next projection includes original messages). Content over 10k chars is written to a temp file and its path returned.",
     parameters: {
       type: "object",
       properties: {
-        block_id: { type: "string", description: "要恢复的 block id（如 b1）" },
+        block_id: { type: "string", description: "要读取的 block id（如 b1）" },
+        full: { type: "boolean", description: "true 时递归到全部原始消息（默认 false：一层视图）" },
+        restore: { type: "boolean", description: "true 时才 deactivate 恢复激活（默认 false：只读原文）" },
       },
       required: ["block_id"],
     },
@@ -95,8 +97,8 @@ export const ACP_CORE_TOOLS: readonly AcpToolMeta[] = [
   {
     name: "acp_status",
     categoryName: "acp_compressor",
-    descriptionZh: "查看当前 session 的 ACP 状态：context usage、active blocks、compressed tokens、当前可压缩范围。",
-    descriptionEn: "View ACP status for the current session: context usage, active blocks, compressed tokens, compressible ranges.",
+    descriptionZh: "查看当前 session 的 ACP 状态：context usage、active blocks（含 blockSpans：每个 block 的 id/tier/ref 跨度）、compressed tokens、当前可压缩范围。blockSpans 用于精确定位可蒸馏（T2）或浓缩（T3）的 block id。",
+    descriptionEn: "View ACP status for the current session: context usage, active blocks (blockSpans: each block id/tier/ref span), compressed tokens, compressible ranges. blockSpans helps locate block ids for T2 distill / T3 condense.",
     parameters: { type: "object", properties: {} },
   },
 ];

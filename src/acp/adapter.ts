@@ -13,7 +13,6 @@
  * 幂等：同一 send 周期（before_finalize_prompt + before_send_to_model）
  * 同 fingerprint 时跳过 processTurn/save，直接返回缓存投影。
  */
-
 import {
   createCore,
   deactivateBlock as kernelDeactivateBlock,
@@ -22,6 +21,10 @@ import {
   applyAbsorb as kernelApplyAbsorb,
   defaultCountTokens,
   hideConsumedCompressCalls as kernelHideConsumedCompressCalls,
+  activeBlockSpans as kernelActiveBlockSpans,
+  formatCreatedBlocks as kernelFormatCreatedBlocks,
+  collectBlockContent as kernelCollectBlockContent,
+  viableRanges as kernelViableRanges,
 } from "acp-kernel";
 import type { CompressionCore, CompressionState, Config, CoreMessage } from "acp-kernel";
 import { loadAdapterSettings, resolveKernelConfig, type AdapterSettings } from "./config";
@@ -51,6 +54,7 @@ import {
 } from "./absorb-candidates";
 import {
   evaluatePressure,
+  detectTierOpportunity,
   type NudgeLevel as PressureNudgeLevel,
   type PressureEpoch,
   type PressureDecision,
@@ -227,6 +231,10 @@ export interface AcpEngine {
     chatId?: string,
   ): Promise<{ state: CompressionState; blocksCreated: number; tokensCompressed: number; errors: string[]; warnings: string[] }>;
   deactivateBlock(sessionKey: string, blockId: string): Promise<{ ok: boolean; error?: string }>;
+  /** V0.9.2 decompress-content：无状态读取 block 原文（copy-paste，不改 state）。
+   *  full=false 一层视图（直接消息+嵌套摘要），full=true 递归到全部原始消息。
+   *  大内容（>10000 字符）写临时文件返回路径。 */
+  decompressContent(sessionKey: string, blockId: string, full?: boolean): Promise<{ ok: boolean; body?: string; count?: number; tempFile?: string; error?: string }>;
   absorb(sessionKey: string, ref: string, summary: string): Promise<{ ok: boolean; resultText: string; absorbedTokens?: number }>;
   search(sessionKey: string, query: string): Promise<unknown[]>;
   status(sessionKey: string, messages: PromptTurnLike[]): Promise<{ report: string; state: CompressionState }>;
@@ -580,9 +588,18 @@ export function createEngine(dataDir?: string): AcpEngine {
           // 不能因为 stage2 复用缓存而丢失前一个 Hop 的 nudge——本 Hop 重新决策注入）。
           let stage2NudgeText: string | undefined;
           let stage2Delivery: NudgeDelivery | undefined;
-          if (stage2Pressure.pressure.allowInject && settings.nudgeEnabled) {
-            stage2Delivery = createNudgeDelivery(hookStage);
-            stage2NudgeText = buildNudgeTextFromReason(stage2Pressure.pressure.decisionReason, stage2Level);
+          const stage2TierHint = detectTierOpportunity({
+          activeBlocks: cached.kernelState.blocks,
+          tier2Trigger: settings.tier2Trigger,
+          tier3Trigger: settings.tier3Trigger,
+        });
+        if (stage2Pressure.pressure.allowInject && settings.nudgeEnabled) {
+          stage2Delivery = createNudgeDelivery(hookStage);
+          const stage2Spans = kernelActiveBlockSpans(cached.kernelState);
+          const stage2SpansText = stage2Spans.length > 0
+            ? stage2Spans.map((s) => `${s.blockId}(${s.tier}:${s.startRef}..${s.endRef})`).join(", ")
+            : "";
+          stage2NudgeText = buildNudgeTextFromReason(stage2Pressure.pressure.decisionReason, stage2Level, stage2TierHint, stage2SpansText, settings.maxShrinkPerCompress);
             const stage2Carrier = buildNudgeCarrier(stage2NudgeText, stage2Level);
             finalPrepared.push({ kind: stage2Carrier.kind, content: stage2Carrier.content, metadata: stage2Carrier.metadata });
             stage2Delivery = markDelivered(stage2Delivery, stage2NudgeText, stage2Carrier, stage2Level);
@@ -664,9 +681,18 @@ export function createEngine(dataDir?: string): AcpEngine {
           //   硬限只作为 forcedThresholdPct 产生 forced nudge，绝不自动压缩历史。
           let cacheNudgeText: string | undefined;
           let cacheDelivery: NudgeDelivery | undefined;
-          if (cachePressure.pressure.allowInject && settings.nudgeEnabled) {
-            cacheDelivery = createNudgeDelivery(hookStage);
-            cacheNudgeText = buildNudgeTextFromReason(cachePressure.pressure.decisionReason, cacheLevel);
+          const cacheTierHint = detectTierOpportunity({
+          activeBlocks: cached.kernelState.blocks,
+          tier2Trigger: settings.tier2Trigger,
+          tier3Trigger: settings.tier3Trigger,
+        });
+        if (cachePressure.pressure.allowInject && settings.nudgeEnabled) {
+          cacheDelivery = createNudgeDelivery(hookStage);
+          const cacheSpans = kernelActiveBlockSpans(cached.kernelState);
+          const cacheSpansText = cacheSpans.length > 0
+            ? cacheSpans.map((s) => `${s.blockId}(${s.tier}:${s.startRef}..${s.endRef})`).join(", ")
+            : "";
+          cacheNudgeText = buildNudgeTextFromReason(cachePressure.pressure.decisionReason, cacheLevel, cacheTierHint, cacheSpansText, settings.maxShrinkPerCompress);
             const cacheCarrier = buildNudgeCarrier(cacheNudgeText, cacheLevel);
             cacheFinal.push({ kind: cacheCarrier.kind, content: cacheCarrier.content, metadata: cacheCarrier.metadata });
             cacheDelivery = markDelivered(cacheDelivery, cacheNudgeText, cacheCarrier, cacheLevel);
@@ -756,9 +782,18 @@ export function createEngine(dataDir?: string): AcpEngine {
               //   硬限只作为 forcedThresholdPct 产生 forced nudge，绝不自动压缩历史。
               let incNudgeText: string | undefined;
               let incDelivery: NudgeDelivery | undefined;
-              if (incPressure.pressure.allowInject && settings.nudgeEnabled) {
+              const incTierHint = detectTierOpportunity({
+              activeBlocks: cached.kernelState.blocks,
+              tier2Trigger: settings.tier2Trigger,
+              tier3Trigger: settings.tier3Trigger,
+            });
+            if (incPressure.pressure.allowInject && settings.nudgeEnabled) {
                 incDelivery = createNudgeDelivery(hookStage);
-                incNudgeText = buildNudgeTextFromReason(incPressure.pressure.decisionReason, incLevel);
+                const incSpans = kernelActiveBlockSpans(cached.kernelState);
+                const incSpansText = incSpans.length > 0
+                  ? incSpans.map((s) => `${s.blockId}(${s.tier}:${s.startRef}..${s.endRef})`).join(", ")
+                  : "";
+                incNudgeText = buildNudgeTextFromReason(incPressure.pressure.decisionReason, incLevel, incTierHint, incSpansText, settings.maxShrinkPerCompress);
                 const incCarrier = buildNudgeCarrier(incNudgeText, incLevel);
                 incFinal.push({ kind: incCarrier.kind, content: incCarrier.content, metadata: incCarrier.metadata });
                 incDelivery = markDelivered(incDelivery, incNudgeText, incCarrier, incLevel);
@@ -970,7 +1005,7 @@ export function createEngine(dataDir?: string): AcpEngine {
         let delivery: NudgeDelivery | undefined;
         if (pressure.allowInject && settings.nudgeEnabled) {
           delivery = createNudgeDelivery(hookStage);
-          nudgeText = buildNudgeText(turn.nudge!, level);
+          nudgeText = buildNudgeText(turn.nudge!, level, settings.maxShrinkPerCompress);
           // V0.6 Phase3.1：从持久化候选读取（检测已在 project 内与 nudge 解耦恒执行）。
           //    只消费候选，不在此处重新检测。文案提供可操作 ref（与 absorb 工具兼容）。
           const active = getActiveAbsorbCandidates(nextAbsorbCandidates);
@@ -1291,12 +1326,17 @@ export function createEngine(dataDir?: string): AcpEngine {
           },
         });
         projectionCache.delete(sessionKey); estimateCache.delete(sessionKey);
+        const createdBlocksText = newBlockIds.length > 0
+          ? kernelFormatCreatedBlocks(applied.state, applied.state.blocks.filter((b) => newBlockIds.includes(b.blockId)))
+          : "";
         return {
           state: applied.state,
           blocksCreated: applied.result.blocksCreated,
           tokensCompressed: applied.result.tokensCompressed,
           errors: applied.result.errors,
           warnings: applied.result.warnings,
+          // V0.9.1 block-map：新建块的 ref 跨度（b3=m00044–m00097），模型据此精确蒸馏。
+          ...(createdBlocksText ? { createdBlocks: createdBlocksText } : {}),
         };
       } finally {
         release();
@@ -1325,6 +1365,38 @@ export function createEngine(dataDir?: string): AcpEngine {
         // ACP Trace：decompress 恢复
         chatTrace(undefined, { type: "decompress", detail: { blockId } });
         return { ok: true };
+      } finally {
+        release();
+      }
+    },
+    // V0.9.2 decompress-content：无状态读取 block 原文（copy-paste，不改 state）。
+    // 原版 bc-upstream 同款思路：优先 raw turns 原文缓存 → collectBlockContent 现抓 → 大内容写临时文件。
+    async decompressContent(sessionKey, blockId, full) {
+      const release = await acquireLock(sessionKey);
+      try {
+        const loaded = await persistence.load(sessionKey);
+        const block = loaded.kernelState.blocks.find((b) => b.blockId === blockId);
+        if (!block) return { ok: false, error: `block ${blockId} not found` };
+        // 1) raw turns（.raw.json 原文缓存）→ CoreMessage[]
+        const rawTurns = (rawTurnsCache.get(sessionKey) ?? loaded.lastRawTurns ?? await persistence.loadRawTurns(sessionKey)) as PromptTurnLike[];
+        const mapping = mapTurnsWithIdentity(rawTurns);
+        // 2) collectBlockContent 提取（full 标志；无状态）
+        const collected = kernelCollectBlockContent(loaded.kernelState, block, mapping.messages, { full: full === true });
+        const body = collected.text || block.summary || "";
+        if (!body) return { ok: false, error: `block ${blockId} 无内容` };
+        // 3) 大内容写临时文件（原版同款：>10000 字符）
+        if (body.length > 10000) {
+          try {
+            const safeId = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
+            const tmpPath = `${settings.dataDir}/acp-decompress-${safeId}-${Date.now()}.txt`;
+            await Tools.Files.write(tmpPath, body, false, "android");
+            return { ok: true, body: "", count: collected.count, tempFile: tmpPath };
+          } catch {
+            // 写文件失败则直接返回内容（截断 4000）
+            return { ok: true, body: body.slice(0, 4000) + "\n...（内容过长，截断显示）", count: collected.count };
+          }
+        }
+        return { ok: true, body, count: collected.count };
       } finally {
         release();
       }
@@ -1389,6 +1461,14 @@ export function createEngine(dataDir?: string): AcpEngine {
       const mapping = promptTurnsToCoreMessages(messages);
       const tokenCount = estimateProjectionTokens(mapping.messages, collectCoveredMessageIds(loaded.kernelState));
       const report = core.status(loaded.kernelState, tokenCount, config);
+      // V0.9.2 viableRanges：用投影消息算连续可压范围（保护区=最近 8 条），
+      // 再用 kernel viableRanges 过滤掉 <200 tokens 碎片——模型据此压缩必成功。
+      const viable = buildViableRanges(
+        loaded.kernelState,
+        mapping.messages,
+        loaded.kernelState.messageRefs?.byRaw ?? {},
+        settings.minCompressRange,
+      );
       // V0.4.1：指标修正——proactive 指"模型主动建块占全部建块的比例"（原实现
       //  compressSucceeded/nudgeIssued 语义不清），并拆出 conversion rate
       //  （nudge 发出后模型是否跟进 compress）。
@@ -1407,6 +1487,10 @@ export function createEngine(dataDir?: string): AcpEngine {
       const enriched = {
         ...(typeof report === "object" && report !== null ? report : { raw: report }),
         runtimeStats: stats,
+        // V0.9.1 block-map：当前所有 active block 的 ref 跨度（模型据此传 block id 蒸馏 T2/T3）。
+        blockSpans: kernelActiveBlockSpans(loaded.kernelState),
+        // V0.9.2 viableRanges：真正可压的连续范围（已过滤 <200 tokens 碎片 + 保护区）。
+        viableRanges: viable,
         metrics: {
           proactiveCompressRatePct: proactiveRate,
           emergencySharePct: emergencyRate,
@@ -1499,47 +1583,112 @@ export function createEngine(dataDir?: string): AcpEngine {
 type NudgeLevel = PressureNudgeLevel;
 
 /**
+ * V0.9.2 viableRanges：计算当前真正可压的连续范围。
+ * 参照 foldSelectRange 的保护区逻辑（最近 8 条），过滤掉已被 block 覆盖的
+ * 消息与保护区，把连续未覆盖消息拼成 range，再用 kernel viableRanges
+ * 过滤 <200 tokens 碎片（模型写不出有意义摘要，且整批会被 kernel 原子拒绝）。
+ */
+function buildViableRanges(
+  state: CompressionState,
+  messages: CoreMessage[],
+  byRaw: Record<string, string>,
+  minCompressRange: number,
+): { startRef: string; endRef: string; tokens: number }[] {
+  const PROTECTED = 8;
+  if (messages.length <= PROTECTED) return [];
+  const covered = collectCoveredMessageIds(state);
+  const recentIds = new Set(messages.slice(-PROTECTED).map((m) => m.id));
+  const raw = Object.entries(byRaw);
+  const ranges: { startRef: string; endRef: string; tokens: number }[] = [];
+  let segStart: number | null = null;
+  for (let i = 0; i < messages.length - PROTECTED; i++) {
+    const m = messages[i];
+    const isCovered = covered.has(m.id) || recentIds.has(m.id);
+    if (!isCovered && segStart === null) segStart = i;
+    if (isCovered && segStart !== null) {
+      pushRange(ranges, messages, segStart, i - 1, raw);
+      segStart = null;
+    }
+  }
+  if (segStart !== null) {
+    pushRange(ranges, messages, segStart, messages.length - PROTECTED - 1, raw);
+  }
+  // 过滤：低于 minCompressRange 字符 或 <200 tokens 碎片。
+  return kernelViableRanges(
+    ranges.filter((r) => r.tokens * 4 >= minCompressRange || r.tokens >= 200),
+  );
+}
+
+function pushRange(
+  out: { startRef: string; endRef: string; tokens: number }[],
+  messages: CoreMessage[],
+  startIdx: number,
+  endIdx: number,
+  raw: [string, string][],
+): void {
+  if (startIdx > endIdx) return;
+  const seg = messages.slice(startIdx, endIdx + 1);
+  const tokens = seg.reduce((n, m) => n + (m.text ? m.text.length / 4 : 0), 0);
+  const startRef = raw.find(([, v]) => v === seg[0].id)?.[0] ?? "";
+  const endRef = raw.find(([, v]) => v === seg[seg.length - 1].id)?.[0] ?? "";
+  if (startRef && endRef) out.push({ startRef, endRef, tokens: Math.round(tokens) });
+}
+
+/**
  * V0.7.3：buildNudgeTextFromReason —— stage2/cache/incremental 路径的 nudge 文案。
  * 这些路径没有 kernel nudge（turn.nudge 未计算），只有 pressure 决策；
  * 用 pressure 的档位 + reason 生成同款文案（与 buildNudgeText 同模板）。
  */
-function buildNudgeTextFromReason(reason: string, level: NudgeLevel): string {
+function buildNudgeTextFromReason(reason: string, level: NudgeLevel, tierHint?: PressureDecision["tierHint"], blockSpansText?: string, maxShrink?: number): string {
   const lines: string[] = [];
   if (level === "gentle") {
     lines.push("[ACP] 上下文使用率已接近阈值，请注意近期对话的上下文占用，建议在合适时机压缩已消费的旧内容。");
-    lines.push("压缩请通过 Operit package_proxy 调用 acp_tools:compress（范围压缩）、acp_tools:absorb（吸收单条巨型输出）、acp_tools:decompress（恢复）、acp_tools:search_context（搜索）、acp_tools:acp_status（查状态/范围）。");
+    lines.push("压缩请直接调用 acp_tools 工具：acp_tools:compress（范围压缩）、acp_tools:absorb（吸收单条巨型输出）、acp_tools:decompress（恢复原文）、acp_tools:search_context（搜索）、acp_tools:acp_status（查状态/范围）。");
   } else if (level === "strong") {
     lines.push("[ACP] 上下文使用率已较高，请立即压缩已消费的旧内容以释放空间。");
-    lines.push("压缩请通过 Operit package_proxy 调用 acp_tools:compress（范围压缩）、acp_tools:absorb（吸收单条巨型输出）、acp_tools:decompress（恢复）、acp_tools:search_context（搜索）、acp_tools:acp_status（查状态/范围）。");
+    lines.push("压缩请直接调用 acp_tools 工具：acp_tools:compress（范围压缩）、acp_tools:absorb（吸收单条巨型输出）、acp_tools:decompress（恢复原文）、acp_tools:search_context（搜索）、acp_tools:acp_status（查状态/范围）。");
   } else {
-    lines.push("[ACP] 上下文已接近硬上限，请立即通过 package_proxy 调用 acp_tools:compress 压缩最旧、已消费的内容。若本提示持续出现，压缩是继续任务的前提，不要忽略。");
+    lines.push("[ACP] 上下文已接近硬上限，请立即调用 acp_tools:compress 压缩最旧、已消费的内容。若本提示持续出现，压缩是继续任务的前提，不要忽略。");
   }
-  lines.push("调用格式（package_proxy 顶层恰好两个参数：tool_name 为一个字符串，params 为一个合法 JSON 对象；tool_name 绝不能放在 params 里）：package_proxy({\"tool_name\":\"acp_tools:acp_status\",\"params\":{}})；package_proxy({\"tool_name\":\"acp_tools:compress\",\"params\":{\"content\":[{\"startId\":\"m00001\",\"endId\":\"m00050\",\"summary\":\"...\"}]}})。");
+  // V0.9-T2/T3：分级压缩机会引导——已有多个 T1 块可蒸馏 T2；多个 T2 块可浓缩 T3。
+  if (tierHint === "t2-distill-ready") {
+    lines.push("[ACP] 已存在多个一级压缩块（T1）。若这些块的主题相关且不再需要逐块原文，可对它们做二级蒸馏：compress 的 startId/endId 使用 block id（如 b1..b5），生成 T2 摘要块，进一步压缩已摘要内容。");
+    if (blockSpansText) lines.push(`[ACP] 当前活动块跨度：${blockSpansText}。蒸馏时按需选择相关的 T1 块（bN），跨度为各块起止 ref。`);
+  } else if (tierHint === "t3-condense-ready") {
+    lines.push("[ACP] 已存在多个二级蒸馏块（T2）。若这些 T2 块可合并浓缩，可用 compress 传 block id（如 b6..b8）做三级浓缩（T3），把多块摘要再凝成一块。");
+    if (blockSpansText) lines.push(`[ACP] 当前活动块跨度：${blockSpansText}。浓缩时按需选择相关的 T2 块（bN）。`);
+  }
+  lines.push("调用方式：直接调用 acp_tools:acp_status（查状态/范围）、acp_tools:compress（压缩，content 传 [{startId,endId,summary}]）等工具即可（工具已在工具面注册，无需 package_proxy 中转）。");
+  if (maxShrink !== undefined) {
+    lines.push(`[ACP] 平滑过渡引导：压缩时优先选择更小、更靠尾部的范围——压缩最近的较大内容，保持最早消息前缀完整。单次大范围重写会急剧改变请求形态并可能触发服务商风控；小而偏尾部的折叠能让前缀缓存存活、过渡平缓。（单次压缩比例上限 ${Math.round(maxShrink * 100)}%）`);
+  }
   if (reason) lines.push(`（pressure: ${reason}）`);
   return lines.join("\n");
 }
 
-function buildNudgeText(nudge: { reason: string; compressibleRanges: { startRef: string; endRef: string; tokens: number }[] }, level: NudgeLevel): string {
+function buildNudgeText(nudge: { reason: string; compressibleRanges: { startRef: string; endRef: string; tokens: number }[] }, level: NudgeLevel, maxShrink?: number): string {
   // 固定模板（不嵌入动态 token 数/百分比——动态内容破坏 LLM 缓存前缀命中率）。
   // 三档递进文案：gentle = 提醒准备；strong = 要求主动压缩；emergency = 必须压缩。
   const lines: string[] = [];
   if (level === "gentle") {
-    lines.push("[ACP] 上下文使用率已接近阈值。请在合适时机压缩已消费的旧内容：可先通过 package_proxy 调用 acp_tools:acp_status 查看可压缩范围，再调用 acp_tools:compress 处理已完成且不再需要原文的部分。");
+    lines.push("[ACP] 上下文使用率已接近阈值。请在合适时机压缩已消费的旧内容：可先调用 acp_tools:acp_status 查看可压缩范围，再调用 acp_tools:compress 处理已完成且不再需要原文的部分。");
   } else if (level === "strong") {
-    lines.push("[ACP] 上下文使用率已超过阈值。请通过 package_proxy 调用 acp_tools:compress 压缩已消费的旧内容以降低上下文占用，无需询问用户、无需等待批准、不要中断当前任务。");
+    lines.push("[ACP] 上下文使用率已超过阈值。请调用 acp_tools:compress 压缩已消费的旧内容以降低上下文占用，无需询问用户、无需等待批准、不要中断当前任务。");
   } else {
-    lines.push("[ACP] 上下文已接近硬上限，请立即通过 package_proxy 调用 acp_tools:compress 压缩最旧、已消费的内容。若本提示持续出现，压缩是继续任务的前提，不要忽略。");
+    lines.push("[ACP] 上下文已接近硬上限，请立即调用 acp_tools:compress 压缩最旧、已消费的内容。若本提示持续出现，压缩是继续任务的前提，不要忽略。");
   }
-  // 精确调用格式（模型照抄；package_proxy 顶层恰好两个参数：tool_name 字符串 + params JSON 对象）。
-  // 注意：tool_name 必须作为 package_proxy 的顶层参数，不能写进 params 内部，也不能混入其他工具的参数结构。
-  lines.push("调用格式（package_proxy 顶层恰好两个参数：tool_name 为一个字符串，params 为一个合法 JSON 对象；tool_name 绝不能放在 params 里）：");
-  lines.push("1) 查范围：package_proxy({\"tool_name\":\"acp_tools:acp_status\",\"params\":{}})；");
-  lines.push("2) 压缩：package_proxy({\"tool_name\":\"acp_tools:compress\",\"params\":{\"content\":[{\"startId\":\"m00001\",\"endId\":\"m00050\",\"summary\":\"...\"}]}})；");
-  lines.push("3) 吸收单条巨型输出：package_proxy({\"tool_name\":\"acp_tools:absorb\",\"params\":{\"ref\":\"m00042\",\"summary\":\"...\"}})。");
+  // 调用方式：直接调用 acp_tools 工具（工具已在工具面注册，宿主自动桥接，无需 package_proxy 中转）。
+  lines.push("调用方式（直接调用 acp_tools 工具，无需 package_proxy 中转）：");
+  lines.push("1) 查范围：acp_tools:acp_status；");
+  lines.push("2) 压缩：acp_tools:compress，params.content=[{startId,endId,summary}]；");
+  lines.push("3) 吸收单条巨型输出：acp_tools:absorb，params.ref=消息 ref、params.summary=摘要。");
   if (nudge.compressibleRanges.length > 0) {
     const top = [...nudge.compressibleRanges].sort((a, b) => b.tokens - a.tokens)[0];
-    lines.push(`建议压缩范围：${top.startRef}..${top.endRef}（package_proxy → acp_tools:compress）。`);
-    lines.push(`可选工具（经 package_proxy）：acp_tools:acp_status（查状态/范围）、acp_tools:absorb（吸收单条巨型输出）、acp_tools:decompress（恢复）、acp_tools:search_context（搜索）。`);
+    lines.push(`建议压缩范围：${top.startRef}..${top.endRef}（acp_tools:compress）。`);
+    lines.push(`可选工具：acp_tools:acp_status（查状态/范围）、acp_tools:absorb（吸收单条巨型输出）、acp_tools:decompress（恢复原文）、acp_tools:search_context（搜索）。`);
+  }
+  if (maxShrink !== undefined) {
+    lines.push(`[ACP] 平滑过渡引导：压缩时优先选择更小、更靠尾部的范围——压缩最近的较大内容，保持最早消息前缀完整。单次大范围重写会急剧改变请求形态并可能触发服务商风控；小而偏尾部的折叠能让前缀缓存存活、过渡平缓。（单次压缩比例上限 ${Math.round(maxShrink * 100)}%）`);
   }
   return lines.join("\n");
 }

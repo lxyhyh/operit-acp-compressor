@@ -248,6 +248,28 @@ export interface PressureDecision {
   pressurePct: number;
   effectiveTokens: number;
   source: EffectiveSource;
+  /** V0.9-T2/T3：分级压缩机会提示（"t2-distill-ready" / "t3-condense-ready"）。 */
+  tierHint?: "t2-distill-ready" | "t3-condense-ready" | undefined;
+}
+
+/** V0.9-T2/T3：检测分级压缩机会——T1 块≥tier2Trigger 可蒸馏 T2；T2 块≥tier3Trigger 可浓缩 T3。
+ *  纯函数，不依赖外部状态；由 adapter 传入当前 active blocks 的 tier 分布。 */
+export function detectTierOpportunity(input: {
+  activeBlocks: ReadonlyArray<{ tier?: number }>;
+  tier2Trigger?: number;
+  tier3Trigger?: number;
+}): PressureDecision["tierHint"] {
+  const t2 = input.tier2Trigger ?? 5;
+  const t3 = input.tier3Trigger ?? 10;
+  let t1Count = 0;
+  let t2Count = 0;
+  for (const b of input.activeBlocks) {
+    if (b.tier === 2) t2Count++;
+    else if (!b.tier || b.tier === 1) t1Count++;
+  }
+  if (t2Count >= t3) return "t3-condense-ready";
+  if (t1Count >= t2) return "t2-distill-ready";
+  return undefined;
 }
 
 export type PressureInput = Parameters<typeof evaluatePressureInner>[0];

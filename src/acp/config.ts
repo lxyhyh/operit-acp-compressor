@@ -59,6 +59,14 @@ export interface AdapterSettings {
   hookExperiment: boolean;
   /** V0.8-P6.1 实验：LLM emergency fold（隐形 compression turn）。默认 false，不影响默认行为。 */
   llmEmergencyFold: boolean;
+  /** V0.9-T2/T3：T1 块数达到此值可蒸馏 T2。默认 5（对齐 kernel tiers.tier2Trigger）。 */
+  tier2Trigger: number;
+  /** V0.9-T2/T3：T2 块数达到此值可浓缩 T3。默认 10（对齐 kernel tiers.tier3Trigger）。 */
+  tier3Trigger: number;
+  /** V0.9.4 缓存友好（对齐原版 #189）：单次压缩最多移除的上下文比例（0~1）。
+   *  配置后 nudge 追加 tail-biased 引导（压尾部保前缀缓存）；超比例范围被拒绝。
+   *  默认 undefined = 不引导（legacy 行为，对齐原版 BILI_MAX_SHRINK_PER_COMPRESS 未设置）。 */
+  maxShrinkPerCompress: number | undefined;
 }
 
 /** acp-config.json 键名（单一事实来源；与 src/config.ts DEFAULT_CONFIG 对齐）。 */
@@ -217,6 +225,13 @@ export function loadAdapterSettings(): AdapterSettings {
     // V0.7.13-HOOK-EXP：实验开关（实验已完成；保留开关但恢复文件读取）。
     hookExperiment: readBool("hookExperiment", false),
     llmEmergencyFold: readBool("llmEmergencyFold", false),
+    tier2Trigger: readNum("tier2Trigger", 5),
+    tier3Trigger: readNum("tier3Trigger", 10),
+    // V0.9.4 缓存友好：maxShrinkPerCompress（0~1），未配置/非法 → undefined（不引导，legacy）。
+    maxShrinkPerCompress: (() => {
+      const raw = readNum("maxShrinkPerCompress", -1);
+      return raw > 0 && raw <= 1 ? raw : undefined;
+    })(),
     dataDir: DATA_DIR,
   };
 }

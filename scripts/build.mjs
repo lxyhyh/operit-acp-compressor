@@ -35,6 +35,8 @@ await build({
     alias: {
         module: path.join(root, "src/shims/module-shim.ts"),
         crypto: path.join(root, "src/shims/crypto-shim.ts"),
+        fs: path.join(root, "src/shims/fs-shim.ts"),
+        path: path.join(root, "src/shims/path-shim.ts"),
     },
     // neutral 平台下 import.meta.url 无意义，createRequire 调用会抛错（仅懒加载 tokenizer 用）
     // UI 文件独立打包（Compose DSL 模块），main bundle 保留外部 require
@@ -89,6 +91,8 @@ await build({
     alias: {
         module: path.join(root, "src/shims/module-shim.ts"),
         crypto: path.join(root, "src/shims/crypto-shim.ts"),
+        fs: path.join(root, "src/shims/fs-shim.ts"),
+        path: path.join(root, "src/shims/path-shim.ts"),
     },
     external: ["./ui/*"],
     banner: {

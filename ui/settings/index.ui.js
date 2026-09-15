@@ -279,7 +279,7 @@ function Screen(ctx) {
                         style: { fontSize: 13 },
                     }),
                 ]),
-                UI.Text({ text: "宿主窗口比估算大时自接管的最低使用率（V0.10 host 校准）", style: "bodySmall", color: "onSurfaceVariant", fontSize: 11 }),
+                UI.Text({ text: "kernel 沉默且使用率超此值并有增长时，插件自接管提示（pressure 7) 分支）", style: "bodySmall", color: "onSurfaceVariant", fontSize: 11 }),
                 UI.Row({ verticalAlignment: "center" }, [
                     UI.Text({ text: "单次压缩上限 (%)", style: "bodySmall", fontSize: 12 }),
                     UI.Spacer({ width: 8 }),

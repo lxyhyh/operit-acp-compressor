@@ -164,6 +164,9 @@ function readEnv(key: string): string {
   const v = json[key];
   if (typeof v === "string" && v.length > 0) return v;
   if (typeof v === "number" || typeof v === "boolean") return String(v);
+  // V0.10-F2.1：UI 存 protectedTools 为 JSON 数组（TextField 拆分），
+  // 数组在此归一为逗号分隔串供 readList 消费。
+  if (Array.isArray(v)) return v.filter((x) => typeof x === "string" && x.length > 0).join(",");
   return "";
 }
 
@@ -205,7 +208,8 @@ export function loadAdapterSettings(): AdapterSettings {
     protectedTools: readList("protectedTools", []),
     renderTags: "none",
     nudgeEnabled: true,
-    nudgeThresholdPct: readPct(KEYS.nudgeThresholdPct, 0.75),
+    // V0.10：死字段（resolveKernelConfig 用 gentleThresholdPct），默认与 gentle 对齐 0.45。
+    nudgeThresholdPct: readPct(KEYS.nudgeThresholdPct, 0.45),
     hardLimitPct: readPct(KEYS.hardLimitPct, 0.85),
     minCompressRange: readNum(KEYS.minCompressRange, 5_000),
     hideConsumedCompressCalls: true,
@@ -218,7 +222,9 @@ export function loadAdapterSettings(): AdapterSettings {
     //（minContextLimitPct 默认 0.45：≥45% 且有增长即提醒）。已存 acp-config.json 不受影响。
     gentleThresholdPct: readPct("nudgeThresholdPct", 0.45),
     strongThresholdPct: readPct("strongThresholdPct", 0.82),
-    // V0.7 host 自接管下限：约 0.70（低于 gentle 0.72，允许 Adapter 在 kernel 沉默区先接管）。
+    // V0.10 host 自接管下限 0.70：gentle 0.45 之后的独立兜底档（pressure 7) 分支：
+    // kernel 沉默 + usage ≥ floor + 有增长 → Adapter 自接管；kernel 从 45% 起即建议，
+    // 故该分支主要在 credit 抑制 gentle 时兜底防危险增长。原注释"低于 gentle 0.72"已过时。
     hostEscalationFloor: readPct("hostEscalationFloor", 0.70),
     // V0.4.1 usage credit：压缩后 contextLimit*15% token 内免除 nudge。
     usageCreditTokens: Math.round(modelContextLimit * 0.15),

@@ -17,7 +17,8 @@ export interface AcpConfig {
 
 export const DEFAULT_CONFIG: AcpConfig = {
     enabled: true,
-    nudgeThresholdPct: 0.72,
+    // V0.10：0.72 → 0.45，对齐原版 kernel nudge 下限（≥45% 且有增长即提醒）。
+    nudgeThresholdPct: 0.45,
     strongThresholdPct: 0.82,
     hardLimitPct: 0.85,
     contextLimit: 200_000,

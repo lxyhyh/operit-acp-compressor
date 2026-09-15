@@ -14,7 +14,8 @@ Object.defineProperty(_exports, "__esModule", { value: true });
 
 const DEFAULT = {
     enabled: true,
-    nudgeThresholdPct: 0.72,
+    // V0.10：对齐服务端默认 0.45（仅 IPC 失败时的本地兜底显示）。
+    nudgeThresholdPct: 0.45,
     strongThresholdPct: 0.82,
     hardLimitPct: 0.85,
     contextLimit: 200000,
@@ -184,7 +185,7 @@ function Screen(ctx) {
                     UI.Text({ text: "温和提示 (%)", style: "bodySmall", fontSize: 12 }),
                     UI.Spacer({ width: 8 }),
                     UI.TextField({
-                        value: String(Math.round((cfg.nudgeThresholdPct || 0.72) * 100)),
+                        value: String(Math.round((cfg.nudgeThresholdPct || 0.45) * 100)),
                         onValueChange: (v) => {
                             const n = Number(String(v).replace(/[^0-9]/g, ""));
                             if (Number.isFinite(n) && n >= 1 && n <= 100) set("nudgeThresholdPct", n / 100);

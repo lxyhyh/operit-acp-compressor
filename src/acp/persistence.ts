@@ -34,7 +34,7 @@ export interface AcpRuntimeStats {
   /** nudge 后经历轮数（用于算 ignore 率）。 */
   nudgeIgnored: number;
   /** 最近一次 compress 来源（model/emergency）。 */
-  lastCompressSource?: "model" | "emergency";
+  lastCompressSource?: "model" | "emergency" | "deferred";
   lastCompressAt?: number;
   /** V0.4.1 usage credit：compress 后 N token 内免除 nudge（防刚压缩又提醒）。 */
   creditUntilToken?: number;

@@ -152,6 +152,81 @@ function buildDeterministicSummary(seg: CoreMessage[], maxLen = 6000, perMsg = 1
   return lines.join("\n");
 }
 
+// —— V0.10-P1 预算守卫：FULL 投影已耗时过长（接近宿主 hook 预算 10s）时，
+//   发送前不再建块重投影（整轮 mutation 有超时被宿主丢弃的风险），改为登记
+//   后台 deferred fold（ChatRuntimeHook completed 时执行，下轮生效）。
+/** 发送前自动折叠的时间预算（ms）：project() 已消耗超过此值时跳过 forced 折叠。 */
+const PROJECT_FOLD_BUDGET_MS = 7000;
+/** deferred fold 待办有效期（ms）：过期即作废（防旧待办作用于新 state）。 */
+const DEFER_FOLD_TTL_MS = 5 * 60 * 1000;
+
+/** deferred fold 待办（globalThis：跨 hook 调用共享，进程内生命周期）。 */
+interface DeferredFoldEntry {
+  sessionKey: string;
+  blocksAtDefer: number;
+  level: string;
+  at: number;
+}
+function deferredFoldStore(): Map<string, DeferredFoldEntry> {
+  const g = globalThis as Record<string, unknown>;
+  if (!g.__acpDeferredFold) g.__acpDeferredFold = new Map<string, DeferredFoldEntry>();
+  return g.__acpDeferredFold as Map<string, DeferredFoldEntry>;
+}
+
+/**
+ * 最旧未覆盖段确定性折叠（project() forced 段与后台 deferred fold 共用）。
+ * 保护尾部最近 8 条；只折叠未被 block 覆盖的连续段；确定性摘要（同段跨轮稳定）。
+ * 返回新 state 与折叠统计；无可用段/建块失败返回 undefined。
+ */
+function foldOldestUncoveredSegment(
+  core: CompressionCore,
+  state: CompressionState,
+  messages: CoreMessage[],
+  config: Config,
+): { state: CompressionState; blocksCreated: number; tokensCompressed: number; segLen: number; startRef: string; endRef: string } | undefined {
+  const PROTECTED = 8;
+  if (messages.length <= PROTECTED) return undefined;
+  const byRaw = state.messageRefs?.byRaw ?? {};
+  const recentIds = new Set(messages.slice(-PROTECTED).map((m) => m.id));
+  const covered = collectCoveredMessageIds(state);
+  // 找最旧未被覆盖、且不在保护区的连续段端点。
+  let startIdx = -1;
+  for (let i = 0; i < messages.length - PROTECTED; i++) {
+    const m = messages[i];
+    if (covered.has(m.id) || recentIds.has(m.id)) continue;
+    if (startIdx < 0) startIdx = i;
+  }
+  if (startIdx < 0) return undefined;
+  // 段终点：保护区之前最后一条未覆盖消息。
+  let endIdx = startIdx;
+  for (let i = startIdx; i < messages.length - PROTECTED; i++) {
+    const m = messages[i];
+    if (!covered.has(m.id) && !recentIds.has(m.id)) endIdx = i;
+  }
+  const seg = messages.slice(startIdx, endIdx + 1);
+  if (seg.length < 8) return undefined;
+  const startRef = Object.entries(byRaw).find(([, v]) => v === seg[0].id)?.[0];
+  const endRef = Object.entries(byRaw).find(([, v]) => v === seg[seg.length - 1].id)?.[0];
+  if (!startRef || !endRef) return undefined;
+  const summary = buildDeterministicSummary(seg, 6000, 120);
+  const topic = `自动折叠（emergency fold ${seg.length} 条）`;
+  const applied = core.applyCompression({
+    ranges: [{ startRef, endRef, summary, topic }],
+    messages,
+    state,
+    config,
+  });
+  if (applied.result.blocksCreated === 0) return undefined;
+  return {
+    state: applied.state,
+    blocksCreated: applied.result.blocksCreated,
+    tokensCompressed: applied.result.tokensCompressed,
+    segLen: seg.length,
+    startRef,
+    endRef,
+  };
+}
+
 /** 反查：给定 messageRefs.byRef（ref→stableKey）与 byKey（key→turn），返回 ref 对应的 CoreMessage。 */
 function messageForRef(
   messages: CoreMessage[],
@@ -243,6 +318,10 @@ export interface AcpEngine {
   foldSelectRange(sessionKey: string, turns: PromptTurnLike[]): Promise<{ ok: boolean; range?: FoldRange; reason?: string }>;
   /** V0.8-P6.2：fold apply 前的上下文重查数据源（当前持久化状态 + 当前 raw turns）。 */
   getFoldApplyContext(sessionKey: string): Promise<{ stateVersion: number; kernelState: CompressionState; rawTurns: PromptTurnLike[] }>;
+  /** V0.10-P1：后台 deferred fold（预算守卫登记；ChatRuntimeHook completed 时执行）。
+   *  读持久化 state + lastRawTurns，对最旧未覆盖段确定性建块并落盘（下轮生效）。
+   *  幂等安全：段选择基于当前 state 的未覆盖消息，已压缩过则无可折叠段返回 no-foldable-range。 */
+  runDeferredFold(sessionKey: string): Promise<{ ok: boolean; reason?: string; blocksCreated?: number; tokensCompressed?: number }>;
   core: CompressionCore;
   settings: AdapterSettings;
 }
@@ -341,7 +420,22 @@ export function createEngine(dataDir?: string): AcpEngine {
       : undefined;
     if (hostTokens !== undefined) usageManager.recordHostUsage(hostTokens, opts.hopNo);
     usageManager.recordEstimate(opts.tokenEstimate, opts.hopNo);
-    const eff = usageManager.getEffectiveSnapshot(opts.tokenEstimate);
+    let eff = usageManager.getEffectiveSnapshot(opts.tokenEstimate);
+    // —— V0.10 第 2 步：host 窗口校准（单边向上，保守，防计数混乱）。
+    //    host（DB currentWindowSize）= 上一轮发送后 provider tokenizer 对实际发送
+    //    历史的真实计数；estimate = 本轮发送前插件粗估（CJK 每字 1 token）。
+    //    仅当 host 显著大于 estimate（>20%）时采用 host —— 说明插件低估了发送体量，
+    //    触发提前（保守保护）。向下方向不校准：压缩生效后 host 变小属正常，无法与
+    //    "插件高估"区分（V0.7.13-P3-E 实证禁止无条件 max：estimate 高估时 max 顶掉
+    //    更准的值且永不回落）。effective 保持单值，ledger 三源留痕，不修改 estimate。
+    const hostNum = typeof hostTokens === "number" && Number.isFinite(hostTokens) && hostTokens > 0 ? hostTokens : undefined;
+    const estNum = eff.effectiveTokens || opts.tokenEstimate;
+    if (hostNum !== undefined && estNum > 0 && hostNum > estNum * 1.2) {
+      eff = { ...eff, effectiveTokens: hostNum, source: "host" as const, confidence: "medium" as const };
+      try {
+        console.log(`[acp] pressure host-calibrated estimate=${opts.tokenEstimate} estEff=${estNum} host=${hostNum} (host>est*1.2, take host conservative)`);
+      } catch { /* noop */ }
+    }
     const pressurePct = opts.config.modelContextLimit > 0
       ? (eff.effectiveTokens || opts.tokenEstimate) / opts.config.modelContextLimit
       : ((eff.effectiveTokens || opts.tokenEstimate) / 200000);
@@ -534,6 +628,8 @@ export function createEngine(dataDir?: string): AcpEngine {
 
     async project(sessionKey, chatId, isSubTask, hookStage, turns) {
       const release = await acquireLock(sessionKey);
+      // V0.10-P1：FULL 投影计时起点（预算守卫：forced 折叠前检查已耗时）。
+      const t0 = Date.now();
       try {
         // —— 阶段守卫：宿主同一发送周期会调两次 finalize hook。
         //   第一阶段 before_finalize_prompt：输入为消息库原始历史 → 执行投影压缩。
@@ -1039,79 +1135,62 @@ export function createEngine(dataDir?: string): AcpEngine {
           const targetTokens = Math.floor(settings.modelContextLimit * (settings.gentleThresholdPct ?? 0.7));
           const effTokens = eff.effectiveTokens || sendEstimate;
           if (pressure.level === "forced" && effTokens > targetTokens && mapping.messages.length > 8) {
-            try {
-              // 保护尾部：最近 8 条 + 最近 user 消息之后绝不折叠。
-              const byRef = turn.state.messageRefs?.byRef ?? {};
-              const byRaw = turn.state.messageRefs?.byRaw ?? {};
-              const recentIds = new Set(mapping.messages.slice(-8).map((m) => m.id));
-              // 找最旧未被覆盖、且不在保护区的连续段端点。
-              const covered = collectCoveredMessageIds(turn.state);
-              let startIdx = -1;
-              for (let i = 0; i < mapping.messages.length - 8; i++) {
-                const m = mapping.messages[i];
-                if (covered.has(m.id) || recentIds.has(m.id)) continue;
-                if (startIdx < 0) startIdx = i;
-              }
-              if (startIdx >= 0) {
-                // 段终点：保护区之前最后一条未覆盖消息。
-                let endIdx = startIdx;
-                for (let i = startIdx; i < mapping.messages.length - 8; i++) {
-                  const m = mapping.messages[i];
-                  if (!covered.has(m.id) && !recentIds.has(m.id)) endIdx = i;
-                }
-                const seg = mapping.messages.slice(startIdx, endIdx + 1);
-                if (seg.length >= 8) {
-                  const startRef = Object.entries(byRaw).find(([, v]) => v === seg[0].id)?.[0];
-                  const endRef = Object.entries(byRaw).find(([, v]) => v === seg[seg.length - 1].id)?.[0];
-                  if (startRef && endRef) {
-                    const summary = buildDeterministicSummary(seg, 6000, 120);
-                    const topic = `自动折叠（emergency fold ${seg.length} 条）`;
-                    const appliedEm = core.applyCompression({
-                      ranges: [{ startRef, endRef, summary, topic }],
-                      messages: mapping.messages,
-                      state: turn.state,
-                      config,
-                    });
-                    if (appliedEm.result.blocksCreated > 0) {
-                      // 用新状态重投影（同 FULL path：processTurn 会把 covered 消息折叠为摘要占位）。
-                      appliedEmState = appliedEm.state;
-                      const reTurn = core.processTurn({
-                        messages: mapping.messages,
-                        state: appliedEm.state,
-                        config,
-                        tokenCount: Math.max(0, effTokens - appliedEm.result.tokensCompressed),
-                        renderTags: "none",
-                      });
-                      appliedEmState = reTurn.state;
-                      let reProj = reTurn.messages;
-                      if (settings.hideConsumedCompressCalls && reTurn.state.blocks.length > 0) {
-                        try { reProj = kernelHideConsumedCompressCalls(reTurn.state, reTurn.messages).messages; } catch { /* noop */ }
-                      }
-                      const reTurns = coreMessagesToPromptTurns(reProj, mapping.byKey);
-                      projectedTurns.length = 0;
-                      projectedTurns.push(...reTurns);
-                      emergencyFolded = true;
-                      emergencyFreedTokens = appliedEm.result.tokensCompressed;
-                      nextStats.emergencyTriggered = (nextStats.emergencyTriggered ?? 0) + 1;
-                      nextStats.emergencySavedTokens = (nextStats.emergencySavedTokens ?? 0) + appliedEm.result.tokensCompressed;
-                      nextStats.lastCompressSource = "emergency";
-                      nextStats.lastCompressAt = Date.now();
-                      // credit 基准更新（与 model compress 同款）。
-                      nextStats.creditBaseToken = Math.max(0, effTokens - appliedEm.result.tokensCompressed);
-                      nextStats.creditRemaining = settings.usageCreditTokens;
-                      try {
-                        console.log(`[acp] project EMERGENCY-FOLD stage=${hookStage} seg=${seg.length} refs=${startRef}..${endRef} freed=${appliedEm.result.tokensCompressed} raw=${turns.length} proj=${reTurns.length}`);
-                      } catch { /* noop */ }
-                      chatTrace(chatId, {
-                        type: "emergency_fold", stage: hookStage,
-                        detail: { seg: seg.length, freed: appliedEm.result.tokensCompressed, raw: turns.length, proj: reTurns.length, effective: effTokens },
-                      });
-                    }
+            // —— V0.10-P1 预算守卫：FULL 投影已耗时过长（接近宿主 hook 预算 10s）时，
+            //   不再发送前建块重投影（整轮 mutation 有超时被宿主丢弃的风险），
+            //   改为登记后台 deferred fold（ChatRuntimeHook completed 时执行，下轮生效）。
+            const elapsed = Date.now() - t0;
+            if (elapsed > PROJECT_FOLD_BUDGET_MS) {
+              deferredFoldStore().set(sessionKey, {
+                sessionKey,
+                blocksAtDefer: turn.state.blocks.length,
+                level: pressure.level,
+                at: Date.now(),
+              });
+              try {
+                console.log(`[acp] project DEFER-FOLD stage=${hookStage} elapsed=${elapsed}ms eff=${effTokens} blocks=${turn.state.blocks.length} (budget guard; fold on task-completed)`);
+              } catch { /* noop */ }
+            } else {
+              try {
+                // 保护尾部：最近 8 条 + 最近 user 消息之后绝不折叠（foldOldestUncoveredSegment 同构）。
+                const folded = foldOldestUncoveredSegment(core, turn.state, mapping.messages, config);
+                if (folded) {
+                  // 用新状态重投影（同 FULL path：processTurn 会把 covered 消息折叠为摘要占位）。
+                  appliedEmState = folded.state;
+                  const reTurn = core.processTurn({
+                    messages: mapping.messages,
+                    state: folded.state,
+                    config,
+                    tokenCount: Math.max(0, effTokens - folded.tokensCompressed),
+                    renderTags: "none",
+                  });
+                  appliedEmState = reTurn.state;
+                  let reProj = reTurn.messages;
+                  if (settings.hideConsumedCompressCalls && reTurn.state.blocks.length > 0) {
+                    try { reProj = kernelHideConsumedCompressCalls(reTurn.state, reTurn.messages).messages; } catch { /* noop */ }
                   }
+                  const reTurns = coreMessagesToPromptTurns(reProj, mapping.byKey);
+                  projectedTurns.length = 0;
+                  projectedTurns.push(...reTurns);
+                  emergencyFolded = true;
+                  emergencyFreedTokens = folded.tokensCompressed;
+                  nextStats.emergencyTriggered = (nextStats.emergencyTriggered ?? 0) + 1;
+                  nextStats.emergencySavedTokens = (nextStats.emergencySavedTokens ?? 0) + folded.tokensCompressed;
+                  nextStats.lastCompressSource = "emergency";
+                  nextStats.lastCompressAt = Date.now();
+                  // credit 基准更新（与 model compress 同款）。
+                  nextStats.creditBaseToken = Math.max(0, effTokens - folded.tokensCompressed);
+                  nextStats.creditRemaining = settings.usageCreditTokens;
+                  try {
+                    console.log(`[acp] project EMERGENCY-FOLD stage=${hookStage} seg=${folded.segLen} refs=${folded.startRef}..${folded.endRef} freed=${folded.tokensCompressed} raw=${turns.length} proj=${reTurns.length}`);
+                  } catch { /* noop */ }
+                  chatTrace(chatId, {
+                    type: "emergency_fold", stage: hookStage,
+                    detail: { seg: folded.segLen, freed: folded.tokensCompressed, raw: turns.length, proj: reTurns.length, effective: effTokens },
+                  });
                 }
+              } catch (e) {
+                try { console.log(`[acp] emergency-fold failed (fallthrough to cap): ${String(e)}`); } catch { /* noop */ }
               }
-            } catch (e) {
-              try { console.log(`[acp] emergency-fold failed (fallthrough to cap): ${String(e)}`); } catch { /* noop */ }
             }
           }
         }
@@ -1505,6 +1584,80 @@ export function createEngine(dataDir?: string): AcpEngine {
 
     async loadState(sessionKey) {
       return persistence.load(sessionKey);
+    },
+
+    // —— V0.10-P1：后台 deferred fold。project() 预算守卫登记的待办，在
+    //   ChatRuntimeHook completed（整轮结束，无 hook 预算压力）时执行：
+    //   读持久化 state + lastRawTurns → 对最旧未覆盖段确定性建块 → 落盘（stateVersion+1）。
+    //   下轮 finalize 的 processTurn 自然折叠为摘要占位。fire-and-forget，失败不影响主链。
+    async runDeferredFold(sessionKey) {
+      const entry = deferredFoldStore().get(sessionKey);
+      if (!entry) return { ok: false, reason: "no-deferred-fold" };
+      if (Date.now() - entry.at > DEFER_FOLD_TTL_MS) {
+        deferredFoldStore().delete(sessionKey);
+        return { ok: false, reason: "defer-expired" };
+      }
+      const release = await acquireLock(sessionKey);
+      try {
+        const loaded = await persistence.load(sessionKey);
+        // state 已前进（期间发生过压缩/建块）→ 旧待办作废（fold 基于当前 state 重选段）。
+        if ((loaded.kernelState.blocks.length ?? 0) > entry.blocksAtDefer) {
+          deferredFoldStore().delete(sessionKey);
+          return { ok: false, reason: "state-advanced" };
+        }
+        if (loaded.hostMetadata.identityBridge) {
+          identityState = loadIdentityBridgeState(loaded.hostMetadata.identityBridge);
+        }
+        const rawTurns = (loaded.lastRawTurns as PromptTurnLike[] | undefined)
+          ?? (await persistence.loadRawTurns(sessionKey) as unknown as PromptTurnLike[]);
+        if (!rawTurns || rawTurns.length === 0) {
+          deferredFoldStore().delete(sessionKey);
+          return { ok: false, reason: "no-raw-turns" };
+        }
+        const config = resolveKernelConfig(settings);
+        const mapping = mapTurnsWithIdentity(rawTurns);
+        const folded = foldOldestUncoveredSegment(core, loaded.kernelState, mapping.messages, config);
+        if (!folded) {
+          deferredFoldStore().delete(sessionKey);
+          return { ok: false, reason: "no-foldable-range" };
+        }
+        const prevStats = { ...(loaded.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS) };
+        const nextStats = { ...prevStats };
+        nextStats.emergencyTriggered = (nextStats.emergencyTriggered ?? 0) + 1;
+        nextStats.emergencySavedTokens = (nextStats.emergencySavedTokens ?? 0) + folded.tokensCompressed;
+        nextStats.lastCompressSource = "deferred";
+        nextStats.lastCompressAt = Date.now();
+        const est = loaded.hostMetadata.lastTokenEstimate;
+        nextStats.creditBaseToken = Math.max(0, (typeof est === "number" && est > 0 ? est : 0) - folded.tokensCompressed);
+        nextStats.creditRemaining = settings.usageCreditTokens;
+        await persistence.save(sessionKey, {
+          ...loaded,
+          kernelState: folded.state,
+          hostMetadata: {
+            ...loaded.hostMetadata,
+            lastUpdatedAt: Date.now(),
+            stateVersion: (loaded.hostMetadata.stateVersion ?? 0) + 1,
+            lastProjectionFingerprint: undefined as string | undefined,
+            runtimeStats: nextStats,
+            identityBridge: identityState,
+          },
+        });
+        projectionCache.delete(sessionKey); estimateCache.delete(sessionKey);
+        deferredFoldStore().delete(sessionKey);
+        chatTrace(undefined, {
+          type: "emergency_fold", stage: "deferred",
+          detail: { seg: folded.segLen, freed: folded.tokensCompressed, refs: `${folded.startRef}..${folded.endRef}` },
+        });
+        try {
+          console.log(`[acp] DEFERRED-FOLD applied seg=${folded.segLen} refs=${folded.startRef}..${folded.endRef} freed=${folded.tokensCompressed}`);
+        } catch { /* noop */ }
+        return { ok: true, blocksCreated: folded.blocksCreated, tokensCompressed: folded.tokensCompressed };
+      } catch (e) {
+        try { console.log(`[acp] runDeferredFold failed: ${String(e)}`); } catch { /* noop */ }
+        return { ok: false, reason: "defer-error" };
+      } finally {
+        release();
+      }
     },
 
     // —— V0.8-P6.2：LLM Fold 范围选择（dispatch 前冻结；与 emergency 段选择同构）。

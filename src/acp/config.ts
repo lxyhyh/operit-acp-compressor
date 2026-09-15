@@ -26,7 +26,7 @@ export interface AdapterSettings {
   renderTags: "none" | "text-only" | "all";
   /** 是否把 nudge 注入到 projection（作为 system 消息追加）。默认 true。 */
   nudgeEnabled: boolean;
-  /** 触发 nudge 建议的上下文使用率阈值（0~1）。默认 0.75。 */
+  /** 触发 nudge 建议的上下文使用率阈值（0~1）。默认 0.45（V0.10 对齐原版 kernel 下限）。 */
   nudgeThresholdPct: number;
   /** hard/maxContextLimit 阈值（0~1）：usage ≥ 此值发 forced nudge（绕过 growth/cadence/credit，但绝不自动压缩历史）。默认 0.85。 */
   hardLimitPct: number;
@@ -42,7 +42,7 @@ export interface AdapterSettings {
   nudgeGrowthFloor: number;
   /** nudge 触发的最小增长下限（token）。默认 5000。 */
   nudgeMinGrowthFloor: number;
-  /** 温和提示阈值（0~1，usage ≥ 此值发 gentle nudge）。默认 0.72。 */
+  /** 温和提示阈值（0~1，usage ≥ 此值发 gentle nudge）。默认 0.45（V0.10 对齐原版）。 */
   gentleThresholdPct: number;
   /** 强制建议阈值（0~1，usage ≥ 此值发 strong nudge）。默认 0.82。 */
   strongThresholdPct: number;
@@ -214,7 +214,9 @@ export function loadAdapterSettings(): AdapterSettings {
     nudgeGrowthFloor: 10_000,
     nudgeMinGrowthFloor: 5_000,
     // V0.4 三档：温和提示沿用旧键 nudgeThresholdPct（兼容已存设置），强制/硬限新增键。
-    gentleThresholdPct: readPct("nudgeThresholdPct", 0.72),
+    // V0.10：gentle 默认 0.72 → 0.45，对齐原版 billion-context kernel nudge 下限
+    //（minContextLimitPct 默认 0.45：≥45% 且有增长即提醒）。已存 acp-config.json 不受影响。
+    gentleThresholdPct: readPct("nudgeThresholdPct", 0.45),
     strongThresholdPct: readPct("strongThresholdPct", 0.82),
     // V0.7 host 自接管下限：约 0.70（低于 gentle 0.72，允许 Adapter 在 kernel 沉默区先接管）。
     hostEscalationFloor: readPct("hostEscalationFloor", 0.70),

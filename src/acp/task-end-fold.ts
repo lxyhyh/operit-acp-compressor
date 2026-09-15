@@ -44,6 +44,8 @@ export interface TaskEndCompressionState {
   expiresAt: number;
   /** 触发时的压力快照（指令文本数据源；completed 事件本身无 history）。 */
   snapshot: PressureSnapshot;
+  /** V0.10-P3：触发时的 block 数（delivered 复核基准：下一次 completed 时块数增加才算压缩成功）。 */
+  blocksAtTrigger: number;
 }
 
 /** completed 事件最小载荷（插件侧解析 ChatRuntimeEventPayload）。 */
@@ -59,6 +61,8 @@ export interface PressureSnapshot {
   effectiveTokens: number;
   contextLimit: number;
   creditTokens: number;
+  /** V0.10-P3：当前 block 数（delivered 复核用）。 */
+  blocks?: number;
 }
 
 /** 注入指令文本（SYSTEM carrier；一次性；模型主动 compress 的唯一要求）。 */
@@ -109,15 +113,25 @@ export function onTaskCompleted(
 ): TaskEndCompressionState | undefined {
   const s = store();
   const prev = s.states.get(sessionKey);
-  if (prev && (prev.phase === "pending" || prev.phase === "delivered")) {
+  // —— V0.10-P3：delivered 复核。上一任务注入过压缩指令（delivered）且本任务又
+  //   完成了 → 核查块数是否比触发时增加（压缩真的落块才算成功；模型可能在文本里
+  //   声称已压缩而未调用工具，或压缩失败）。核查后收尾，允许本轮重新评估。
+  if (prev && prev.phase === "delivered") {
+    const blocksNow = snap.blocks ?? 0;
+    const gained = blocksNow - prev.blocksAtTrigger;
+    log(sessionKey, `verify prev=delivered identity=${prev.turnIdentity} blocksAtTrigger=${prev.blocksAtTrigger} blocksNow=${blocksNow} gained=${gained} => ${gained > 0 ? "COMPRESS-VERIFIED" : "COMPRESS-NOT-VERIFIED"}`);
+    s.states.delete(sessionKey);
+  }
+  const prev2 = s.states.get(sessionKey);
+  if (prev2 && (prev2.phase === "pending" || prev2.phase === "delivered")) {
     // 已有待处理/已交付请求：不重复触发（Test5：重复结束事件只允许一次 compression request）。
-    log(sessionKey, `phase=${prev.phase} skip-duplicate-completed identity=${prev.turnIdentity}`);
-    return prev;
+    log(sessionKey, `phase=${prev2.phase} skip-duplicate-completed identity=${prev2.turnIdentity}`);
+    return prev2;
   }
   const threshold = Math.round(snap.contextLimit * TASK_END_TRIGGER_PCT);
   if (!(snap.effectiveTokens >= threshold) || snap.contextLimit <= 0) {
     // 压力不足：不触发（Test3）。清理历史终态记录。
-    if (prev) s.states.delete(sessionKey);
+    if (prev2) s.states.delete(sessionKey);
     log(sessionKey, `below-threshold eff=${snap.effectiveTokens} thr=${threshold} no-op`);
     return undefined;
   }
@@ -133,6 +147,7 @@ export function onTaskCompleted(
     createdAt: now,
     expiresAt: now + PENDING_TTL_MS,
     snapshot: { ...snap },
+    blocksAtTrigger: snap.blocks ?? 0,
   };
   s.states.set(sessionKey, st);
   log(sessionKey, `pending armed eff=${snap.effectiveTokens} thr=${threshold} identity=${st.turnIdentity}`);

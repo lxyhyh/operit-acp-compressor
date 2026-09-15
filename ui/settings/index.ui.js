@@ -260,6 +260,95 @@ function Screen(ctx) {
         ])
     );
 
+    // V0.10 高级设置（adapter 层按键名直接消费 acp-config.json，原仅可手改 JSON）
+    children.push(
+        UI.Card({ fillMaxWidth: true }, [
+            UI.Column({ padding: 12, spacing: 6 }, [
+                UI.Text({ text: "高级设置（V0.10）", style: "bodySmall", color: "onSurfaceVariant", fontSize: 11 }),
+                UI.Row({ verticalAlignment: "center" }, [
+                    UI.Text({ text: "host 自接管下限 (%)", style: "bodySmall", fontSize: 12 }),
+                    UI.Spacer({ width: 8 }),
+                    UI.TextField({
+                        value: String(Math.round((cfg.hostEscalationFloor ?? 0.7) * 100)),
+                        onValueChange: (v) => {
+                            const n = Number(String(v).replace(/[^0-9]/g, ""));
+                            if (Number.isFinite(n) && n >= 1 && n <= 100) set("hostEscalationFloor", n / 100);
+                        },
+                        label: "%",
+                        singleLine: true,
+                        style: { fontSize: 13 },
+                    }),
+                ]),
+                UI.Text({ text: "宿主窗口比估算大时自接管的最低使用率（V0.10 host 校准）", style: "bodySmall", color: "onSurfaceVariant", fontSize: 11 }),
+                UI.Row({ verticalAlignment: "center" }, [
+                    UI.Text({ text: "单次压缩上限 (%)", style: "bodySmall", fontSize: 12 }),
+                    UI.Spacer({ width: 8 }),
+                    UI.TextField({
+                        value: cfg.maxShrinkPerCompress != null ? String(Math.round(cfg.maxShrinkPerCompress * 100)) : "",
+                        onValueChange: (v) => {
+                            const t = String(v).replace(/[^0-9]/g, "");
+                            if (!t) { set("maxShrinkPerCompress", undefined); return; }
+                            const n = Number(t);
+                            if (Number.isFinite(n) && n >= 1 && n <= 100) set("maxShrinkPerCompress", n / 100);
+                        },
+                        label: "%（空=不引导）",
+                        singleLine: true,
+                        style: { fontSize: 13 },
+                    }),
+                ]),
+                UI.Text({ text: "单次压缩最多移除比例，尾压保前缀缓存（V0.9.4，对齐原版 #189）", style: "bodySmall", color: "onSurfaceVariant", fontSize: 11 }),
+                UI.Row({ verticalAlignment: "center" }, [
+                    UI.Text({ text: "LLM 紧急折叠", style: "bodySmall", fontSize: 12 }),
+                    UI.Spacer({ width: 8 }),
+                    UI.Switch({ checked: !!cfg.llmEmergencyFold, onCheckedChange: (v) => set("llmEmergencyFold", !!v) }),
+                ]),
+                UI.Text({ text: "压力到硬限时尝试 LLM 折叠（实验，默认关）", style: "bodySmall", color: "onSurfaceVariant", fontSize: 11 }),
+                UI.Row({ verticalAlignment: "center" }, [
+                    UI.Text({ text: "T2/T3 蒸馏阈值", style: "bodySmall", fontSize: 12 }),
+                    UI.Spacer({ width: 8 }),
+                    UI.TextField({
+                        value: String(cfg.tier2Trigger ?? 5),
+                        onValueChange: (v) => numField(v, 1, 100, "tier2Trigger"),
+                        label: "T2",
+                        singleLine: true,
+                        style: { fontSize: 13 },
+                    }),
+                    UI.Spacer({ width: 8 }),
+                    UI.TextField({
+                        value: String(cfg.tier3Trigger ?? 10),
+                        onValueChange: (v) => numField(v, 1, 100, "tier3Trigger"),
+                        label: "T3",
+                        singleLine: true,
+                        style: { fontSize: 13 },
+                    }),
+                ]),
+                UI.Row({ verticalAlignment: "center" }, [
+                    UI.Text({ text: "增量投影上限", style: "bodySmall", fontSize: 12 }),
+                    UI.Spacer({ width: 8 }),
+                    UI.TextField({
+                        value: String(cfg.incrementalMaxNewTurns ?? 8),
+                        onValueChange: (v) => numField(v, 1, 100, "incrementalMaxNewTurns"),
+                        label: "条",
+                        singleLine: true,
+                        style: { fontSize: 13 },
+                    }),
+                ]),
+                UI.Row({ verticalAlignment: "center" }, [
+                    UI.Text({ text: "受保护工具", style: "bodySmall", fontSize: 12 }),
+                    UI.Spacer({ width: 8 }),
+                    UI.TextField({
+                        value: (cfg.protectedTools || []).join(","),
+                        onValueChange: (v) => set("protectedTools", String(v).split(",").map((s) => s.trim()).filter((s) => s.length > 0)),
+                        label: "逗号分隔",
+                        singleLine: true,
+                        style: { fontSize: 13 },
+                    }),
+                ]),
+                UI.Text({ text: "这些工具的结果对不压缩（tool-call + result 成对保护）", style: "bodySmall", color: "onSurfaceVariant", fontSize: 11 }),
+            ]),
+        ])
+    );
+
     // 保存/重置按钮
     children.push(
         UI.Row({ horizontalArrangement: "End", spacing: 8, padding: 4 }, [

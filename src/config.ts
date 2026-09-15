@@ -13,6 +13,14 @@ export interface AcpConfig {
     contextLimit: number;           // 与 Operit contextLength 对齐
     preserveRecentMessages: number; // 保护最近 N 条消息
     minCompressRangeChars: number;  // 单段可压缩最小字符数
+    // —— V0.10 高级设置（UI 高级卡片可编辑；adapter 层按键名直接消费）——
+    hostEscalationFloor?: number;       // 0~1，host 自接管下限（默认 0.70）
+    llmEmergencyFold?: boolean;         // LLM emergency fold 实验开关（默认 false）
+    maxShrinkPerCompress?: number;      // 0~1，单次压缩最多移除比例（默认不引导）
+    tier2Trigger?: number;              // T1 块数达到此值可蒸馏 T2（默认 5）
+    tier3Trigger?: number;              // T2 块数达到此值可浓缩 T3（默认 10）
+    incrementalMaxNewTurns?: number;    // 增量投影最大新增条数（默认 8）
+    protectedTools?: string[];          // 受保护工具（tool-call+result 成对不压缩）
 }
 
 export const DEFAULT_CONFIG: AcpConfig = {
@@ -24,6 +32,14 @@ export const DEFAULT_CONFIG: AcpConfig = {
     contextLimit: 200_000,
     preserveRecentMessages: 5,
     minCompressRangeChars: 5000,
+    // 高级设置默认值（与 src/acp/config.ts loadAdapterSettings 对齐）。
+    // maxShrinkPerCompress 省略 = 不引导（undefined 语义）。
+    hostEscalationFloor: 0.70,
+    llmEmergencyFold: false,
+    tier2Trigger: 5,
+    tier3Trigger: 10,
+    incrementalMaxNewTurns: 8,
+    protectedTools: [],
 };
 
 export function configPath(): string {

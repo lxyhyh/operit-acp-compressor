@@ -64,10 +64,18 @@ export function registerIpc(): void {
         });
         ToolPkg.ipc.on("acp.get_stats", async () => {
             // V0.5：读最近会话状态文件的 runtimeStats/metrics（UI 状态卡）。
+            // V0.10-F2 修复：宿主 Files.list 返回 DirectoryListingData{path,entries}
+            //  对象形状（StandardFileSystemTools.kt listFiles），Array.isArray 恒 false
+            //  导致 files 恒空、状态卡恒 null；兼容对象/数组两种形状。
+            //  过滤改为 state_<safe>_<hash12>.json（persistence.sessionKeyToFile），
+            //  旧 "_b" 过滤与命名不符（同样导致恒空）。
             try {
                 const dir = "/sdcard/Download/Operit/plugins/com.operit.acp_compressor/acp-state";
                 const res = await Tools.Files.list(dir);
-                const files = (Array.isArray(res) ? res : []).map((f) => typeof f === "string" ? f : String((f as { name?: string }).name ?? "")).filter((f) => f.includes("_b") && f.endsWith(".json") && !f.includes("raw"));
+                const rawEntries = res && typeof res === "object" && !Array.isArray(res) && Array.isArray((res as { entries?: unknown }).entries)
+                    ? (res as { entries: unknown[] }).entries
+                    : (Array.isArray(res) ? res : []);
+                const files = rawEntries.map((f) => typeof f === "string" ? f : String((f as { name?: string }).name ?? "")).filter((f) => f.startsWith("state_") && f.endsWith(".json") && !f.includes("raw"));
                 // 逐个读 hostMetadata.lastUpdatedAt，取最新（不依赖 stat API）
                 let latest = "";
                 let latestTs = 0;

@@ -1,6 +1,6 @@
 node_modules/
-dist/*.js
-dist/*.map
+# 构建产物整体不提交（dist/main.js + dist/packages/** 均由 npm run build 生成）
+dist/
 *.toolpkg
 .DS_Store
 *.log

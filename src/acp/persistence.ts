@@ -29,12 +29,14 @@ export interface AcpRuntimeStats {
   emergencyTriggered: number;
   /** 自动兜底释放 token。 */
   emergencySavedTokens: number;
+  /** V0.11 A 项 preflight：宿主上轮真实发送已超硬限触发的提前折叠次数。 */
+  preflightTriggered?: number;
   /** 模型主动压缩释放 token。 */
   modelSavedTokens: number;
   /** nudge 后经历轮数（用于算 ignore 率）。 */
   nudgeIgnored: number;
-  /** 最近一次 compress 来源（model/emergency）。 */
-  lastCompressSource?: "model" | "emergency" | "deferred";
+  /** 最近一次 compress 来源（model/emergency/preflight/deferred）。 */
+  lastCompressSource?: "model" | "emergency" | "preflight" | "deferred";
   lastCompressAt?: number;
   /** V0.4.1 usage credit：compress 后 N token 内免除 nudge（防刚压缩又提醒）。 */
   creditUntilToken?: number;

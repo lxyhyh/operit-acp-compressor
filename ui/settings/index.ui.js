@@ -138,7 +138,7 @@ function Screen(ctx) {
                 UI.Column({ padding: 12, spacing: 4 }, [
                     UI.Text({ text: "运行状态" + (updated ? " · " + updated : ""), style: "bodySmall", color: "onSurfaceVariant", fontSize: 11 }),
                     UI.Text({ text: "压缩块: " + (stats.blocks ?? 0) + " 个 · 累计压缩 " + Number(stats.tokensCompressed || 0).toLocaleString() + " tokens", style: "bodySmall", fontSize: 12 }),
-                    UI.Text({ text: "模型主动压缩: " + (st.compressSucceeded || 0) + " 次 (" + proactivePct + "%) · 紧急兜底: " + (st.emergencyTriggered || 0) + " 次", style: "bodySmall", fontSize: 12 }),
+                    UI.Text({ text: "模型主动压缩: " + (st.compressSucceeded || 0) + " 次 (" + proactivePct + "%) · 紧急兜底: " + (st.emergencyTriggered || 0) + " 次" + ((st.preflightTriggered || 0) > 0 ? " · 超窗预压: " + (st.preflightTriggered || 0) + " 次" : ""), style: "bodySmall", fontSize: 12 }),
                     UI.Text({ text: "nudge 已发: " + (st.nudgeIssued || 0) + " (gentle " + (st.gentleNudges || 0) + "/strong " + (st.strongNudges || 0) + "/emergency " + (st.emergencyNudges || 0) + ") · 转化率 " + convPct + "%", style: "bodySmall", fontSize: 12 }),
                     epoch ? UI.Text({ text: "pressure epoch #" + (epoch.epoch || 0) + " · 注入 " + (epoch.injections || 0) + " 次 · 档位 " + (epoch.maxLevel || "none") + (epoch.closed ? " (closed)" : ""), style: "bodySmall", fontSize: 12 }) : null,
                 ]),

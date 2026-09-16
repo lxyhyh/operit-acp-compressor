@@ -16,13 +16,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { stableKeyForTurn, promptTurnsToCoreMessages, coreMessagesToPromptTurns, capProjectionSize, hashString, toolNameFromXml } from "../src/acp/messages.ts";
-import { countTokensCjk, collectCoveredMessageIds } from "../src/acp/token.ts";
+import { stableKeyForTurn, promptTurnsToCoreMessages, coreMessagesToPromptTurns, capProjectionSize, hashString, toolNameFromXml, splitThinkingFromContent } from "../src/acp/messages.ts";
+import { countTokensCjk, collectCoveredMessageIds, estimateProjectionTokens } from "../src/acp/token.ts";
 import { buildSessionKey } from "../src/acp/session.ts";
 import { appendAcpSystemPrompt, ACP_SYSTEM_PROMPT } from "../src/acp/system-prompt.ts";
 import { ACP_CORE_TOOLS, acpCoreToolNames, buildAcpToolPromptItems } from "../src/acp/tools-meta.ts";
 import { sessionKeyToFile, mergeInitialState, EMPTY_RUNTIME_STATS, type AcpRuntimeStats } from "../src/acp/persistence.ts";
-import { computeFingerprint } from "../src/acp/adapter.ts";
+import { computeFingerprint, shouldPreflightFold } from "../src/acp/adapter.ts";
 
 import { createCore, createInitialState, defaultConfig } from "acp-kernel";
 
@@ -432,4 +432,83 @@ test("V0.4.1 usage credit：默认窗口 ≈ contextLimit 的 15%（200k → 30k
     const base = 70_000;
     assert.ok(base + credit - 85_000 > 0, "85k < 100k 仍在 credit 窗口");
     assert.ok(base + credit - 105_000 <= 0, "105k ≥ 100k 已出 credit 窗口");
+});
+
+// ---- C 项：thinking 感知（V0.11） ----
+
+test("splitThinkingFromContent 剥离 <thinking>/<search> 标签且返回 thinking 原文", () => {
+  const content = [
+    "先思考一下。",
+    "<thinking>用户想压缩上下文，需要选最旧未覆盖段。</thinking>",
+    "<search>查询 adapter.ts 折叠入口</search>",
+    "结论：走 foldOldestUncoveredSegment。",
+  ].join("\n");
+  const { text, thinking } = splitThinkingFromContent(content);
+  assert.ok(!text.includes("<thinking>"), "text 不应含 thinking 标签");
+  assert.ok(!text.includes("<search>"), "text 不应含 search 标签");
+  assert.ok(text.includes("先思考一下。"), "text 保留思考前内容");
+  assert.ok(text.includes("结论：走 foldOldestUncoveredSegment。"), "text 保留思考后内容");
+  assert.ok(thinking.includes("用户想压缩上下文"), "thinking 原文保留 thinking 内容");
+  assert.ok(thinking.includes("查询 adapter.ts 折叠入口"), "thinking 原文保留 search 内容");
+});
+
+test("splitThinkingFromContent 处理未闭合 thinking（宿主 DOT_MATCHES_ALL 语义）", () => {
+  const content = "开头\n<thinking>未闭合的思考内容";
+  const { text, thinking } = splitThinkingFromContent(content);
+  assert.ok(!text.includes("<thinking>"), "未闭合 thinking 也剥离");
+  assert.ok(thinking.includes("未闭合的思考内容"), "未闭合内容进入 thinking");
+});
+
+test("promptTurnsToCoreMessages：ASSISTANT 剥离 thinking → text 干净 + thinkingTokens 计量", () => {
+  const turns = [
+    { kind: "USER", content: "帮我压缩" },
+    { kind: "ASSISTANT", content: "<thinking>思考中</thinking>正式回答" },
+  ];
+  const { messages } = promptTurnsToCoreMessages(turns);
+  const assistant = messages.find((m) => m.role === "assistant");
+  assert.ok(assistant, "存在 assistant 消息");
+  assert.equal(assistant.text, "正式回答", "text 已剥离 thinking");
+  assert.ok((assistant.thinkingTokens ?? 0) > 0, "thinkingTokens 已计量");
+  // USER 消息不应有 thinkingTokens
+  const user = messages.find((m) => m.role === "user");
+  assert.equal(user.thinkingTokens, undefined, "USER 消息无 thinkingTokens");
+});
+
+test("coreMessagesToPromptTurns：剥离过 thinking 的消息还原原始 content（供宿主重放 reasoning）", () => {
+  const original = { kind: "ASSISTANT", content: "<thinking>思考</thinking>回答" };
+  const { messages, byKey } = promptTurnsToCoreMessages([original]);
+  const core = messages[0];
+  // 模拟 kernel 原样返回（未压缩）该 core
+  const restored = coreMessagesToPromptTurns([core], byKey);
+  assert.equal(restored[0].content, "<thinking>思考</thinking>回答", "还原保留原始 content（含 thinking）");
+});
+
+test("estimateProjectionTokens 计入 thinkingTokens", () => {
+  const { messages } = promptTurnsToCoreMessages([
+    { kind: "ASSISTANT", content: "<thinking>很长的思考内容反复推演多轮</thinking>短回答" },
+  ]);
+  const withThinking = estimateProjectionTokens(messages);
+  const { messages: stripped } = promptTurnsToCoreMessages([
+    { kind: "ASSISTANT", content: "短回答" },
+  ]);
+  const withoutThinking = estimateProjectionTokens(stripped);
+  assert.ok(withThinking > withoutThinking, "thinkingTokens 计入估算");
+});
+
+// ---- A 项：preflight 主动压缩（V0.11） ----
+
+test("shouldPreflightFold：host 超硬限（0.85×limit）才触发，无效 host 恒 false", () => {
+  const limit = 200_000;
+  const hard = 0.85;
+  const at = limit * hard; // 170_000
+  assert.equal(shouldPreflightFold(at + 1, limit, hard), true, "host 超过硬限触发");
+  assert.equal(shouldPreflightFold(at, limit, hard), false, "host 恰在硬限不触发（严格大于）");
+  assert.equal(shouldPreflightFold(at * 0.8, limit, hard), false, "host 未到硬限不触发");
+  assert.equal(shouldPreflightFold(undefined, limit, hard), false, "host undefined 不触发");
+  assert.equal(shouldPreflightFold(0, limit, hard), false, "host 0 不触发");
+  assert.equal(shouldPreflightFold(-5, limit, hard), false, "host 负数不触发");
+  assert.equal(shouldPreflightFold(NaN, limit, hard), false, "host NaN 不触发");
+  assert.equal(shouldPreflightFold(10, 0, hard), false, "limit 0 不触发");
+  assert.equal(shouldPreflightFold(10, 200_000, undefined), false, "hardLimitPct 缺省且 host 未超 0.85×limit 不触发");
+  assert.equal(shouldPreflightFold(limit * 0.86, 200_000, undefined), true, "hardLimitPct 缺省用 0.85 兜底");
 });

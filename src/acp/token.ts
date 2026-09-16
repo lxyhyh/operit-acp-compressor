@@ -42,6 +42,9 @@ export function estimateProjectionTokens(
     if (m.toolName === "compress" || (m.toolName && m.toolName.endsWith(":compress"))) continue;
     if (coveredIds?.has(m.id)) continue;
     tokens += countTokensCjk(m.text ?? "");
+    // C 项：thinking 负载随每次请求重发（宿主发送层保留 thinking 标签），
+    // 虽不属 text 但真实占用模型窗口，计入估算。
+    if (m.thinkingTokens) tokens += m.thinkingTokens;
   }
   return tokens;
 }

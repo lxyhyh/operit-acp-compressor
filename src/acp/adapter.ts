@@ -264,6 +264,24 @@ export interface ProjectionResult {
   delivery?: NudgeDelivery;
 }
 
+/**
+ * V0.11 A 项（preflight）触发判定：宿主上轮真实发送 token（host = DB
+ * currentWindowSize = finalize 后发送历史的 tokenizer 计数）已超过硬限
+ * （hardLimitPct × modelContextLimit）时，即使本轮 estimate 未达 forced 也
+ * 提前折叠。覆盖 estimate 低估（thinking 未计/CJK 粗估偏小）与换小窗口模型
+ * 场景。host 无效（undefined/≤0）恒 false。
+ */
+export function shouldPreflightFold(
+  hostTokens: number | undefined,
+  modelContextLimit: number,
+  hardLimitPct: number | undefined,
+): boolean {
+  const hostNum = typeof hostTokens === "number" && Number.isFinite(hostTokens) && hostTokens > 0 ? hostTokens : undefined;
+  return hostNum !== undefined
+    && modelContextLimit > 0
+    && hostNum > modelContextLimit * (hardLimitPct ?? 0.85);
+}
+
 /** 计算 projection fingerprint（轻量；stableKey 全量拼接）。
  *  V0.7.13-PERF：stableKeyForTurn 对每条 content 做 JSON.stringify+hash，
  *  2050 层巨型 TOOL_RESULT（单条可达数 MB）时整体 >10s，超出宿主 hook 预算
@@ -1133,7 +1151,7 @@ export function createEngine(dataDir?: string): AcpEngine {
         //   故：autoFolded 时用压缩后投影重新估算 tokenEstimate 作为本 Hop 的发送视图。
         const sendEstimate = tokenEstimate;
         const prevNudgeState = cached.hostMetadata.acpNudge ?? {};
-        const { pressure, eff, pressurePct, usageManager: um2 } = await collectAndEvaluatePressure({
+        const { pressure, eff, pressurePct, usageManager: um2, hostTokens } = await collectAndEvaluatePressure({
           sessionKey, chatId,
           tokenEstimate: sendEstimate,
           kernelShouldInject: turn.nudge?.shouldInject === true,
@@ -1196,7 +1214,17 @@ export function createEngine(dataDir?: string): AcpEngine {
         {
           const targetTokens = Math.floor(settings.modelContextLimit * (settings.gentleThresholdPct ?? 0.7));
           const effTokens = eff.effectiveTokens || sendEstimate;
-          if (pressure.level === "forced" && effTokens > targetTokens && mapping.messages.length > 8) {
+          // —— V0.11 A 项（preflight，对齐原版 billion-context）：宿主上轮真实发送
+          //   token（host = DB currentWindowSize = finalize 后发送历史的 tokenizer 计数）
+          //   已超硬限时，即使本轮 estimate 未达 forced 也提前折叠。覆盖两个场景：
+          //   ① estimate 低估（thinking 未计 / CJK 粗估偏小）——estimate 看压力温和，
+          //      但宿主上轮实际发送已超窗；② 换小窗口模型（1M→260k）——host 读数
+          //      是模型无关的真实计数，超限即折叠，不等 estimate 缓慢爬升。
+          //   host 读数已在 collectAndEvaluatePressure 经 clamp（≤limit×2）校验，
+          //   此处复用同一可信值；与 forced 共用折叠块（含预算守卫 deferred fold）。
+          const preflightHostOver = shouldPreflightFold(hostTokens, settings.modelContextLimit, settings.hardLimitPct);
+          const foldReason = pressure.level === "forced" ? "forced" : preflightHostOver ? "preflight" : undefined;
+          if (foldReason && effTokens > targetTokens && mapping.messages.length > 8) {
             // —— V0.10-P1 预算守卫：FULL 投影已耗时过长（接近宿主 hook 预算 10s）时，
             //   不再发送前建块重投影（整轮 mutation 有超时被宿主丢弃的风险），
             //   改为登记后台 deferred fold（ChatRuntimeHook completed 时执行，下轮生效）。
@@ -1212,7 +1240,7 @@ export function createEngine(dataDir?: string): AcpEngine {
                   sessionKey,
                   blocksAtDefer: turn.state.blocks.length,
                   stateVersionAtDefer: cached.hostMetadata.stateVersion ?? 0,
-                  level: pressure.level,
+                  level: foldReason as NudgeLevel,
                   at: Date.now(),
                 });
                 try {
@@ -1247,19 +1275,24 @@ export function createEngine(dataDir?: string): AcpEngine {
                   projectedTurns.push(...reTurns);
                   emergencyFolded = true;
                   emergencyFreedTokens = folded.tokensCompressed;
-                  nextStats.emergencyTriggered = (nextStats.emergencyTriggered ?? 0) + 1;
-                  nextStats.emergencySavedTokens = (nextStats.emergencySavedTokens ?? 0) + folded.tokensCompressed;
-                  nextStats.lastCompressSource = "emergency";
+                  if (foldReason === "preflight") {
+                    nextStats.preflightTriggered = (nextStats.preflightTriggered ?? 0) + 1;
+                    nextStats.lastCompressSource = "preflight";
+                  } else {
+                    nextStats.emergencyTriggered = (nextStats.emergencyTriggered ?? 0) + 1;
+                    nextStats.emergencySavedTokens = (nextStats.emergencySavedTokens ?? 0) + folded.tokensCompressed;
+                    nextStats.lastCompressSource = "emergency";
+                  }
                   nextStats.lastCompressAt = Date.now();
                   // credit 基准更新（与 model compress 同款）。
                   nextStats.creditBaseToken = Math.max(0, effTokens - folded.tokensCompressed);
                   nextStats.creditRemaining = settings.usageCreditTokens;
                   try {
-                    console.log(`[acp] project EMERGENCY-FOLD stage=${hookStage} seg=${folded.segLen} refs=${folded.startRef}..${folded.endRef} freed=${folded.tokensCompressed} raw=${turns.length} proj=${reTurns.length}`);
+                    console.log(`[acp] project ${foldReason === "preflight" ? "PREFLIGHT-FOLD" : "EMERGENCY-FOLD"} stage=${hookStage} seg=${folded.segLen} refs=${folded.startRef}..${folded.endRef} freed=${folded.tokensCompressed} raw=${turns.length} proj=${reTurns.length} reason=${foldReason} host=${typeof hostTokens === "number" ? hostTokens : "-"}`);
                   } catch { /* noop */ }
                   chatTrace(chatId, {
                     type: "emergency_fold", stage: hookStage,
-                    detail: { seg: folded.segLen, freed: folded.tokensCompressed, raw: turns.length, proj: reTurns.length, effective: effTokens },
+                    detail: { reason: foldReason, seg: folded.segLen, freed: folded.tokensCompressed, raw: turns.length, proj: reTurns.length, effective: effTokens, host: typeof hostTokens === "number" ? hostTokens : undefined },
                   });
                 }
               } catch (e) {
@@ -1885,7 +1918,10 @@ function pushRange(
 ): void {
   if (startIdx > endIdx) return;
   const seg = messages.slice(startIdx, endIdx + 1);
-  const tokens = seg.reduce((n, m) => n + (m.text ? m.text.length / 4 : 0), 0);
+  const tokens = seg.reduce(
+    (n, m) => n + (m.text ? m.text.length / 4 : 0) + (m.thinkingTokens ?? 0),
+    0,
+  );
   // kernel messageRefs.byRaw 键 = 消息 id、值 = ref（{id → ref}），正查。
   const startRef = byRaw[seg[0].id] ?? "";
   const endRef = byRaw[seg[seg.length - 1].id] ?? "";

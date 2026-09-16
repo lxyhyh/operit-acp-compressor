@@ -82,6 +82,35 @@ export function toolTagIdFromXml(content: string): string {
   return m ? m[1] : "";
 }
 
+/**
+ * 从 ASSISTANT 文本中剥离 thinking/思考标签（与宿主 ChatUtils.removeThinkingContent
+ * 同正则：`<think(?:ing)?>...</think>` + `<search>...</search>`，DOT_MATCHES_ALL 处理未闭合）。
+ * 宿主发送给插件 finalize 钩子的 preparedHistory 保留 thinking 标签（剥离只发生在
+ * provider 发送层/显示层/总结层），若不剥离，thinking 会被当作正文参与投影/折叠/压缩。
+ * 返回剥离后的文本与剥离出的 thinking 原文。
+ */
+export function splitThinkingFromContent(content: string): {
+  text: string;
+  thinking: string;
+} {
+  if (typeof content !== "string" || content.length === 0) {
+    return { text: content, thinking: "" };
+  }
+  const thinkRe = /<think(?:ing)?>[\s\S]*?(?:<\/think(?:ing)?>|$)/g;
+  const searchRe = /<search\b[\s\S]*?(?:<\/search>|$)/g;
+  let thinking = "";
+  let text = content;
+  for (const re of [thinkRe, searchRe]) {
+    for (const m of text.matchAll(re)) {
+      if (m[0]) thinking += (thinking ? "\n" : "") + m[0];
+    }
+    text = text.replace(re, "");
+  }
+  // 清理因剥离产生的多余空行。
+  text = text.replace(/\n{3,}/g, "\n\n").replace(/^\n+/, "");
+  return { text, thinking };
+}
+
 /** 为一条 PromptTurn 生成 stableKey（内容指纹；排除易变 metadata）。 */
 export function stableKeyForTurn(turn: PromptTurnLike): string {
   const kind = turn.kind || "UNKNOWN";
@@ -136,7 +165,7 @@ export function promptTurnsToCoreMessages(
 
     const role = KIND_TO_ROLE[turn.kind] || "user";
     const contentType = KIND_TO_CONTENT_TYPE[turn.kind] || "text";
-    const text = typeof turn.content === "string" ? turn.content : "";
+    let text = typeof turn.content === "string" ? turn.content : "";
 
     const core: CoreMessage = {
       id: key,
@@ -144,6 +173,21 @@ export function promptTurnsToCoreMessages(
       contentType,
       text,
     };
+
+    // C 项（thinking 感知）：ASSISTANT 文本消息剥离 thinking 标签——宿主发送给
+    // 插件的 preparedHistory 保留 `<thinking>`（剥离只发生在 provider 发送层/显示层），
+    // 若不剥离，thinking 会被当正文参与投影/折叠/压缩（失真 + 浪费压缩预算）。
+    // 剥离出的内容估算 tokens 写入 core.thinkingTokens（kernel metering-only：
+    // 计 token、不渲染、不索引、不压缩；宿主须精确 attach 一次——每原始消息恰一条 core）。
+    if (role === "assistant" && contentType === "text") {
+      const split = splitThinkingFromContent(text);
+      if (split.thinking) {
+        text = split.text;
+        core.text = text;
+        // 与 kernel 默认 countTokens（text.length/4）同口径估算 thinking 负载。
+        core.thinkingTokens = Math.ceil(split.thinking.length / 4) || 1;
+      }
+    }
 
     if (turn.kind === "TOOL_CALL" || turn.kind === "TOOL_RESULT") {
       const xmlName = toolNameFromXml(text);
@@ -277,7 +321,10 @@ export function coreMessagesToPromptTurns(
       const isStructured = original.kind === "TOOL_CALL" || original.kind === "TOOL_RESULT";
       const outTurn: PromptTurnLike = { ...original };
       if (!isStructured && typeof core.text === "string" && core.text !== original.content) {
-        outTurn.content = core.text;
+        // C 项：剥离过 thinking 的 core 带 thinkingTokens 标记——还原时恢复原始
+        // content（thinking 标签随发送历史回传，宿主/DeepSeek 需重放 reasoning，
+        // 400 要求原样回传）；未剥离的 core 才采用 kernel 输出文本。
+        outTurn.content = core.thinkingTokens ? original.content : core.text;
       }
       if (core.toolCallId && (!outTurn.metadata || !(outTurn.metadata as Record<string, unknown>).toolCallId)) {
         outTurn.metadata = { ...(outTurn.metadata || {}), toolCallId: core.toolCallId };

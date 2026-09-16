@@ -497,10 +497,10 @@ test("estimateProjectionTokens 计入 thinkingTokens", () => {
 
 // ---- A 项：preflight 主动压缩（V0.11） ----
 
-test("shouldPreflightFold：host 超硬限（0.85×limit）才触发，无效 host 恒 false", () => {
+test("shouldPreflightFold：host 超硬限（0.95×limit）才触发，无效 host 恒 false", () => {
   const limit = 200_000;
-  const hard = 0.85;
-  const at = limit * hard; // 170_000
+  const hard = 0.95;
+  const at = limit * hard; // 190_000
   assert.equal(shouldPreflightFold(at + 1, limit, hard), true, "host 超过硬限触发");
   assert.equal(shouldPreflightFold(at, limit, hard), false, "host 恰在硬限不触发（严格大于）");
   assert.equal(shouldPreflightFold(at * 0.8, limit, hard), false, "host 未到硬限不触发");
@@ -509,6 +509,6 @@ test("shouldPreflightFold：host 超硬限（0.85×limit）才触发，无效 ho
   assert.equal(shouldPreflightFold(-5, limit, hard), false, "host 负数不触发");
   assert.equal(shouldPreflightFold(NaN, limit, hard), false, "host NaN 不触发");
   assert.equal(shouldPreflightFold(10, 0, hard), false, "limit 0 不触发");
-  assert.equal(shouldPreflightFold(10, 200_000, undefined), false, "hardLimitPct 缺省且 host 未超 0.85×limit 不触发");
-  assert.equal(shouldPreflightFold(limit * 0.86, 200_000, undefined), true, "hardLimitPct 缺省用 0.85 兜底");
+  assert.equal(shouldPreflightFold(10, 200_000, undefined), false, "hardLimitPct 缺省且 host 未超 0.95×limit 不触发");
+  assert.equal(shouldPreflightFold(limit * 0.96, 200_000, undefined), true, "hardLimitPct 缺省用 0.95 兜底");
 });

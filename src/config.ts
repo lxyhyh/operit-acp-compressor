@@ -28,7 +28,7 @@ export const DEFAULT_CONFIG: AcpConfig = {
     // V0.10：0.72 → 0.45，对齐原版 kernel nudge 下限（≥45% 且有增长即提醒）。
     nudgeThresholdPct: 0.45,
     strongThresholdPct: 0.82,
-    hardLimitPct: 0.85,
+    hardLimitPct: 0.95,
     contextLimit: 200_000,
     preserveRecentMessages: 5,
     minCompressRangeChars: 5000,

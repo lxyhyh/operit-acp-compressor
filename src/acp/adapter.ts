@@ -279,7 +279,7 @@ export function shouldPreflightFold(
   const hostNum = typeof hostTokens === "number" && Number.isFinite(hostTokens) && hostTokens > 0 ? hostTokens : undefined;
   return hostNum !== undefined
     && modelContextLimit > 0
-    && hostNum > modelContextLimit * (hardLimitPct ?? 0.85);
+    && hostNum > modelContextLimit * (hardLimitPct ?? 0.95);
 }
 
 /** 计算 projection fingerprint（轻量；stableKey 全量拼接）。

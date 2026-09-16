@@ -20,7 +20,7 @@
                            │ before_send_to_model
 ┌──────────────────────────▼──────────────────────────────────┐
 │ fold.ts：foldHistory                                         │
-│  1) 超硬限(≥85%)+历史长 → preflight.ts 自动折叠最早段          │
+│  1) 超硬限(≥95%)+历史长 → preflight.ts 自动折叠最早段          │
 │  2) processTurn(全部历史, session.state) → 折叠视图           │
 │  3) 首条 metadata.acpChatId=chatId                            │
 │  4) persistSession（插件目录 sessions/<chatId>.json）          │
@@ -68,7 +68,7 @@
 | handler 模块导出 | 宿主要求注册 handler 带 `__operit_toolpkg_module_path`，`resolveDurableFunctionRef` 需从模块 exports 解析函数 → main.ts re-export 全部 handler。 |
 | Tools.Net.http 一次性请求 + 本地 SSE 解析 | Tools.Net 无流式 API（类型实测）；服务端流响应仍可整包取回后按 SSE 解析；分块回传用 sendIntermediateResult。 |
 | 配置走 IPC + JSON | UI/main/provider 不同 engine；配置写入 acp-config.json，hook 读取。 |
-| preflight 硬限兜底 | 模型一直不 compress 时 ≥85% 主动折叠最早段，防原生 token 超限中断。 |
+| preflight 硬限兜底 | 模型一直不 compress 时 ≥95% 主动折叠最早段，防原生 token 超限中断。 |
 
 ## 风险与未决
 

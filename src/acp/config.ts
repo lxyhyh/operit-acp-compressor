@@ -28,7 +28,7 @@ export interface AdapterSettings {
   nudgeEnabled: boolean;
   /** 触发 nudge 建议的上下文使用率阈值（0~1）。默认 0.45（V0.10 对齐原版 kernel 下限）。 */
   nudgeThresholdPct: number;
-  /** hard/maxContextLimit 阈值（0~1）：usage ≥ 此值发 forced nudge（绕过 growth/cadence/credit，但绝不自动压缩历史）。默认 0.85。 */
+  /** hard/maxContextLimit 阈值（0~1）：usage ≥ 此值发 forced nudge（绕过 growth/cadence/credit，但绝不自动压缩历史）。默认 0.95。 */
   hardLimitPct: number;
   /** 单次压缩的最小字符数门槛。默认 5000。 */
   minCompressRange: number;
@@ -210,7 +210,7 @@ export function loadAdapterSettings(): AdapterSettings {
     nudgeEnabled: true,
     // V0.10：死字段（resolveKernelConfig 用 gentleThresholdPct），默认与 gentle 对齐 0.45。
     nudgeThresholdPct: readPct(KEYS.nudgeThresholdPct, 0.45),
-    hardLimitPct: readPct(KEYS.hardLimitPct, 0.85),
+    hardLimitPct: readPct(KEYS.hardLimitPct, 0.95),
     minCompressRange: readNum(KEYS.minCompressRange, 5_000),
     hideConsumedCompressCalls: true,
     nudgeCooldownTurns: 3,

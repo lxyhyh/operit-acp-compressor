@@ -17,7 +17,7 @@ const DEFAULT = {
     // V0.10：对齐服务端默认 0.45（仅 IPC 失败时的本地兜底显示）。
     nudgeThresholdPct: 0.45,
     strongThresholdPct: 0.82,
-    hardLimitPct: 0.85,
+    hardLimitPct: 0.95,
     contextLimit: 200000,
     preserveRecentMessages: 5,
     minCompressRangeChars: 5000,
@@ -215,7 +215,7 @@ function Screen(ctx) {
                     UI.Text({ text: "硬限阈值 (%)", style: "bodySmall", fontSize: 12 }),
                     UI.Spacer({ width: 8 }),
                     UI.TextField({
-                        value: String(Math.round((cfg.hardLimitPct || 0.85) * 100)),
+                        value: String(Math.round((cfg.hardLimitPct || 0.95) * 100)),
                         onValueChange: (v) => {
                             const n = Number(String(v).replace(/[^0-9]/g, ""));
                             if (Number.isFinite(n) && n >= 1 && n <= 100) set("hardLimitPct", n / 100);

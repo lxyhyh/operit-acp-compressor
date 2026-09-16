@@ -62,7 +62,10 @@ export async function loadConfig(): Promise<AcpConfig> {
     }
 }
 
-/** 保存配置（失败静默） */
+/** 保存配置（失败静默）。
+ *  注意：JSON.stringify 会省略值为 undefined 的键（如 maxShrinkPerCompress 不引导时），
+ *  loadConfig 的 {...DEFAULT_CONFIG, ...parsed} 恰好使省略等价于 undefined —— 依赖 JS
+ *  序列化行为的有意设计，勿改为显式写入 null（会破坏"不引导"语义）。 */
 export async function saveConfig(cfg: AcpConfig): Promise<boolean> {
     const path = configPath();
     if (!path) return false;

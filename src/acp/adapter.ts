@@ -460,13 +460,15 @@ export function createEngine(dataDir?: string): AcpEngine {
     // 超界视为异常读数，保持 estimate（host 读数永远只做"向上修正"不做"向上顶爆"）。
     const hostLimit = opts.config.modelContextLimit > 0 ? opts.config.modelContextLimit : 200000;
     const HOST_MAX_CLAMP_FACTOR = 2;
+    // host 显著大于 estimate 的判定阈值（>20% 才采纳 host 保守修正；小差异属正常抖动）。
+    const HOST_CALIBRATION_RATIO = 1.2;
     const hostPlausible = hostNum !== undefined && hostNum <= hostLimit * HOST_MAX_CLAMP_FACTOR;
-    if (hostNum !== undefined && estNum > 0 && hostNum > estNum * 1.2 && hostPlausible) {
+    if (hostNum !== undefined && estNum > 0 && hostNum > estNum * HOST_CALIBRATION_RATIO && hostPlausible) {
       eff = { ...eff, effectiveTokens: hostNum, source: "host" as const, confidence: "medium" as const };
       try {
-        console.log(`[acp] pressure host-calibrated estimate=${opts.tokenEstimate} estEff=${estNum} host=${hostNum} (host>est*1.2, take host conservative)`);
+        console.log(`[acp] pressure host-calibrated estimate=${opts.tokenEstimate} estEff=${estNum} host=${hostNum} (host>est*${HOST_CALIBRATION_RATIO}, take host conservative)`);
       } catch { /* noop */ }
-    } else if (hostNum !== undefined && hostNum > estNum * 1.2 && !hostPlausible) {
+    } else if (hostNum !== undefined && hostNum > estNum * HOST_CALIBRATION_RATIO && !hostPlausible) {
       try {
         console.log(`[acp] pressure host-ignored estimate=${opts.tokenEstimate} host=${hostNum} limit=${hostLimit} (clamped: host>limit*${HOST_MAX_CLAMP_FACTOR} treated as stale/erratic)`);
       } catch { /* noop */ }

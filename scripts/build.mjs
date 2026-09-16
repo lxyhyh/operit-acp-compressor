@@ -23,6 +23,40 @@ function extractMetadata(sourcePath) {
     return m ? m[0] : null;
 }
 
+// 公共 banner（main 与 subpackage 共用）：
+// - V0.10-B1-M 修复（M11）：banner 先于 esbuild 生成的 "use strict" 执行
+//   （banner 恒在输出最顶部），banner 代码实际运行在非严格模式；
+//   在 banner 首行显式 "use strict"，保证 shim 代码与产物同处严格模式
+//   （对齐原版产物 "use strict" 紧跟顶部的形态）。
+const SHIM_BANNER = [
+    '"use strict";',
+    'var __g = (typeof globalThis !== "undefined") ? globalThis : this;',
+    'if (typeof __g.process === "undefined") { __g.process = { env: { ACP_REASONING_KEEP: "0" } }; }',
+    'var process = __g.process;',
+    'if (typeof __g.Intl === "undefined") { __g.Intl = {}; }',
+    'if (typeof __g.Intl.Segmenter === "undefined") {',
+    '  var SegmenterShimImpl = function(_locale, options) { this.g = (options && options.granularity) || "grapheme"; };',
+    '  SegmenterShimImpl.prototype.segment = function(input) {',
+    '    var text = String(input == null ? "" : input);',
+    '    var out = [];',
+    '    if (this.g === "word") {',
+    '      var re = /[A-Za-z0-9_\']+/g; var m; var last = 0;',
+    '      while ((m = re.exec(text)) !== null) {',
+    '        for (var i = last; i < m.index; i++) out.push({ segment: text[i], index: i, input: text, isWordLike: false });',
+    '        out.push({ segment: m[0], index: m.index, input: text, isWordLike: true });',
+    '        last = m.index + m[0].length;',
+    '      }',
+    '      for (var j = last; j < text.length; j++) out.push({ segment: text[j], index: j, input: text, isWordLike: false });',
+    '    } else {',
+    '      for (var k = 0; k < text.length; k++) out.push({ segment: text[k], index: k, input: text, isWordLike: false });',
+    '    }',
+    '    return out[Symbol.iterator]();',
+    '  };',
+    '  __g.Intl.Segmenter = SegmenterShimImpl;',
+    '}',
+    '',
+].join("\n");
+
 await build({
     entryPoints: [path.join(root, "src/main.ts")],
     bundle: true,
@@ -42,38 +76,7 @@ await build({
     // UI 文件独立打包（Compose DSL 模块），main bundle 保留外部 require
     external: ["./ui/*"],
     banner: {
-        js: [
-            // V0.10-B1-M 修复（M11）：banner 先于 esbuild 生成的 "use strict" 执行
-            // （banner 恒在输出最顶部），banner 代码实际运行在非严格模式；
-            // 在 banner 首行显式 "use strict"，保证 shim 代码与产物同处严格模式
-            // （对齐原版产物 "use strict" 紧跟顶部的形态）。
-            '"use strict";',
-            'var __g = (typeof globalThis !== "undefined") ? globalThis : this;',
-            'if (typeof __g.process === "undefined") { __g.process = { env: { ACP_REASONING_KEEP: "0" } }; }',
-            'var process = __g.process;',
-            'if (typeof __g.Intl === "undefined") { __g.Intl = {}; }',
-            'if (typeof __g.Intl.Segmenter === "undefined") {',
-            '  var SegmenterShimImpl = function(_locale, options) { this.g = (options && options.granularity) || "grapheme"; };',
-            '  SegmenterShimImpl.prototype.segment = function(input) {',
-            '    var text = String(input == null ? "" : input);',
-            '    var out = [];',
-            '    if (this.g === "word") {',
-            '      var re = /[A-Za-z0-9_\']+/g; var m; var last = 0;',
-            '      while ((m = re.exec(text)) !== null) {',
-            '        for (var i = last; i < m.index; i++) out.push({ segment: text[i], index: i, input: text, isWordLike: false });',
-            '        out.push({ segment: m[0], index: m.index, input: text, isWordLike: true });',
-            '        last = m.index + m[0].length;',
-            '      }',
-            '      for (var j = last; j < text.length; j++) out.push({ segment: text[j], index: j, input: text, isWordLike: false });',
-            '    } else {',
-            '      for (var k = 0; k < text.length; k++) out.push({ segment: text[k], index: k, input: text, isWordLike: false });',
-            '    }',
-            '    return out[Symbol.iterator]();',
-            '  };',
-            '  __g.Intl.Segmenter = SegmenterShimImpl;',
-            '}',
-            '',
-        ].join("\n"),
+        js: SHIM_BANNER,
     },
     // main.ts 通过命名空间引用保证内核被内联；tree-shaking 保留被调用符号即可
     treeShaking: true,
@@ -101,38 +104,7 @@ await build({
     },
     external: ["./ui/*"],
     banner: {
-        js: [
-            // V0.10-B1-M 修复（M11）：banner 先于 esbuild 生成的 "use strict" 执行
-            // （banner 恒在输出最顶部），banner 代码实际运行在非严格模式；
-            // 在 banner 首行显式 "use strict"，保证 shim 代码与产物同处严格模式
-            // （对齐原版产物 "use strict" 紧跟顶部的形态）。
-            '"use strict";',
-            'var __g = (typeof globalThis !== "undefined") ? globalThis : this;',
-            'if (typeof __g.process === "undefined") { __g.process = { env: { ACP_REASONING_KEEP: "0" } }; }',
-            'var process = __g.process;',
-            'if (typeof __g.Intl === "undefined") { __g.Intl = {}; }',
-            'if (typeof __g.Intl.Segmenter === "undefined") {',
-            '  var SegmenterShimImpl = function(_locale, options) { this.g = (options && options.granularity) || "grapheme"; };',
-            '  SegmenterShimImpl.prototype.segment = function(input) {',
-            '    var text = String(input == null ? "" : input);',
-            '    var out = [];',
-            '    if (this.g === "word") {',
-            '      var re = /[A-Za-z0-9_\']+/g; var m; var last = 0;',
-            '      while ((m = re.exec(text)) !== null) {',
-            '        for (var i = last; i < m.index; i++) out.push({ segment: text[i], index: i, input: text, isWordLike: false });',
-            '        out.push({ segment: m[0], index: m.index, input: text, isWordLike: true });',
-            '        last = m.index + m[0].length;',
-            '      }',
-            '      for (var j = last; j < text.length; j++) out.push({ segment: text[j], index: j, input: text, isWordLike: false });',
-            '    } else {',
-            '      for (var k = 0; k < text.length; k++) out.push({ segment: text[k], index: k, input: text, isWordLike: false });',
-            '    }',
-            '    return out[Symbol.iterator]();',
-            '  };',
-            '  __g.Intl.Segmenter = SegmenterShimImpl;',
-            '}',
-            '',
-        ].join("\n"),
+        js: SHIM_BANNER,
     },
     treeShaking: true,
     // METADATA 是文件头注释，esbuild 会删除；构建后由下方 extractMetadata 重新前置。

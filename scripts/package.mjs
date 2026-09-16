@@ -115,6 +115,12 @@ async function main() {
         if (existsSync(full) && statSync(full).isFile()) entries.push({ rel, full });
     };
     add("manifest.json");
+    // V0.10-B1-M 修复（M10）：main.js 缺失时静默跳过会打包出残缺 .toolpkg
+    // （宿主无 main.js 可执行 → 插件整体静默失效，用户无从得知）。改为硬失败。
+    if (!existsSync(path.join(root, "dist/main.js"))) {
+        console.error("[acp] FATAL: dist/main.js 不存在——请先运行 npm run build（缺失时打包出的 .toolpkg 宿主无法加载，插件静默失效）。");
+        process.exit(1);
+    }
     add("dist/main.js");
     // subpackage 入口：dist/packages/**（manifest.subpackages[].entry 指向）。
     const pkgDir = path.join(root, "dist", "packages");

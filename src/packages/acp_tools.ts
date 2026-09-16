@@ -294,7 +294,11 @@ export async function decompress(params: {
       if (!r.ok) {
         return { success: false, message: r.error || "decompress 失败" };
       }
-      return { success: true, message: `block ${blockId} 已恢复（deactivated），下次投影将包含其原始消息。` };
+      return {
+        success: true,
+        message: `block ${blockId} 已恢复（deactivated），下次投影将包含其原始消息。`,
+        data: { restored: true, blockId },
+      };
     }
     const result = await e.decompressContent(sessionKey, blockId, params.full === true);
     if (!result.ok) {
@@ -306,6 +310,8 @@ export async function decompress(params: {
         message: `block ${blockId} 内容（${result.count ?? 0} 条）已写入临时文件：${result.tempFile}\n请用文件读取工具读取该文件。`,
         count: result.count,
         tempFile: result.tempFile,
+        // V0.10-B1-M 修复（M12）：成功统一挂 data（模型解析结构化结果用同一字段）。
+        data: { tempFile: result.tempFile, count: result.count ?? 0 },
       };
     }
     return {
@@ -313,6 +319,7 @@ export async function decompress(params: {
       message: `[Block ${blockId} content — ${result.count ?? 0} item(s)${params.full === true ? ", full" : ""}]\n${result.body}`,
       count: result.count,
       body: result.body,
+      data: { body: result.body, count: result.count ?? 0, full: params.full === true },
     };
   } catch (error) {
     return { success: false, message: String(error && (error as Error).message ? (error as Error).message : error) };
@@ -402,7 +409,13 @@ export async function acp_status(params: {
     } catch {
       report = { raw: result.report };
     }
-    return { success: true, data: report };
+    return {
+      success: true,
+      // V0.10-B1-M 修复（M12）：成功路径补 message（与其他工具一致；
+      // 结构化内容仍在 data）。
+      message: `ACP 状态报告（${Object.keys((report as Record<string, unknown>) ?? {}).length > 0 ? "见 data" : "空"}）。`,
+      data: report,
+    };
   } catch (error) {
     return { success: false, message: String(error && (error as Error).message ? (error as Error).message : error) };
   }

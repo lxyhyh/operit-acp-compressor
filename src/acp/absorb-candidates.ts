@@ -50,17 +50,25 @@ export function detectAbsorbCandidates(
   const candidates: AbsorbCandidate[] = [];
   const byRaw = (state.messageRefs?.byRaw ?? {}) as Record<string, string>;
   const now = Date.now();
-  for (let i = 0; i < turns.length; i++) {
-    const t = turns[i];
+  // V0.10-B1-M 修复（M7）：kernel messageRefs.byRaw 的键是 CoreMessage.id
+  // （identity-bridge 生成的 namespace-aware id），旧实现用 stableKeyForTurn(t)
+  // 查 → identity 模式下恒 undefined → 巨型 TOOL_RESULT 候选恒空。
+  // 改为遍历 mapping.messages（含正确 id），经 byKey 取回原始 turn 判 kind/内容。
+  // （byKey 键 = CoreMessage.id，与 messages[i].id 一一对应。）
+  for (let i = 0; i < mapping.messages.length; i++) {
+    const m = mapping.messages[i];
+    const t = mapping.byKey.get(m.id);
     if (!t || typeof t !== "object") continue;
     const kind = t.kind;
     if (kind !== "TOOL_RESULT" && kind !== "tool") continue;
     const content = typeof t.content === "string" ? t.content : "";
     if (content.length < minChars) continue;
-    const key = stableKeyForTurn(t);
     // 已被压缩 block 覆盖 → 不新增（避免 block + candidate 重复描述同一内容）。
-    if (coveredKeys.has(key)) continue;
-    const ref = byRaw[key];
+    // coveredKeys 是消息 id 集（collectCoveredMessageIds），用 m.id 判断
+    // （旧实现用 stableKey 查 id 集，恒不命中 → 覆盖检查失效）。
+    if (coveredKeys.has(m.id)) continue;
+    const key = stableKeyForTurn(t);
+    const ref = byRaw[m.id];
     if (!ref) continue; // 无 kernel ref（protected/未映射）→ 跳过，保持与 kernel 兼容
     candidates.push({
       ref,

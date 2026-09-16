@@ -20,15 +20,26 @@ import {
   tryAcquireFoldSlot,
   releaseFoldSlot,
   newFoldJobId,
+  checkFoldApply,
   type FoldRange,
   type LlmFoldJob,
 } from "../src/acp/llm-fold.ts";
 import type { PromptTurnLike } from "../src/acp/messages.ts";
 
-// —— 工具：构造 CompressionState（byRaw: ref → id）。
-function makeKernelState(byRaw: Record<string, string>, coveredIds: string[] = []): CompressionState {
-  const ks = createInitialState() as unknown as CompressionState & { messageRefs: { byRaw: Record<string, string> }; blocks: Array<{ blockId: string; active: boolean; effectiveMessageIds: string[] }> };
-  ks.messageRefs = { byRaw, byRef: {}, byId: {} } as never;
+// —— 工具：构造真实方向 kernel messageRefs。
+//    kernel 语义：byRaw = { 消息id → ref }、byRef = { ref → 消息id }。
+//    入参 refMap = { ref → id }（人类可读的"引用→消息"映射），内部同时构建
+//    byRaw 与 byRef —— 与生产 kernel 方向一致（旧夹具直接拿 refMap 当 byRaw
+//    （{ref: id}）且 byRef 留空，方向相反，掩盖了 checkFoldApply 的恒 discard 缺陷）。
+function makeKernelState(refMap: Record<string, string>, coveredIds: string[] = []): CompressionState {
+  const ks = createInitialState() as unknown as CompressionState & { messageRefs: { byRaw: Record<string, string>; byRef: Record<string, string> }; blocks: Array<{ blockId: string; active: boolean; effectiveMessageIds: string[] }> };
+  const byRaw: Record<string, string> = {};
+  const byRef: Record<string, string> = {};
+  for (const [ref, id] of Object.entries(refMap)) {
+    byRaw[id] = ref;
+    byRef[ref] = id;
+  }
+  ks.messageRefs = { byRaw, byRef, byId: {} } as never;
   ks.blocks = coveredIds.length > 0
     ? [{ blockId: "bx", active: true, effectiveMessageIds: coveredIds, refs: coveredIds, summary: "", tokens: 0, title: "", createdAt: 0 } as never]
     : [];
@@ -190,4 +201,28 @@ test("summary 过短（<200 字）→ 不落块", async () => {
   assert.equal(result.ok, false);
   assert.equal(result.reason, "summary-too-short");
   assert.equal(applyCount, 0);
+});
+
+test("生产态 byRaw 方向：checkFoldApply 正常放行（回归夹具方向错误 B1/H5）", () => {
+  // 真实 kernel：byRaw = {消息id → ref}、byRef = {ref → 消息id}。
+  // 夹具 makeKernelState 已改为真实方向；此用例直接断言在真实方向下
+  // 正常 job 通过端点/输入集检查，防止夹具再被改回反向而掩盖恒 discard。
+  const ks = makeKernelState({ m00001: "m1", m00002: "m2", m00003: "m3", m00004: "m4" });
+  const chk = checkFoldApply({ stateVersion: 5, kernelState: ks }, makeJob());
+  assert.equal(chk.ok, true, `生产态 byRaw 下正常 job 应放行，实际 reason=${chk.reason}`);
+  assert.equal(chk.versionDelta, 0);
+});
+
+test("生产态 byRaw 方向：端点换绑 → range-identity-changed", () => {
+  const ks = makeKernelState({ m00001: "m1", m00002: "m2", m00003: "m3", m00004: "m9" });
+  const chk = checkFoldApply({ stateVersion: 5, kernelState: ks }, makeJob());
+  assert.equal(chk.ok, false);
+  assert.equal(chk.reason, "range-identity-changed");
+});
+
+test("生产态 byRaw 方向：inputTurnIds 缺失 → input-turns-missing", () => {
+  const ks = makeKernelState({ m00001: "m1", m00003: "m3", m00004: "m4" }); // m2 已从历史消失
+  const chk = checkFoldApply({ stateVersion: 5, kernelState: ks }, makeJob());
+  assert.equal(chk.ok, false);
+  assert.equal(chk.reason, "input-turns-missing");
 });

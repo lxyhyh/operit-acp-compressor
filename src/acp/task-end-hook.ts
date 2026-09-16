@@ -72,10 +72,15 @@ export async function onChatRuntimeEvent(event: unknown): Promise<void> {
       const loaded = await engine.loadState(sessionKey);
       const k = loaded.kernelState as { stats?: { tokensCompressed?: number }; blocks?: unknown[] };
       const hm = (loaded as { hostMetadata?: { stateVersion?: number } }).hostMetadata;
+      // V0.10-B1-M 修复：usageState 实际存于 hostMetadata.usageState
+      //（persistence 写入 `hostMetadata: {... usageState}`）；旧代码从顶层读
+      // 恒 undefined → task-end 压力核查永不触发（P7 形同虚设）。
       const usage = (loaded as {
-        hostMetadata?: { stateVersion?: number };
-        usageState?: { lastEstimateTokens?: number; compressionCreditTokens?: number };
-      }).usageState;
+        hostMetadata?: {
+          stateVersion?: number;
+          usageState?: { lastEstimateTokens?: number; compressionCreditTokens?: number };
+        };
+      }).hostMetadata?.usageState;
       effective = Number(usage?.lastEstimateTokens ?? 0);
       credit = Number(usage?.compressionCreditTokens ?? k?.stats?.tokensCompressed ?? 0);
       stateVersion = Number(hm?.stateVersion ?? 0);

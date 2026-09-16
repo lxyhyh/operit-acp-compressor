@@ -155,14 +155,19 @@ export function checkFoldApply(
   if (versionDelta < 0) {
     return { ok: false, reason: "state-version-rollback", versionDelta };
   }
-  const refs = (ctx.kernelState as { messageRefs?: { byRaw?: Record<string, string>; byRef?: Record<string, unknown> } }).messageRefs ?? {};
+  const refs = (ctx.kernelState as { messageRefs?: { byRaw?: Record<string, string>; byRef?: Record<string, string> } }).messageRefs ?? {};
   const byRaw = refs.byRaw ?? {};
+  const byRef = refs.byRef ?? {};
   // 1) 端点 ref 仍指向冻结 id（range identity 未漂移）。
-  if (byRaw[job.startRef] !== job.startId || byRaw[job.endRef] !== job.endId) {
+  //    kernel messageRefs：byRaw = {消息id → ref}、byRef = {ref → 消息id}；
+  //    端点必须按 ref 正查 byRef——旧实现用 byRaw[job.startRef]（键是消息 id，
+  //    拿 ref 当键恒 undefined），导致生产环境每次都被判 range-identity-changed 而 discard。
+  if (byRef[job.startRef] !== job.startId || byRef[job.endRef] !== job.endId) {
     return { ok: false, reason: "range-identity-changed", versionDelta };
   }
-  // 2) 冻结的 inputTurnIds 仍存在于当前历史 id 集。
-  const currentIds = new Set(Object.values(byRaw));
+  // 2) 冻结的 inputTurnIds 仍存在于当前历史 id 集（byRaw 的键 = 消息 id；
+  //    旧实现用 Object.values(byRaw) 取到的是 ref 值而非 id，恒判 missing）。
+  const currentIds = new Set(Object.keys(byRaw));
   const missing = job.inputTurnIds.filter((id) => !currentIds.has(id));
   if (missing.length > 0) {
     return { ok: false, reason: "input-turns-missing", versionDelta };

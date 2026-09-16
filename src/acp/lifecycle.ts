@@ -198,11 +198,19 @@ export async function onFinalize(event: FinalizeHookEvent): Promise<PromptHookOb
             diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-discard] chat=${(ctx.chatId ?? "none").slice(0, 8)} phase=slot reason=job-in-flight`);
           } else {
             // —— ②构造 job snapshot（prompt 输入 = range 真实 turns）。
+            //   stateVersion 必须从持久化 state 读：ProjectionResult.state 是 kernel
+            //   CompressionState，没有 hostMetadata.stateVersion（旧写法恒 0，
+            //   使 version-rollback 检查被阉割 —— V0.10 审查 B1/H5 修复）。
+            let snapshotVersion = 0;
+            try {
+              const loaded = await engine.loadState(sessionKey!);
+              snapshotVersion = (loaded as { hostMetadata?: { stateVersion?: number } }).hostMetadata?.stateVersion ?? 0;
+            } catch { /* ignore */ }
             const job = createFoldJob({
               jobId,
               sessionKey: sessionKey!,
               chatId: ctx.chatId,
-              stateVersion: (projectedFull as unknown as { state?: { hostMetadata?: { stateVersion?: number } } } | undefined)?.state?.hostMetadata?.stateVersion ?? 0,
+              stateVersion: snapshotVersion,
               range: sel.range,
             });
             diagLog(LOG_TOOLS_VISIBILITY_FILE, `[lfold-snapshot] job=${job.jobId} chat=${(ctx.chatId ?? "none").slice(0, 8)} stateVersion=${job.stateVersion} start=${job.startRef} end=${job.endRef} inputIds=${job.inputTurnIds.length} chars=${job.inputChars} promptLen=${job.prompt.length}`);

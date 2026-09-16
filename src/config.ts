@@ -74,12 +74,3 @@ export async function saveConfig(cfg: AcpConfig): Promise<boolean> {
     }
 }
 
-/** 以配置校准 fold 参数（contextLimit / preserveRecentMessages / minCompressRangeChars） */
-export async function configOverrides(): Promise<{ modelContextLimit: number; preserveRecentMessages: number; enabled: boolean }> {
-    const cfg = await loadConfig();
-    return {
-        modelContextLimit: cfg.contextLimit > 0 ? cfg.contextLimit : DEFAULT_CONFIG.contextLimit,
-        preserveRecentMessages: cfg.preserveRecentMessages > 0 ? cfg.preserveRecentMessages : DEFAULT_CONFIG.preserveRecentMessages,
-        enabled: cfg.enabled,
-    };
-}

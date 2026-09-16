@@ -23,9 +23,12 @@ export const LOG_TOOL_CALLS_FILE = `${LOG_DIR}/acp_tool_calls.log`;
 let _configDir: string | null = null;
 
 /**
- * 宿主配置目录（ToolPkg.getConfigDir() 动态值；不可用时回退 DATA_DIR）。
+ * 宿主配置目录（ToolPkg.getConfigDir() 动态值）。
  * 由 config.ts 使用（acp-config.json 所在目录）。原实现位于 state.ts（v0.2 遗留），
  * v0.3 抽离至 paths 单一事实来源，使 state.ts 可随遗留孤岛一并移除。
+ * 注意：getConfigDir() 不可用时返回空串（调用方回退默认配置），并不回退 DATA_DIR
+ * ——DATA_DIR 是插件数据目录（state/日志），配置目录由宿主决定（V0.10-B1-M 修复
+ * M13：注释曾误称"回退 DATA_DIR"，实现从未如此）。
  */
 export function resolveConfigDir(): string {
   if (_configDir) return _configDir;

@@ -24,6 +24,7 @@ installIntlSegmenter();
 import { onFinalize, onEstimateFinalize, onEstimateHistory, onSystemPromptCompose, onToolLifecycle } from "./acp/lifecycle";
 import { onChatRuntimeEvent } from "./acp/task-end-hook";
 import { loadConfig, saveConfig, DEFAULT_CONFIG, type AcpConfig } from "./config";
+import { STATE_DIR } from "./acp/paths";
 
 // IPC 通道必须在 main 脚本【模块顶层】注册（guide 3.2.5 示例），
 // registerToolPkg() 执行期注册会错过窗口 → UI 调用报 channel is not registered。
@@ -70,7 +71,9 @@ export function registerIpc(): void {
             //  过滤改为 state_<safe>_<hash12>.json（persistence.sessionKeyToFile），
             //  旧 "_b" 过滤与命名不符（同样导致恒空）。
             try {
-                const dir = "/sdcard/Download/Operit/plugins/com.operit.acp_compressor/acp-state";
+                // V0.10-B1-M 修复（M13）：路径统一走 paths.STATE_DIR（原硬编码
+                // /sdcard/Download/.../acp-state 字符串，与 paths.ts 双轨）。
+                const dir = STATE_DIR;
                 const res = await Tools.Files.list(dir);
                 const rawEntries = res && typeof res === "object" && !Array.isArray(res) && Array.isArray((res as { entries?: unknown }).entries)
                     ? (res as { entries: unknown[] }).entries
@@ -165,8 +168,12 @@ export function registerAcpHooks(): void {
                 id: "acp.task_end_fold",
                 function: onChatRuntimeEvent as never,
             });
+            // V0.10-B1-M 修复（M1）：能力位供 adapter 判断是否可登记 deferred fold
+            // （无 ChatRuntimeHook 的宿主上登记永远悬挂，runDeferredFold 无人调用）。
+            (globalThis as Record<string, unknown>).__acpChatRuntimeHook = true;
             try { console.log("[acp] registerChatRuntimeHook OK: acp.task_end_fold"); } catch { /* noop */ }
         } else {
+            (globalThis as Record<string, unknown>).__acpChatRuntimeHook = false;
             try { console.log("[acp] registerChatRuntimeHook unavailable（宿主 API < 1.0.1），P7 状态机待机"); } catch { /* noop */ }
         }
     } catch (e) {

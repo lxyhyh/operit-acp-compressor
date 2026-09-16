@@ -59,46 +59,59 @@ export function createOperitHostUsageAdapter(
   const throttleMs = opts?.throttleMs ?? 5000;
   // 缓存仅用于节流，不作为长期 truth；超过 maxCacheAge 必重新读。
   const maxCacheAgeMs = opts?.maxCacheAgeMs ?? 30_000;
-  const cache = new Map<string, { value?: number; at: number; fail: boolean }>();
+  const cache = new Map<string, { value?: number; at: number; fail: boolean; retryAfter?: number; failCount: number }>();
   // V0.7.5：不再永久 disabled。一次失败只进入短退避（retryAfterMs），
   // 超过退避窗口后重新尝试；连续失败会指数退避但封顶，避免每轮都打 DB。
   // （文档十三：transient failure 可恢复、保持 throttle、保持 maxCacheAge，
   //   不把一次失败变成整个进程生命周期的永久 disabled。）
-  let sqliteOk: boolean | undefined;
-  let retryAfterMs = 0;
-  let failCount = 0;
+  // V0.10-B1-M 修复（M3）：退避改为 per-chat——旧实现 sqliteOk/retryAfterMs/
+  // failCount 是全局单例，一个 chat 的 DB 失败会让所有 chat 一起退避。
   const INITIAL_RETRY_MS = 10_000;
   const MAX_RETRY_MS = 120_000;
 
   const dbPath = "/data/user/0/com.ai.assistance.operit/databases/app_database";
 
-  // 单条 python3 只读命令：读指定 chatId 的 currentWindowSize；失败输出空。
+  // 单条 python3 只读命令（旧实现先跑一个仅 `import sqlite3;` 的冗余 python3 检查
+  // import、再跑查询——每次 getCurrentContextTokens 都派生 2 个 python 进程，
+  // 纯浪费）。chatId 经 argv 传入 + 参数化查询（防 SQL 插值注入）；
+  // URI 只读模式失败回退普通连接；失败输出空。
   const buildCmd = (chatId: string): string =>
-    `python3 -c "import sqlite3;" && ` +
-    `python3 -c "import sqlite3,json,sys;` +
-    `c=sqlite3.connect('file:${dbPath}?mode=ro',uri=True);` +
-    `r=c.execute('SELECT currentWindowSize FROM chats WHERE id=?',('${chatId}',)).fetchone();` +
-    `print(int(r[0]) if r and r[0] is not None else '')" 2>/dev/null` +
-    ` || python3 -c "import sqlite3;` +
-    `c=sqlite3.connect('${dbPath}');` +
-    `r=c.execute('SELECT currentWindowSize FROM chats WHERE id=?',('${chatId}',)).fetchone();` +
-    `print(int(r[0]) if r and r[0] is not None else '')" 2>/dev/null`;
+    `python3 -c '
+import sqlite3, sys
+db = "${dbPath}"
+chat = sys.argv[1]
+r = None
+try:
+    c = sqlite3.connect("file:" + db + "?mode=ro", uri=True)
+    r = c.execute("SELECT currentWindowSize FROM chats WHERE id=?", (chat,)).fetchone()
+except Exception:
+    try:
+        c = sqlite3.connect(db)
+        r = c.execute("SELECT currentWindowSize FROM chats WHERE id=?", (chat,)).fetchone()
+    except Exception:
+        r = None
+print(int(r[0]) if r and r[0] is not None else "")
+' 2>/dev/null "${chatId}"`;
 
   return {
     async getCurrentContextTokens(chatId): Promise<number | undefined> {
       if (!chatId) return undefined;
       const now = Date.now();
       const hit = cache.get(chatId);
-      if (hit && now - hit.at < Math.min(throttleMs, maxCacheAgeMs)) {
-        return hit.fail ? undefined : hit.value;
+      if (hit) {
+        const fresh = now - hit.at < Math.min(throttleMs, maxCacheAgeMs);
+        // per-chat 退避：退避窗口内快速失败，窗口外重试（可恢复）。
+        const inRetry = hit.fail && typeof hit.retryAfter === "number" && now < (hit.retryAfter as number);
+        if (fresh && !inRetry) return hit.fail ? undefined : hit.value;
+        if (inRetry) return undefined;
       }
-      // V0.7.5：失败退避而非永久 disabled。退避窗口内快速失败，窗口外重试。
-      if (sqliteOk === false && now < retryAfterMs) return undefined;
 
       const start = Date.now();
+      // 超时 800ms（旧 1500ms）：DB 查询本地通常 <50ms，1.5s 只会在异常时
+      // 白耗估算钩子预算（估算钩子在宿主 Main 线程，ANR 风险）。
       const got = await Promise.race([
         execFn(buildCmd(chatId)).catch(() => undefined),
-        new Promise<undefined>((res) => setTimeout(() => res(undefined), 1500)),
+        new Promise<undefined>((res) => setTimeout(() => res(undefined), 800)),
       ]);
       const took = Date.now() - start;
 
@@ -107,17 +120,14 @@ export function createOperitHostUsageAdapter(
         const n = Number(got.trim());
         if (Number.isFinite(n) && n > 0) value = n;
       }
-      cache.set(chatId, { value, at: now, fail: value === undefined });
-      if (value === undefined) {
-        // 记录失败 + 指数退避（封顶 2 分钟），窗口过后重新尝试（可恢复）。
-        failCount++;
-        sqliteOk = false;
-        retryAfterMs = now + Math.min(INITIAL_RETRY_MS * Math.pow(2, failCount - 1), MAX_RETRY_MS);
-      } else {
-        failCount = 0;
-        sqliteOk = true;
-        retryAfterMs = 0;
-      }
+      const nextFailCount = value === undefined ? (hit?.failCount ?? 0) + 1 : 0;
+      cache.set(chatId, {
+        value,
+        at: now,
+        fail: value === undefined,
+        retryAfter: value === undefined ? now + Math.min(INITIAL_RETRY_MS * Math.pow(2, nextFailCount - 1), MAX_RETRY_MS) : undefined,
+        failCount: nextFailCount,
+      });
       return value;
     },
   };

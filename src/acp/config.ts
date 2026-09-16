@@ -270,5 +270,13 @@ export function resolveKernelConfig(settings: AdapterSettings): Config {
       ...cfg.compress,
       minCompressRange: settings.minCompressRange,
     },
+    // V0.10-B1-M 修复：kernel 蒸馏 tiers 必须被 UI 设置覆盖。
+    // 旧实现只覆盖顶层字段，cfg.tiers 恒为 kernel 默认（tier2Trigger=5 /
+    // tier3Trigger=10），UI 的 tier2Trigger/tier3Trigger 双轨失效。
+    tiers: {
+      ...(cfg.tiers ?? {}),
+      tier2Trigger: settings.tier2Trigger,
+      tier3Trigger: settings.tier3Trigger,
+    },
   };
 }

@@ -356,13 +356,26 @@ function mkTurn(kind: string, content: string, toolName?: string) {
 function stableKeyForTurnForTest(t: any): string {
   return stableKeyForTurn(t);
 }
+/** 构造与生产一致的消息映射：无 identity 时 CoreMessage.id = stableKey，
+ *  byKey 键 = CoreMessage.id（V0.10-B1-M 修复 M7 后 detectAbsorbCandidates
+ *  按 mapping.messages[i].id 正查 byRaw，不再按 turn 的 stableKey 查）。 */
+function mkMappingForTest(turns: any[]): { messages: any[]; byKey: Map<string, any> } {
+  const messages: any[] = [];
+  const byKey = new Map<string, any>();
+  for (const t of turns) {
+    const id = stableKeyForTurnForTest(t);
+    messages.push({ id, role: "user", contentType: "text", text: typeof t.content === "string" ? t.content : "" });
+    byKey.set(id, t);
+  }
+  return { messages, byKey };
+}
 function mkCand(ref: string, stableKey: string, chars: number, status: "candidate" | "absorbed" = "candidate"): AbsorbCandidate {
   return { ref, stableKey, chars, turnIndex: 0, status, createdAt: 1 };
 }
 
 test("Test1: 无 nudge 也能发现 candidate（usage 低、TOOL_RESULT=10k）", () => {
   const turns = [mkTurn("USER", "hi"), mkTurn("TOOL_RESULT", "x".repeat(10000), "read_file")];
-  const mapping = { messages: [], byKey: new Map() };
+  const mapping = mkMappingForTest(turns);
   const state = { messageRefs: { byRaw: { [stableKeyForTurnForTest(turns[1])]: "m00042" } } } as any;
   const cands = detectAbsorbCandidates(turns as any, mapping as any, state, new Set());
   assert.equal(cands.length, 1);
@@ -373,7 +386,7 @@ test("Test2: 多 Hop 不重复（同一 TOOL_RESULT 幂等去重）", () => {
   const turn = mkTurn("TOOL_RESULT", "y".repeat(9000), "terminal");
   const key = stableKeyForTurnForTest(turn);
   const state = { messageRefs: { byRaw: { [key]: "m00007" } } } as any;
-  const detected = detectAbsorbCandidates([turn] as any, { messages: [], byKey: new Map() } as any, state, new Set());
+  const detected = detectAbsorbCandidates([turn] as any, mkMappingForTest([turn]) as any, state, new Set());
   const merged = upsertAbsorbCandidates(detected, detected); // 模拟 Hop2 再次 detect
   const merged3 = upsertAbsorbCandidates(merged, detected); // Hop3
   assert.equal(getActiveAbsorbCandidates(merged3).length, 1, "同一 TOOL_RESULT 应只有 1 个 candidate");
@@ -386,10 +399,10 @@ test("Test3: 多 candidate（3 个不同巨型 TOOL_RESULT → 3 个 ref）", ()
     mkTurn("TOOL_RESULT", "c".repeat(30000), "toolC"),
   ];
   const byRaw: Record<string, string> = {};
-  const mapping = { messages: [], byKey: new Map() } as any;
+  const mapping = mkMappingForTest(turns);
   for (let i = 0; i < turns.length; i++) byRaw[stableKeyForTurnForTest(turns[i])] = `m0000${i + 1}`;
   const state = { messageRefs: { byRaw } } as any;
-  const cands = detectAbsorbCandidates(turns as any, mapping, state, new Set());
+  const cands = detectAbsorbCandidates(turns as any, mapping as any, state, new Set());
   assert.equal(cands.length, 3);
   const refs = new Set(cands.map((c) => c.ref));
   assert.equal(refs.size, 3, "3 个不同候选应有 3 个不同 ref");
@@ -408,7 +421,7 @@ test("Test5: 已被 compression block 覆盖的 TOOL_RESULT 不产生 candidate"
   const key = stableKeyForTurnForTest(turn);
   const state = { messageRefs: { byRaw: { [key]: "m00009" } } } as any;
   const covered = new Set([key]); // 已被 block 覆盖
-  const cands = detectAbsorbCandidates([turn] as any, { messages: [], byKey: new Map() } as any, state, covered);
+  const cands = detectAbsorbCandidates([turn] as any, mkMappingForTest([turn]) as any, state, covered);
   assert.equal(cands.length, 0, "covered 消息不应产生 candidate");
 });
 

@@ -160,10 +160,20 @@ const PROJECT_FOLD_BUDGET_MS = 7000;
 /** deferred fold 待办有效期（ms）：过期即作废（防旧待办作用于新 state）。 */
 const DEFER_FOLD_TTL_MS = 5 * 60 * 1000;
 
+// V0.10-B1-M 修复（H3）：deferred fold 自预算。completed 事件经宿主 dispatchAsync
+// 独立协程派发（fire-and-forget），但插件 JS 仍跑在引擎单线程——大 session 的
+// 全量 identityForTurn 哈希 + 全量 save 可达数秒，拖住引擎内排队的下轮 finalize
+// 钩子（表现为回复前卡顿）。在 load / 哈希 / 折叠后检查耗时，超预算即放弃并清理
+// 登记（本轮不做，下轮 forced 时会重新登记），把阻塞钉在有界 3s 内。
+const DEFERRED_FOLD_BUDGET_MS = 3000;
+
 /** deferred fold 待办（globalThis：跨 hook 调用共享，进程内生命周期）。 */
 interface DeferredFoldEntry {
   sessionKey: string;
   blocksAtDefer: number;
+  /** V0.10-B1-M 修复（M5）：登记时的 stateVersion，判定"state 已前进"更可靠
+   *  （blocks.length 只数块数：期间压缩同数量块/解封块会漏判）。 */
+  stateVersionAtDefer: number;
   level: string;
   at: number;
 }
@@ -189,42 +199,45 @@ function foldOldestUncoveredSegment(
   const byRaw = state.messageRefs?.byRaw ?? {};
   const recentIds = new Set(messages.slice(-PROTECTED).map((m) => m.id));
   const covered = collectCoveredMessageIds(state);
-  // 找最旧未被覆盖、且不在保护区的连续段端点。
-  let startIdx = -1;
+  // 按 covered/recent 边界切连续未覆盖段（段内不夹已覆盖消息，避免 kernel
+  // 以 overlap/consumed 拒绝整段）；从最旧开始取第一个长度 >= 8 的段。
+  let segStart = -1;
   for (let i = 0; i < messages.length - PROTECTED; i++) {
     const m = messages[i];
-    if (covered.has(m.id) || recentIds.has(m.id)) continue;
-    if (startIdx < 0) startIdx = i;
+    const isBlocked = covered.has(m.id) || recentIds.has(m.id);
+    if (!isBlocked && segStart < 0) segStart = i;
+    const segEndsHere = isBlocked || i === messages.length - PROTECTED - 1;
+    if (segEndsHere && segStart >= 0) {
+      const segEnd = isBlocked ? i - 1 : i;
+      if (segEnd - segStart + 1 >= 8) {
+        const seg = messages.slice(segStart, segEnd + 1);
+        // kernel messageRefs.byRaw 键 = 消息 id、值 = ref（{id → ref}），正查。
+        const startRef = byRaw[seg[0].id];
+        const endRef = byRaw[seg[seg.length - 1].id];
+        if (startRef && endRef) {
+          const summary = buildDeterministicSummary(seg, 6000, 120);
+          const topic = `自动折叠（emergency fold ${seg.length} 条）`;
+          const applied = core.applyCompression({
+            ranges: [{ startRef, endRef, summary, topic }],
+            messages,
+            state,
+            config,
+          });
+          if (applied.result.blocksCreated === 0) return undefined;
+          return {
+            state: applied.state,
+            blocksCreated: applied.result.blocksCreated,
+            tokensCompressed: applied.result.tokensCompressed,
+            segLen: seg.length,
+            startRef,
+            endRef,
+          };
+        }
+      }
+      segStart = -1;
+    }
   }
-  if (startIdx < 0) return undefined;
-  // 段终点：保护区之前最后一条未覆盖消息。
-  let endIdx = startIdx;
-  for (let i = startIdx; i < messages.length - PROTECTED; i++) {
-    const m = messages[i];
-    if (!covered.has(m.id) && !recentIds.has(m.id)) endIdx = i;
-  }
-  const seg = messages.slice(startIdx, endIdx + 1);
-  if (seg.length < 8) return undefined;
-  const startRef = Object.entries(byRaw).find(([, v]) => v === seg[0].id)?.[0];
-  const endRef = Object.entries(byRaw).find(([, v]) => v === seg[seg.length - 1].id)?.[0];
-  if (!startRef || !endRef) return undefined;
-  const summary = buildDeterministicSummary(seg, 6000, 120);
-  const topic = `自动折叠（emergency fold ${seg.length} 条）`;
-  const applied = core.applyCompression({
-    ranges: [{ startRef, endRef, summary, topic }],
-    messages,
-    state,
-    config,
-  });
-  if (applied.result.blocksCreated === 0) return undefined;
-  return {
-    state: applied.state,
-    blocksCreated: applied.result.blocksCreated,
-    tokensCompressed: applied.result.tokensCompressed,
-    segLen: seg.length,
-    startRef,
-    endRef,
-  };
+  return undefined;
 }
 
 /** 反查：给定 messageRefs.byRef（ref→stableKey）与 byKey（key→turn），返回 ref 对应的 CoreMessage。 */
@@ -360,17 +373,27 @@ export function createEngine(dataDir?: string): AcpEngine {
   function setIdentityBridgeState(s: IdentityBridgeState) { identityState = s; }
 
   /** per-session 内存锁：同一 session 的 mutation 串行化。 */
-  const locks = new Map<string, Promise<void>>();
+  // V0.10-B1-M 修复（M6）：锁表提升到 globalThis——宿主 main.js 只执行一次、
+  // 引擎按 key 常驻缓存，但 compress/absorb 工具路径与 finalize/estimate 钩子
+  // 可能经不同 engine 实例进入，各实例持独立 locks Map 时同一 session 的
+  // mutation 不互斥 → 相等 stateVersion 并发写互相覆盖（丢 block/丢 usage）。
+  // 提升后同 runtime 内所有 engine 共享同一把 session 锁。
+  const lockStore = (globalThis as Record<string, unknown>).__acpLocksV2 as
+    | Map<string, Promise<void>>
+    | undefined ?? new Map<string, Promise<void>>();
+  if (!(globalThis as Record<string, unknown>).__acpLocksV2) {
+    (globalThis as Record<string, unknown>).__acpLocksV2 = lockStore;
+  }
   async function acquireLock(sid: string): Promise<() => void> {
-    const prev = locks.get(sid) ?? Promise.resolve();
+    const prev = lockStore.get(sid) ?? Promise.resolve();
     let release!: () => void;
     const next = new Promise<void>((resolve) => {
       release = () => {
-        locks.delete(sid);
+        lockStore.delete(sid);
         resolve();
       };
     });
-    locks.set(sid, prev.then(() => next));
+    lockStore.set(sid, prev.then(() => next));
     await prev;
     return release;
   }
@@ -430,10 +453,22 @@ export function createEngine(dataDir?: string): AcpEngine {
     //    更准的值且永不回落）。effective 保持单值，ledger 三源留痕，不修改 estimate。
     const hostNum = typeof hostTokens === "number" && Number.isFinite(hostTokens) && hostTokens > 0 ? hostTokens : undefined;
     const estNum = eff.effectiveTokens || opts.tokenEstimate;
-    if (hostNum !== undefined && estNum > 0 && hostNum > estNum * 1.2) {
+    // V0.10-B1-M 修复：host 校准加 clamp 守卫。host 读数来自宿主 DB（currentWindowSize），
+    // 单样本异常（读错 chat / DB 脏值 / tokenizer 口径漂移）若被无界采纳会把
+    // effective 钉在异常高位 → 每轮 forced → emergency 折叠死循环（B1 修复后折叠
+    // 真的会执行，风险从"空转"升级为"反复建块"）。可信上界 = contextLimit × 2，
+    // 超界视为异常读数，保持 estimate（host 读数永远只做"向上修正"不做"向上顶爆"）。
+    const hostLimit = opts.config.modelContextLimit > 0 ? opts.config.modelContextLimit : 200000;
+    const HOST_MAX_CLAMP_FACTOR = 2;
+    const hostPlausible = hostNum !== undefined && hostNum <= hostLimit * HOST_MAX_CLAMP_FACTOR;
+    if (hostNum !== undefined && estNum > 0 && hostNum > estNum * 1.2 && hostPlausible) {
       eff = { ...eff, effectiveTokens: hostNum, source: "host" as const, confidence: "medium" as const };
       try {
         console.log(`[acp] pressure host-calibrated estimate=${opts.tokenEstimate} estEff=${estNum} host=${hostNum} (host>est*1.2, take host conservative)`);
+      } catch { /* noop */ }
+    } else if (hostNum !== undefined && hostNum > estNum * 1.2 && !hostPlausible) {
+      try {
+        console.log(`[acp] pressure host-ignored estimate=${opts.tokenEstimate} host=${hostNum} limit=${hostLimit} (clamped: host>limit*${HOST_MAX_CLAMP_FACTOR} treated as stale/erratic)`);
       } catch { /* noop */ }
     }
     const pressurePct = opts.config.modelContextLimit > 0
@@ -495,6 +530,12 @@ export function createEngine(dataDir?: string): AcpEngine {
       try {
         const config = resolveKernelConfig(settings);
         const loaded = await persistence.load(sessionKey);
+        // V0.10-B1-M 修复（M8）：估算侧也必须加载 identity-bridge（与发送链路
+        // project() 同款），否则 id 口径漂移——估算用无 identity 的 stableKey id、
+        // 发送用 namespace-aware id，静态计数与任务中计数不一致。
+        if (loaded.hostMetadata.identityBridge) {
+          identityState = loadIdentityBridgeState(loaded.hostMetadata.identityBridge);
+        }
         const fingerprint = computeFingerprint(sessionKey, turns, config);
         const stateVersion = loaded.hostMetadata.stateVersion ?? 0;
         // 命中缓存：同 fingerprint → 直接返回缓存投影。
@@ -661,7 +702,12 @@ export function createEngine(dataDir?: string): AcpEngine {
           const stage2Pressure = await collectAndEvaluatePressure({
             sessionKey, chatId,
             tokenEstimate: stage2Estimate,
-            kernelShouldInject: false,
+            // V0.10-B1-M 修复：无 processTurn 时以 usage 档位模拟 kernel 判断，
+            // 消灭 [gentle, hostEscalationFloor) 死区——旧硬编码 false 使 stage2
+            // 在 45%~70% 区间永不注入 gentle nudge（FULL 路径 L1080 会注入）。
+            kernelShouldInject: config.modelContextLimit > 0
+              ? stage2Estimate / config.modelContextLimit >= settings.gentleThresholdPct
+              : false,
             kernelReason: "",
             prevBlocks: cached.kernelState.blocks.length,
             curBlocks: cached.kernelState.blocks.length,
@@ -756,7 +802,10 @@ export function createEngine(dataDir?: string): AcpEngine {
           const cachePressure = await collectAndEvaluatePressure({
             sessionKey, chatId,
             tokenEstimate: cacheEstimate,
-            kernelShouldInject: false,
+            // V0.10-B1-M 修复：同 stage2，消灭 CACHE-HIT 路径 [gentle, floor) 死区。
+            kernelShouldInject: config.modelContextLimit > 0
+              ? cacheEstimate / config.modelContextLimit >= settings.gentleThresholdPct
+              : false,
             kernelReason: "",
             prevBlocks: cached.kernelState.blocks.length,
             curBlocks: cached.kernelState.blocks.length,
@@ -859,7 +908,10 @@ export function createEngine(dataDir?: string): AcpEngine {
               const incPressure = await collectAndEvaluatePressure({
                 sessionKey, chatId,
                 tokenEstimate: incEstimate,
-                kernelShouldInject: false,
+                // V0.10-B1-M 修复：同 stage2，消灭 INCREMENTAL 路径死区。
+                kernelShouldInject: config.modelContextLimit > 0
+                  ? incEstimate / config.modelContextLimit >= settings.gentleThresholdPct
+                  : false,
                 kernelReason: "",
                 prevBlocks: cached.kernelState.blocks.length,
                 curBlocks: cached.kernelState.blocks.length,
@@ -937,7 +989,11 @@ export function createEngine(dataDir?: string): AcpEngine {
         //   （块推进由 lastProjection 伴随的 kernelState 演进覆盖，投影复用
         //   只要求"前缀内容未变"，前缀的折叠状态不会因新尾部而失效）。
         {
-          const rawPrevPersist = cached.lastRawTurns as PromptTurnLike[] | undefined;
+          // V0.10-B1-M 修复：state 文件不持久化 lastRawTurns（save omit），
+          // cached.lastRawTurns 恒 undefined → 快速路径是死代码；改从
+          // .raw.json（saveRawTurns 落盘）兜底读取，让 PERF 快速路径真正生效。
+          const rawPrevLoaded: unknown = cached.lastRawTurns ?? (await persistence.loadRawTurns(sessionKey));
+          const rawPrevPersist = (Array.isArray(rawPrevLoaded) ? rawPrevLoaded : undefined) as PromptTurnLike[] | undefined;
           const projPrevPersist = cached.hostMetadata.lastProjection as PromptTurnLike[] | undefined;
           if (rawPrevPersist && rawPrevPersist.length > 0 && projPrevPersist && projPrevPersist.length > 0
             && turns.length >= rawPrevPersist.length) {
@@ -963,6 +1019,10 @@ export function createEngine(dataDir?: string): AcpEngine {
                   ...cached.hostMetadata,
                   stateVersion: cached.hostMetadata.stateVersion ?? 0,
                   lastProjectionFingerprint: fingerprint,
+                  // V0.10-B1-M 修复：同步最新投影。旧实现不更新 lastProjection，
+                  // 连续多轮快速路径时投影停留在"首次全量"版本，中间轮次的消息
+                  // 从发送内容中丢失（前缀只校验 raw turns，不校验投影完整性）。
+                  lastProjection: capped as PromptTurnLike[],
                   lastUpdatedAt: Date.now(),
                   ...(chatId ? { lastChatId: String(chatId) } : {}),
                 },
@@ -1140,15 +1200,27 @@ export function createEngine(dataDir?: string): AcpEngine {
             //   改为登记后台 deferred fold（ChatRuntimeHook completed 时执行，下轮生效）。
             const elapsed = Date.now() - t0;
             if (elapsed > PROJECT_FOLD_BUDGET_MS) {
-              deferredFoldStore().set(sessionKey, {
-                sessionKey,
-                blocksAtDefer: turn.state.blocks.length,
-                level: pressure.level,
-                at: Date.now(),
-              });
-              try {
-                console.log(`[acp] project DEFER-FOLD stage=${hookStage} elapsed=${elapsed}ms eff=${effTokens} blocks=${turn.state.blocks.length} (budget guard; fold on task-completed)`);
-              } catch { /* noop */ }
+              // V0.10-B1-M 修复（M1）：deferred fold 依赖 ChatRuntimeHook（completed
+              // 事件触发 runDeferredFold）。宿主 API < 1.0.1 无此 hook 时，登记永远
+              // 悬挂（runDeferredFold 无人调用）；此时跳过登记，保持 V0.9.4 行为
+              // （超预算走 capProjectionSize 兜底）。能力位由 main.ts 注册时设置。
+              const crhAvailable = (globalThis as Record<string, unknown>).__acpChatRuntimeHook === true;
+              if (crhAvailable) {
+                deferredFoldStore().set(sessionKey, {
+                  sessionKey,
+                  blocksAtDefer: turn.state.blocks.length,
+                  stateVersionAtDefer: cached.hostMetadata.stateVersion ?? 0,
+                  level: pressure.level,
+                  at: Date.now(),
+                });
+                try {
+                  console.log(`[acp] project DEFER-FOLD stage=${hookStage} elapsed=${elapsed}ms eff=${effTokens} blocks=${turn.state.blocks.length} (budget guard; fold on task-completed)`);
+                } catch { /* noop */ }
+              } else {
+                try {
+                  console.log(`[acp] project DEFER-FOLD skipped stage=${hookStage} elapsed=${elapsed}ms (ChatRuntimeHook unavailable; cannot defer fold)`);
+                } catch { /* noop */ }
+              }
             } else {
               try {
                 // 保护尾部：最近 8 条 + 最近 user 消息之后绝不折叠（foldOldestUncoveredSegment 同构）。
@@ -1392,6 +1464,11 @@ export function createEngine(dataDir?: string): AcpEngine {
             lastUpdatedAt: Date.now(),
             stateVersion: (loaded.hostMetadata.stateVersion ?? 0) + 1,
             lastProjectionFingerprint: undefined as string | undefined,
+            // V0.10-B1-M 修复：压缩/状态变更后清除陈旧投影，下轮必须走全量
+            // processTurn 重建投影（否则 PERSIST-PREFIX-REUSE 复用压缩前旧投影，
+            // 折叠收益对模型不可见）。lastRawTurns 不清——原始 turns 不因压缩而变，
+            // compress/decompress 仍要锚定。
+            lastProjection: undefined as PromptTurnLike[] | undefined,
             runtimeStats: nextStats,
             ...(usageStateForSave ? { usageState: usageStateForSave } : {}),
             // V0.7.9：identity-bridge state 持久化（compress/absorb 工具路径）。
@@ -1438,6 +1515,7 @@ export function createEngine(dataDir?: string): AcpEngine {
             lastUpdatedAt: Date.now(),
             stateVersion: (loaded.hostMetadata.stateVersion ?? 0) + 1,
             lastProjectionFingerprint: undefined as string | undefined,
+            lastProjection: undefined as PromptTurnLike[] | undefined,
           },
         });
         projectionCache.delete(sessionKey); estimateCache.delete(sessionKey);
@@ -1511,6 +1589,7 @@ export function createEngine(dataDir?: string): AcpEngine {
             lastUpdatedAt: Date.now(),
             stateVersion: (loaded.hostMetadata.stateVersion ?? 0) + 1,
             lastProjectionFingerprint: undefined as string | undefined,
+            lastProjection: undefined as PromptTurnLike[] | undefined,
             // V0.6 Phase3.1：absorb 成功后该 ref 标记 absorbed，后续不再作为 active 候选提示。
             absorbCandidates: markAbsorbed(loaded.hostMetadata.absorbCandidates, ref),
           },
@@ -1597,11 +1676,21 @@ export function createEngine(dataDir?: string): AcpEngine {
         deferredFoldStore().delete(sessionKey);
         return { ok: false, reason: "defer-expired" };
       }
+      // V0.10-B1-M 修复（H3）：自预算计时起点（load 前）。
+      const tBudget = Date.now();
+      const overBudget = (): boolean => Date.now() - tBudget > DEFERRED_FOLD_BUDGET_MS;
       const release = await acquireLock(sessionKey);
       try {
         const loaded = await persistence.load(sessionKey);
+        if (overBudget()) {
+          deferredFoldStore().delete(sessionKey);
+          return { ok: false, reason: "defer-budget" };
+        }
         // state 已前进（期间发生过压缩/建块）→ 旧待办作废（fold 基于当前 state 重选段）。
-        if ((loaded.kernelState.blocks.length ?? 0) > entry.blocksAtDefer) {
+        // V0.10-B1-M 修复（M5）：stateVersion 前进判定（任何 mutation 都 +1，比
+        // blocks.length 全——期间压缩同数量块会漏判）；blocks.length 保留作兼容。
+        if ((loaded.hostMetadata.stateVersion ?? 0) > (entry.stateVersionAtDefer ?? 0)
+          || (loaded.kernelState.blocks.length ?? 0) > entry.blocksAtDefer) {
           deferredFoldStore().delete(sessionKey);
           return { ok: false, reason: "state-advanced" };
         }
@@ -1616,10 +1705,19 @@ export function createEngine(dataDir?: string): AcpEngine {
         }
         const config = resolveKernelConfig(settings);
         const mapping = mapTurnsWithIdentity(rawTurns);
+        if (overBudget()) {
+          deferredFoldStore().delete(sessionKey);
+          return { ok: false, reason: "defer-budget" };
+        }
         const folded = foldOldestUncoveredSegment(core, loaded.kernelState, mapping.messages, config);
         if (!folded) {
           deferredFoldStore().delete(sessionKey);
           return { ok: false, reason: "no-foldable-range" };
+        }
+        if (overBudget()) {
+          // 折叠计算本身超预算：不 save（避免再造一次大写入），下轮重新登记。
+          deferredFoldStore().delete(sessionKey);
+          return { ok: false, reason: "defer-budget" };
         }
         const prevStats = { ...(loaded.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS) };
         const nextStats = { ...prevStats };
@@ -1638,6 +1736,7 @@ export function createEngine(dataDir?: string): AcpEngine {
             lastUpdatedAt: Date.now(),
             stateVersion: (loaded.hostMetadata.stateVersion ?? 0) + 1,
             lastProjectionFingerprint: undefined as string | undefined,
+            lastProjection: undefined as PromptTurnLike[] | undefined,
             runtimeStats: nextStats,
             identityBridge: identityState,
           },
@@ -1653,6 +1752,10 @@ export function createEngine(dataDir?: string): AcpEngine {
         } catch { /* noop */ }
         return { ok: true, blocksCreated: folded.blocksCreated, tokensCompressed: folded.tokensCompressed };
       } catch (e) {
+        // V0.10-B1-M 修复（M4）：失败也清理登记——否则同一待办每轮 completed
+        // 都重试同一段（失败原因不会自愈，如 raw turns 缺失/identity 失败），
+        // 形成永久残留 + 每轮白跑。
+        deferredFoldStore().delete(sessionKey);
         try { console.log(`[acp] runDeferredFold failed: ${String(e)}`); } catch { /* noop */ }
         return { ok: false, reason: "defer-error" };
       } finally {
@@ -1675,41 +1778,41 @@ export function createEngine(dataDir?: string): AcpEngine {
         }
         const covered = collectCoveredMessageIds(state);
         const recentIds = new Set(messages.slice(-PROTECTED).map((m) => m.id));
-        let startIdx = -1;
+        // 按 covered/recent 边界切连续未覆盖段（段内不夹已覆盖消息）；
+        // 从最旧开始取第一个达到 minCompressRange 字符门槛的段。
+        let segStart = -1;
+        let anySeg = false;
         for (let i = 0; i < messages.length - PROTECTED; i++) {
           const m = messages[i];
-          if (covered.has(m.id) || recentIds.has(m.id)) continue;
-          if (startIdx < 0) startIdx = i;
+          const isBlocked = covered.has(m.id) || recentIds.has(m.id);
+          if (!isBlocked && segStart < 0) segStart = i;
+          const segEndsHere = isBlocked || i === messages.length - PROTECTED - 1;
+          if (segEndsHere && segStart >= 0) {
+            const segEnd = isBlocked ? i - 1 : i;
+            const seg = messages.slice(segStart, segEnd + 1);
+            anySeg = true;
+            const chars = seg.reduce((n, mm) => n + (mm.text ? mm.text.length : 0), 0);
+            if (chars >= settings.minCompressRange) {
+              // kernel messageRefs.byRaw 键 = 消息 id、值 = ref（{id → ref}），正查。
+              const startRef = byRaw[seg[0].id];
+              const endRef = byRaw[seg[seg.length - 1].id];
+              if (startRef && endRef) {
+                const range: FoldRange = {
+                  startRef,
+                  endRef,
+                  startId: seg[0].id,
+                  endId: seg[seg.length - 1].id,
+                  ids: seg.map((mm) => mm.id),
+                  chars,
+                  seg: seg.map((mm) => ({ id: mm.id, role: String(mm.role), contentType: String(mm.contentType), text: String(mm.text ?? "") })),
+                };
+                return { ok: true, range };
+              }
+            }
+            segStart = -1;
+          }
         }
-        if (startIdx >= 0) {
-          // 段终点：保护区之前最后一条未覆盖消息。
-          let endIdx = startIdx;
-          for (let i = startIdx; i < messages.length - PROTECTED; i++) {
-            const m = messages[i];
-            if (!covered.has(m.id) && !recentIds.has(m.id)) endIdx = i;
-          }
-          const seg = messages.slice(startIdx, endIdx + 1);
-          const chars = seg.reduce((n, m) => n + (m.text ? m.text.length : 0), 0);
-          if (chars < settings.minCompressRange) {
-            return { ok: false, reason: "range-below-min-chars" };
-          }
-          const startRef = Object.entries(byRaw).find(([, v]) => v === seg[0].id)?.[0];
-          const endRef = Object.entries(byRaw).find(([, v]) => v === seg[seg.length - 1].id)?.[0];
-          if (!startRef || !endRef) {
-            return { ok: false, reason: "refs-not-found" };
-          }
-          const range: FoldRange = {
-            startRef,
-            endRef,
-            startId: seg[0].id,
-            endId: seg[seg.length - 1].id,
-            ids: seg.map((m) => m.id),
-            chars,
-            seg: seg.map((m) => ({ id: m.id, role: String(m.role), contentType: String(m.contentType), text: String(m.text ?? "") })),
-          };
-          return { ok: true, range };
-        }
-        return { ok: false, reason: "no-uncovered-head" };
+        return { ok: false, reason: anySeg ? "range-below-min-chars" : "no-uncovered-head" };
       } catch (e) {
         try { console.log(`[acp] foldSelectRange failed: ${String(e)}`); } catch { /* noop */ }
         return { ok: false, reason: "select-error" };
@@ -1751,7 +1854,6 @@ function buildViableRanges(
   if (messages.length <= PROTECTED) return [];
   const covered = collectCoveredMessageIds(state);
   const recentIds = new Set(messages.slice(-PROTECTED).map((m) => m.id));
-  const raw = Object.entries(byRaw);
   const ranges: { startRef: string; endRef: string; tokens: number }[] = [];
   let segStart: number | null = null;
   for (let i = 0; i < messages.length - PROTECTED; i++) {
@@ -1759,12 +1861,12 @@ function buildViableRanges(
     const isCovered = covered.has(m.id) || recentIds.has(m.id);
     if (!isCovered && segStart === null) segStart = i;
     if (isCovered && segStart !== null) {
-      pushRange(ranges, messages, segStart, i - 1, raw);
+      pushRange(ranges, messages, segStart, i - 1, byRaw);
       segStart = null;
     }
   }
   if (segStart !== null) {
-    pushRange(ranges, messages, segStart, messages.length - PROTECTED - 1, raw);
+    pushRange(ranges, messages, segStart, messages.length - PROTECTED - 1, byRaw);
   }
   // 过滤：低于 minCompressRange 字符 或 <200 tokens 碎片。
   return kernelViableRanges(
@@ -1777,13 +1879,14 @@ function pushRange(
   messages: CoreMessage[],
   startIdx: number,
   endIdx: number,
-  raw: [string, string][],
+  byRaw: Record<string, string>,
 ): void {
   if (startIdx > endIdx) return;
   const seg = messages.slice(startIdx, endIdx + 1);
   const tokens = seg.reduce((n, m) => n + (m.text ? m.text.length / 4 : 0), 0);
-  const startRef = raw.find(([, v]) => v === seg[0].id)?.[0] ?? "";
-  const endRef = raw.find(([, v]) => v === seg[seg.length - 1].id)?.[0] ?? "";
+  // kernel messageRefs.byRaw 键 = 消息 id、值 = ref（{id → ref}），正查。
+  const startRef = byRaw[seg[0].id] ?? "";
+  const endRef = byRaw[seg[seg.length - 1].id] ?? "";
   if (startRef && endRef) out.push({ startRef, endRef, tokens: Math.round(tokens) });
 }
 

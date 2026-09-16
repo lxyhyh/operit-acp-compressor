@@ -2,7 +2,7 @@
  * 构建：TS 源码 → 单文件 main.js（QuickJS 可执行）。
  *
  * - platform: "neutral"：不注入 node builtin
- * - format: "iife"：注册入口暴露到 globalThis
+ * - format: "cjs"：产物为 CommonJS 单文件（宿主 QuickJS 经 module 加载）
  * - 把 `module` 与 `crypto` 重定向到本地 shim（acp-kernel 的 node 绑定点）
  * - banner 预置 process / Intl shim
  * - acp-kernel 是纯 ESM 且用 tsup chunk 分块，esbuild bundle 会内联全部依赖
@@ -43,6 +43,11 @@ await build({
     external: ["./ui/*"],
     banner: {
         js: [
+            // V0.10-B1-M 修复（M11）：banner 先于 esbuild 生成的 "use strict" 执行
+            // （banner 恒在输出最顶部），banner 代码实际运行在非严格模式；
+            // 在 banner 首行显式 "use strict"，保证 shim 代码与产物同处严格模式
+            // （对齐原版产物 "use strict" 紧跟顶部的形态）。
+            '"use strict";',
             'var __g = (typeof globalThis !== "undefined") ? globalThis : this;',
             'if (typeof __g.process === "undefined") { __g.process = { env: { ACP_REASONING_KEEP: "0" } }; }',
             'var process = __g.process;',
@@ -97,6 +102,11 @@ await build({
     external: ["./ui/*"],
     banner: {
         js: [
+            // V0.10-B1-M 修复（M11）：banner 先于 esbuild 生成的 "use strict" 执行
+            // （banner 恒在输出最顶部），banner 代码实际运行在非严格模式；
+            // 在 banner 首行显式 "use strict"，保证 shim 代码与产物同处严格模式
+            // （对齐原版产物 "use strict" 紧跟顶部的形态）。
+            '"use strict";',
             'var __g = (typeof globalThis !== "undefined") ? globalThis : this;',
             'if (typeof __g.process === "undefined") { __g.process = { env: { ACP_REASONING_KEEP: "0" } }; }',
             'var process = __g.process;',
@@ -130,8 +140,8 @@ await build({
     logLevel: "info",
 });
 
-// 宿主按文件头 /* METADATA ... */ 解析 subpackage 工具声明（对齐原版产物：
-// "use strict"; 之后紧跟 METADATA）。esbuild banner/legalComments 会移除注释，
+// 宿主按文件头 /* METADATA ... */ 解析 subpackage 工具声明。
+// METADATA 前置到产物最顶部（在 "use strict" 之前；宿主按文件头解析）。
 // 构建完成后把源文件 METADATA 块重新写到产物最顶部。
 const metadata = extractMetadata(pkgSrc);
 if (metadata) {

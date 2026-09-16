@@ -46,8 +46,12 @@ jobs:
           ls -la dist/
           ls -la dist/*.toolpkg
 
+      # upload-artifact v7（2025 年发布）。保持默认打包上传（archive 默认 true）：
+      # .toolpkg 本身是 zip 格式，archive:false 直传后 v8 download-artifact 会按
+      # content-type 自动解压成目录，拿不到 .toolpkg 文件本体；默认打包下载时
+      # 自动解压还原出的正是 .toolpkg 文件，与 v4 行为一致。
       - name: Upload toolpkg artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: acp-toolpkg
           path: dist/*.toolpkg

@@ -46,14 +46,14 @@ jobs:
           ls -la dist/
           ls -la dist/*.toolpkg
 
-      # upload-artifact v7（2025 年发布）。保持默认打包上传（archive 默认 true）：
-      # .toolpkg 本身是 zip 格式，archive:false 直传后 v8 download-artifact 会按
-      # content-type 自动解压成目录，拿不到 .toolpkg 文件本体；默认打包下载时
-      # 自动解压还原出的正是 .toolpkg 文件，与 v4 行为一致。
+      # upload-artifact v7（2025 年发布）：archive: false 单文件直传，artifact 名 =
+      # 文件名（com.operit.acp_compressor-v0.3.0.toolpkg）。v8 download-artifact 按
+      # content-type 判定解压，非 zip 存储的 artifact 不会被解压——下载得到的正是
+      # .toolpkg 文件本体（同 README 中 tar 文件 archive:false 的例子）。
       - name: Upload toolpkg artifact
         uses: actions/upload-artifact@v7
         with:
-          name: acp-toolpkg
           path: dist/*.toolpkg
           if-no-files-found: error
           retention-days: 14
+          archive: false

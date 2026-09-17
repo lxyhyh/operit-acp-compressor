@@ -184,8 +184,28 @@ function deferredFoldStore(): Map<string, DeferredFoldEntry> {
 }
 
 /**
+ * 系统提示保护（折叠内容修复）：收集消息数组中所有 role=system 消息的 kernel ref。
+ * 折叠绝不能吞系统提示词——折叠后发送的应是"系统提示词 + 折叠后的内容"（与原版
+ * billion-context 行为一致：anthropic system 独立参数 / openai 转换时剥离 systemParts）。
+ * 作为 protectedMessageIds 传给 applyCompression：命中保护区的消息从压缩范围排除、
+ * 在 rebuildMessages 中原样保留（kernel 0.0.66–0.0.75 对 system 均无内置保护）。
+ */
+function protectedSystemRefs(messages: CoreMessage[], state: CompressionState): Set<string> | undefined {
+  const byRaw = state.messageRefs?.byRaw ?? {};
+  const refs = new Set<string>();
+  for (const m of messages) {
+    if (m.role === "system") {
+      const ref = byRaw[m.id];
+      if (ref && ref !== "BLOCKED") refs.add(ref);
+    }
+  }
+  return refs.size > 0 ? refs : undefined;
+}
+
+/**
  * 最旧未覆盖段确定性折叠（project() forced 段与后台 deferred fold 共用）。
  * 保护尾部最近 8 条；只折叠未被 block 覆盖的连续段；确定性摘要（同段跨轮稳定）。
+ * 段扫描起点跳过开头连续 system 消息（宿主系统提示/既有摘要）——折叠绝不包含系统提示词。
  * 返回新 state 与折叠统计；无可用段/建块失败返回 undefined。
  */
 function foldOldestUncoveredSegment(
@@ -193,16 +213,21 @@ function foldOldestUncoveredSegment(
   state: CompressionState,
   messages: CoreMessage[],
   config: Config,
+  minCompressRange: number,
 ): { state: CompressionState; blocksCreated: number; tokensCompressed: number; segLen: number; startRef: string; endRef: string } | undefined {
   const PROTECTED = 8;
   if (messages.length <= PROTECTED) return undefined;
   const byRaw = state.messageRefs?.byRaw ?? {};
   const recentIds = new Set(messages.slice(-PROTECTED).map((m) => m.id));
   const covered = collectCoveredMessageIds(state);
+  // 折叠内容修复：跳过开头连续的 system 消息（宿主系统提示/既有 SUMMARY 摘要），
+  // 折叠段从第一条非 system 消息开始——系统提示词永远保留在发送历史里。
+  let scanFrom = 0;
+  while (scanFrom < messages.length - PROTECTED && messages[scanFrom].role === "system") scanFrom++;
   // 按 covered/recent 边界切连续未覆盖段（段内不夹已覆盖消息，避免 kernel
   // 以 overlap/consumed 拒绝整段）；从最旧开始取第一个长度 >= 8 的段。
   let segStart = -1;
-  for (let i = 0; i < messages.length - PROTECTED; i++) {
+  for (let i = scanFrom; i < messages.length - PROTECTED; i++) {
     const m = messages[i];
     const isBlocked = covered.has(m.id) || recentIds.has(m.id);
     if (!isBlocked && segStart < 0) segStart = i;
@@ -211,27 +236,34 @@ function foldOldestUncoveredSegment(
       const segEnd = isBlocked ? i - 1 : i;
       if (segEnd - segStart + 1 >= 8) {
         const seg = messages.slice(segStart, segEnd + 1);
-        // kernel messageRefs.byRaw 键 = 消息 id、值 = ref（{id → ref}），正查。
-        const startRef = byRaw[seg[0].id];
-        const endRef = byRaw[seg[seg.length - 1].id];
-        if (startRef && endRef) {
-          const summary = buildDeterministicSummary(seg, 6000, 120);
-          const topic = `自动折叠（emergency fold ${seg.length} 条）`;
-          const applied = core.applyCompression({
-            ranges: [{ startRef, endRef, summary, topic }],
-            messages,
-            state,
-            config,
-          });
-          if (applied.result.blocksCreated === 0) return undefined;
-          return {
-            state: applied.state,
-            blocksCreated: applied.result.blocksCreated,
-            tokensCompressed: applied.result.tokensCompressed,
-            segLen: seg.length,
-            startRef,
-            endRef,
-          };
+        // 字符门槛对齐 kernel minCompressRange：不足的段 kernel 会直接拒绝
+        // （'Total compressible content too small'），这里提前跳过找下一个段，
+        // 避免必然失败的折叠尝试（0.0.75 升级后暴露：10 条×310 字符 < 5000）。
+        const segChars = seg.reduce((n, m) => n + (typeof m.text === "string" ? m.text.length : 0), 0);
+        if (segChars >= minCompressRange) {
+          // kernel messageRefs.byRaw 键 = 消息 id、值 = ref（{id → ref}），正查。
+          const startRef = byRaw[seg[0].id];
+          const endRef = byRaw[seg[seg.length - 1].id];
+          if (startRef && endRef) {
+            const summary = buildDeterministicSummary(seg, 6000, 120);
+            const topic = `自动折叠（emergency fold ${seg.length} 条）`;
+            const applied = core.applyCompression({
+              ranges: [{ startRef, endRef, summary, topic }],
+              messages,
+              state,
+              config,
+              protectedMessageIds: protectedSystemRefs(messages, state),
+            });
+            if (applied.result.blocksCreated === 0) return undefined;
+            return {
+              state: applied.state,
+              blocksCreated: applied.result.blocksCreated,
+              tokensCompressed: applied.result.tokensCompressed,
+              segLen: seg.length,
+              startRef,
+              endRef,
+            };
+          }
         }
       }
       segStart = -1;
@@ -972,6 +1004,11 @@ export function createEngine(dataDir?: string): AcpEngine {
               }
               cacheSetLimited(projectionCache, sessionKey, { fingerprint, stateVersion, projection: incFinal });
               cacheSetLimited(rawTurnsCache, sessionKey, turns);
+              // —— 折叠内容修复（raw 同步）：快速路径跳过 processTurn，但不更新
+              //   .raw.json 会让 runDeferredFold / 模型 compress 的 raw 快照落后于
+              //   实际发送内容（新消息无 ref、折叠段锚定失败）。这里同步落盘，
+              //   与主路径 saveRawTurns 保持一致。
+              try { await persistence.saveRawTurns(sessionKey, turns); } catch { /* 失败不影响主流程 */ }
               const incNextState: OperitAcpSessionState = {
                 adapterStateVersion: cached.adapterStateVersion,
                 kernelState: cached.kernelState,
@@ -1032,6 +1069,9 @@ export function createEngine(dataDir?: string): AcpEngine {
               const capped = capProjectionSize(merged, { keepChars: 2000, maxRecent: 3, totalBudgetChars: 200_000 });
               cacheSetLimited(projectionCache, sessionKey, { fingerprint, stateVersion, projection: capped });
               cacheSetLimited(rawTurnsCache, sessionKey, turns);
+              // —— 折叠内容修复（raw 同步）：同 INCREMENTAL——快速路径同步 .raw.json，
+              //   否则 runDeferredFold / 模型 compress 的 raw 快照落后于发送内容。
+              try { await persistence.saveRawTurns(sessionKey, turns); } catch { /* 失败不影响主流程 */ }
               const pfNextState: OperitAcpSessionState = {
                 adapterStateVersion: cached.adapterStateVersion,
                 kernelState: cached.kernelState,
@@ -1254,7 +1294,7 @@ export function createEngine(dataDir?: string): AcpEngine {
             } else {
               try {
                 // 保护尾部：最近 8 条 + 最近 user 消息之后绝不折叠（foldOldestUncoveredSegment 同构）。
-                const folded = foldOldestUncoveredSegment(core, turn.state, mapping.messages, config);
+                const folded = foldOldestUncoveredSegment(core, turn.state, mapping.messages, config, settings.minCompressRange);
                 if (folded) {
                   // 用新状态重投影（同 FULL path：processTurn 会把 covered 消息折叠为摘要占位）。
                   appliedEmState = folded.state;
@@ -1447,6 +1487,8 @@ export function createEngine(dataDir?: string): AcpEngine {
           messages: mapping.messages,
           state: loaded.kernelState,
           config,
+          // 折叠内容修复：模型 compress 也可能请求含 system 的段——统一保护系统提示。
+          protectedMessageIds: protectedSystemRefs(mapping.messages, loaded.kernelState),
         });
         // —— V0.4：模型 compress 统计 + 来源标记 model。
         const prevStats = { ...(loaded.hostMetadata.runtimeStats ?? EMPTY_RUNTIME_STATS) };
@@ -1744,7 +1786,19 @@ export function createEngine(dataDir?: string): AcpEngine {
           deferredFoldStore().delete(sessionKey);
           return { ok: false, reason: "defer-budget" };
         }
-        const folded = foldOldestUncoveredSegment(core, loaded.kernelState, mapping.messages, config);
+        // —— 折叠内容修复（refs 同步）：INCREMENTAL / CACHE-HIT 投影路径不更新
+        //   kernelState.messageRefs.byRaw，rawTurns 中较新的消息（工具循环新 hop
+        //   追加的 user/tool 消息）没有 kernel ref → 折叠段 endRef 锚定失败返回
+        //   no-foldable-range。deferred fold 是后台异步路径，这里先 processTurn 把
+        //   最新消息的 refs 建进 state（与主路径 preflight 同构），再基于该 state 折叠。
+        const refSyncedTurn = core.processTurn({
+          messages: mapping.messages,
+          state: loaded.kernelState,
+          config,
+          tokenCount: estimateProjectionTokens(mapping.messages, collectCoveredMessageIds(loaded.kernelState)),
+          renderTags: "none",
+        });
+        const folded = foldOldestUncoveredSegment(core, refSyncedTurn.state, mapping.messages, config, settings.minCompressRange);
         if (!folded) {
           deferredFoldStore().delete(sessionKey);
           return { ok: false, reason: "no-foldable-range" };
@@ -1813,11 +1867,14 @@ export function createEngine(dataDir?: string): AcpEngine {
         }
         const covered = collectCoveredMessageIds(state);
         const recentIds = new Set(messages.slice(-PROTECTED).map((m) => m.id));
+        // 折叠内容修复：跳过开头连续 system，折叠范围永不包含系统提示词。
+        let scanFrom = 0;
+        while (scanFrom < messages.length - PROTECTED && messages[scanFrom].role === "system") scanFrom++;
         // 按 covered/recent 边界切连续未覆盖段（段内不夹已覆盖消息）；
         // 从最旧开始取第一个达到 minCompressRange 字符门槛的段。
         let segStart = -1;
         let anySeg = false;
-        for (let i = 0; i < messages.length - PROTECTED; i++) {
+        for (let i = scanFrom; i < messages.length - PROTECTED; i++) {
           const m = messages[i];
           const isBlocked = covered.has(m.id) || recentIds.has(m.id);
           if (!isBlocked && segStart < 0) segStart = i;
@@ -1891,7 +1948,11 @@ function buildViableRanges(
   const recentIds = new Set(messages.slice(-PROTECTED).map((m) => m.id));
   const ranges: { startRef: string; endRef: string; tokens: number }[] = [];
   let segStart: number | null = null;
-  for (let i = 0; i < messages.length - PROTECTED; i++) {
+  // 折叠内容修复：跳过开头连续 system（宿主系统提示/既有 SUMMARY），
+  // nudge 的 viableRanges 不暴露含系统提示词的段——模型据此压缩必不含 SYSTEM。
+  let scanFrom = 0;
+  while (scanFrom < messages.length - PROTECTED && messages[scanFrom].role === "system") scanFrom++;
+  for (let i = scanFrom; i < messages.length - PROTECTED; i++) {
     const m = messages[i];
     const isCovered = covered.has(m.id) || recentIds.has(m.id);
     if (!isCovered && segStart === null) segStart = i;

@@ -12,11 +12,11 @@
     "verify": "npm run typecheck && npm test && npm run build && npm run package"
   },
   "dependencies": {
-    "acp-kernel": "^0.0.66"
+    "acp-kernel": "^0.0.75"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "esbuild": "^0.24.0",
+    "esbuild": "^0.24.2",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   },

@@ -92,6 +92,40 @@ test("压缩后消息视图包含 acp_summary 占位", () => {
     assert.ok(hasSummary, "processTurn 后应渲染 acp_summary 占位");
 });
 
+// —— 折叠内容修复：protectedMessageIds 保护 system（0.0.75 支持传入保护集）。
+//   即便压缩段显式包含 system（模型 compress 或强制折叠路径），命中保护的消息
+//   也会从压缩范围排除并在重建中原样保留——"系统提示词 + 折叠后的内容"。
+test("protectedMessageIds 保护 system：段含 system 仍被排除且保留", () => {
+    const core = createCore();
+    let state = createInitialState();
+    const messages = mkMessages(); // m_sys@0 + m_u0..m_a29
+    let t = core.processTurn({ messages, state, config: mkConfig(), tokenCount: 100_000, renderTags: "all" });
+    state = t.state;
+    const byRaw = state.messageRefs.byRaw as Record<string, string>;
+    const sysRef = byRaw["m_sys"];
+    assert.ok(sysRef, "system 消息应分配 ref");
+    // 段从 m_sys 开始（历史上会被折叠吞掉系统提示的场景）
+    const r = core.applyCompression({
+        ranges: [{ startRef: sysRef, endRef: byRaw["m_a2"], summary: "早期问答摘要内容详细说明", topic: "早期" }],
+        messages,
+        state,
+        config: mkConfig(),
+        protectedMessageIds: new Set([sysRef]),
+    });
+    assert.equal(r.result.blocksCreated, 1, "保护 system 后仍应压缩 user/assistant 段");
+    const block = r.state.blocks[r.state.blocks.length - 1];
+    assert.ok(block.effectiveMessageIds.length > 0);
+    assert.ok(!block.effectiveMessageIds.includes("m_sys"), "system 不得进入压缩块");
+    assert.ok(block.effectiveMessageIds.includes("m_u0"), "user 段应被压缩");
+    // 重建视图：system 保留在最前，summary 紧随其后
+    const after = core.processTurn({ messages, state: r.state, config: mkConfig(), tokenCount: 80_000, renderTags: "all" });
+    const idxSys = after.messages.findIndex((m) => m.id === "m_sys");
+    const idxSum = after.messages.findIndex((m) => m.id && m.id.startsWith("acp_summary_"));
+    assert.ok(idxSys >= 0, "system 消息应保留在视图中");
+    assert.ok(idxSum > idxSys, "summary 应插在 system 之后（system 前缀不被折叠改写）");
+    assert.equal(after.messages[idxSys].role, "system", "system 消息 role 保持 system");
+});
+
 // —— 文档 Test B：同一 Session 内连续多次压缩，blocks 持续累积（非重建）
 test("Test B：同 Session 连续 3 次压缩 → blocks >= 3（多 Hop 复用状态）", () => {
     const core = createCore();
